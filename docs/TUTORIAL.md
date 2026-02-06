@@ -14,8 +14,11 @@ A detailed walkthrough of using TTCalX for direction-dependent calibration, from
   - [Step 1: Copy data to working directory](#step-1-copy-data-to-working-directory-1)
   - [Step 2: Apply calibration to all files](#step-2-apply-calibration-to-all-files)
   - [Step 3: Zest all files in batch mode](#step-3-zest-all-files-in-batch-mode)
-- [Data Column Reference](#data-column-reference)
-
+  - [Step 4: Image all peeled files](#step-4-image-all-peeled-files)
+  - [Expected Performance](#expected-performance)
+- [Example Results](#example-results)
+  - [Quick Test (6 channels)](#quick-test-6-channels)
+  - [Full MS (48 channels)](#full-ms-48-channels)
 ---
 
 ## Quick Test (Example Dataset)
@@ -67,6 +70,8 @@ wsclean(
 ```
 
 ---
+
+
 
 ## Full Workflow on Calim (Single MS)
 
@@ -220,7 +225,81 @@ ttcalx zest /home/pipeline/sources.json *.ms \
     --maxiter=30 --tolerance=1e-4 --minuvw=10
 ```
 
-> **Performance:** The first MS includes ~30-60s of JIT compilation overhead. Subsequent files process at full GPU speed (~10-12s each). 
+### Step 4: Image all peeled files
+
+```python
+# image_batch.py
+from pathlib import Path
+from orca.wrapper.wsclean import wsclean
+
+ms_files = [
+    "20240524_090003_73MHz_averaged.ms",
+    "20240524_093009_73MHz_averaged.ms",
+    "20240524_095904_73MHz_averaged.ms",
+]
+
+out_dir = Path("images").resolve()
+out_dir.mkdir(parents=True, exist_ok=True)
+
+for ms_name in ms_files:
+    ms = Path(ms_name).resolve()
+    prefix = ms.stem.replace("_averaged", "_zested")
+    print(f"Imaging {ms_name} -> {prefix}")
+    wsclean(
+        ms_list=[str(ms)],
+        out_dir=str(out_dir),
+        filename_prefix=prefix,
+        extra_arg_list=[
+            "-pol", "IV",
+            "-size", "4096", "4096",
+            "-scale", "0.03125",
+            "-niter", "0",
+            "-weight", "briggs", "0",
+            "-horizon-mask", "10deg",
+            "-taper-inner-tukey", "30",
+        ],
+        num_threads=4,
+        mem_gb=50,
+    )
+```
+
+```bash
+python3 image_batch.py
+```
+
+### Expected Performance
+
+Benchmarked on calim server (NVIDIA RTX A4000 16 GB) with 73 MHz data (352 antennas, 48 channels, zest mode):
+
+| MS file | Time | Notes |
+|---------|------|-------|
+| 1st file | ~27s | Includes JIT compilation |
+| 2nd file | ~5-10s | Full GPU speed |
+| 3rd file | ~5-10s | Full GPU speed |
+| **Average (excl. JIT)** | **~5-10s** | |
+
+
+> **Try to always use batch mode** — pass all MS files in a single `ttcalx` call to pay the JIT cost only once.
 
 ---
 
+## Example Results
+
+Below are dirty images (Stokes I, `niter=0`) showing the effect of peeling with TTCalX. Non-peeled images are shown for reference only — the tutorial products are the ZESTed images.
+
+### Quick Test (6 channels)
+
+![Quick Test: Before vs After Peeling](img/comparison_test.jpg)
+
+### Full MS (48 channels)
+
+**09:00:03 UTC:**
+![09:00:03 Before vs After](img/comparison_090003.jpg)
+
+**09:30:09 UTC:**
+![09:30:09 Before vs After](img/comparison_093009.jpg)
+
+**09:59:04 UTC:**
+![09:59:04 Before vs After](img/comparison_095904.jpg)
+
+---
