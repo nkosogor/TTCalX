@@ -77,7 +77,7 @@ For convenience, you can add these to your `~/.bashrc`:
 
 ```bash
 # TTCalX setup
-alias ttcalx_env='conda activate /opt/devel/pipeline/envs/py38_orca_nkosogor && export PATH="/opt/devel/nkosogor/nkosogor/julia-1.10.4/bin:$PATH"'
+alias ttcalx_env='conda activate /opt/devel/pipeline/envs/py38_orca_nkosogor && export PATH="/opt/devel/nkosogor/nkosogor/julia-1.10.4/bin:$PATH" && export JULIA_DEPOT_PATH="/tmp/julia_${USER}:/home/pipeline/.julia"'
 alias ttcalx='julia --project=/opt/devel/nkosogor/nkosogor/TTCalX /opt/devel/nkosogor/nkosogor/TTCalX/bin/ttcal_gpu.jl'
 
 # Then simply run:
@@ -85,6 +85,12 @@ alias ttcalx='julia --project=/opt/devel/nkosogor/nkosogor/TTCalX /opt/devel/nko
 # ttcalx zest /home/pipeline/sources.json data.ms
 
 ```
+
+> **Note:** The `ttcalx_env` alias sets `JULIA_DEPOT_PATH` with two paths: `/tmp/julia_$USER` (writable, for compiled cache) and `/home/pipeline/.julia` (read-only, for pre-installed packages). This way no per-user package installation is needed — only `pipeline` needs to run `Pkg.instantiate()`.
+
+> **Important:** Do **not** add Julia 1.10.4 to your PATH globally in `~/.bashrc`. Only the alias should set it. Running `ttcalx_env` modifies the current terminal session's PATH and `JULIA_DEPOT_PATH`, so if you also use original (https://github.com/mweastwood/TTCal.jl) TTCal (in `julia060`), use a **separate terminal** for each:
+> - **Terminal 1** (production): `conda activate julia060` → `ttcal.jl peel ...`
+> - **Terminal 2** (TTCalX): `ttcalx_env` → `ttcalx zest ...`
 
 ### Installation from scratch
 
@@ -124,8 +130,8 @@ export PATH="$PWD/julia-1.10.4/bin:$PATH"
 #### 3. Clone and install Julia packages
 
 ```bash
-git clone https://github.com/nkosogor/TTCal-GPU.git
-cd TTCal-GPU
+git clone https://github.com/nkosogor/TTCalX.git
+cd TTCalX
 
 # Install dependencies and build PyCall with current Python
 julia -e '
@@ -140,13 +146,11 @@ Pkg.build("PyCall")
 #### 4. Verify installation
 
 ```bash
-julia -e '
-push!(LOAD_PATH, "src")
-include("src/gpu/GPUTTCal.jl")
-using .GPUTTCal
-println("CUDA available: ", is_gpu_available())
-init_pycasacore()
-'
+# Check CUDA is working
+julia --project=. -e "using CUDA; println(\"CUDA functional: \", CUDA.functional())"
+
+# Test TTCalX loads and shows help
+julia --project=. bin/ttcal_gpu.jl --help
 ```
 
 ## Usage
@@ -212,17 +216,18 @@ The sources file is a JSON array of source objects (see [sources.json](sources.j
 ## Project Structure
 
 ```
-TTCal.jl/
+TTCalX/
 ├── bin/
 │   └── ttcal_gpu.jl          # Main CLI script
 ├── src/
+│   ├── TTCalX.jl             # Main module entry point
 │   └── gpu/
-│       ├── GPUTTCal.jl       # Main module
 │       ├── types.jl          # GPU data types
 │       ├── sources.jl        # Source models
 │       ├── peel_gpu.jl       # Peeling implementation
 │       ├── pycall_ms_bridge.jl  # MS I/O via python-casacore
 │       ├── memory.jl         # Memory utilities
+│       ├── logging.jl        # Progress bars & verbosity
 │       └── kernels/          # CUDA kernels
 │           ├── utils.jl
 │           ├── stefcal.jl
@@ -230,6 +235,7 @@ TTCal.jl/
 │           └── genvis.jl
 ├── examples/
 │   └── sources.json          # Example sources file
+├── Project.toml              # Julia dependencies
 ├── README.md                 # This file
 └── LICENSE.md
 ```
@@ -243,8 +249,18 @@ TTCal.jl/
 nvidia-smi
 
 # In Julia, test CUDA
-julia -e 'using CUDA; println(CUDA.functional())'
+julia --project=/opt/devel/nkosogor/nkosogor/TTCalX -e "using CUDA; println(CUDA.functional())"
 ```
+
+### "Package CUDA is required but does not seem to be installed"
+
+Make sure `JULIA_DEPOT_PATH` includes `pipeline`'s packages as a secondary (read-only) depot:
+
+```bash
+export JULIA_DEPOT_PATH="/tmp/julia_${USER}:/home/pipeline/.julia"
+```
+
+This is already included in the `ttcalx_env` alias. The first path (`/tmp`) is writable for compiled cache, the second path reads packages from `pipeline`.
 
 
 
