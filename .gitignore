@@ -1,0 +1,24 @@
+# Build outputs
+site/
+docs/build/
+
+# Julia
+*.jl.cov
+*.jl.mem
+Manifest.toml
+
+# IDE
+.vscode/
+*.code-workspace
+
+# Python
+__pycache__/
+*.pyc
+
+# Temporary files
+*.tmp
+*.bak
+*~
+
+# MS data files (large)
+*.ms/
