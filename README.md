@@ -24,6 +24,7 @@ TTCalX is an extended version of the previous TTCal package by Michael Eastwood 
   - [Options](#options)
   - [Examples](#examples)
   - [Batch Processing (Recommended)](#batch-processing-recommended)
+- [Tutorial](docs/TUTORIAL.md)
 - [Source File Format](#source-file-format)
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
@@ -155,6 +156,8 @@ julia --project=. bin/ttcal_gpu.jl --help
 
 ## Usage
 
+For a detailed walkthrough with example data, see the [Tutorial](docs/TUTORIAL.md).
+
 ### Basic Command
 
 ```bash
@@ -210,33 +213,31 @@ julia bin/ttcal_gpu.jl peel sources.json /path/to/*.ms
 
 The sources file is a JSON array of source objects (see [sources.json](sources.json) in this repo or `/home/pipeline/sources.json` on calim servers).
 
-
-
-
 ## Project Structure
 
 ```
 TTCalX/
 ├── bin/
-│   └── ttcal_gpu.jl          # Main CLI script
+│   └── ttcal_gpu.jl              # Main CLI script
 ├── src/
-│   ├── TTCalX.jl             # Main module entry point
+│   ├── TTCalX.jl                 # Main module entry point
 │   └── gpu/
-│       ├── types.jl          # GPU data types
-│       ├── sources.jl        # Source models
-│       ├── peel_gpu.jl       # Peeling implementation
-│       ├── pycall_ms_bridge.jl  # MS I/O via python-casacore
-│       ├── memory.jl         # Memory utilities
-│       ├── logging.jl        # Progress bars & verbosity
-│       └── kernels/          # CUDA kernels
+│       ├── types.jl              # GPU data types
+│       ├── sources.jl            # Source models
+│       ├── peel_gpu.jl           # Peeling implementation
+│       ├── pycall_ms_bridge.jl   # MS I/O via python-casacore
+│       ├── memory.jl             # Memory utilities
+│       ├── logging.jl            # Progress bars & verbosity
+│       └── kernels/              # CUDA kernels
 │           ├── utils.jl
 │           ├── stefcal.jl
 │           ├── corrupt.jl
 │           └── genvis.jl
 ├── examples/
-│   └── sources.json          # Example sources file
-├── Project.toml              # Julia dependencies
-├── README.md                 # This file
+│   ├── sources.json              # Example sources file
+│   └── 20240524_090003_73MHz_ch0to5.ms  # Test dataset (6 ch, ~22 MB)
+├── Project.toml                  # Julia dependencies
+├── README.md                     # This file
 └── LICENSE.md
 ```
 

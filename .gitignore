@@ -22,3 +22,5 @@ __pycache__/
 
 # MS data files (large)
 *.ms/
+# Exception: keep the small example dataset
+!examples/20240524_090003_73MHz_ch0to5.ms/
