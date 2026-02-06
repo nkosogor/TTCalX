@@ -133,7 +133,7 @@ function parse_args(args)
         elseif startswith(arg, "--peeliter=")
             opts["peeliter"] = parse(Int, split(arg, "=")[2])
         elseif startswith(arg, "--column=")
-            opts["column"] = split(arg, "=")[2]
+            opts["column"] = String(split(arg, "=")[2])
         elseif startswith(arg, "--")
             println("Unknown option: $arg")
             exit(1)
