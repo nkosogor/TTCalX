@@ -1,4 +1,4 @@
-# GPU-accelerated TTCal Module
+# GPU-accelerated TTCalX Module
 # 
 # High-performance calibration for radio interferometry using CUDA.
 # Implements peeling/zesting for direction-dependent calibration.
@@ -6,7 +6,7 @@
 # Copyright (c) 2024
 # License: GPL v3
 
-module GPUTTCal
+module TTCalX
 
 using CUDA
 using KernelAbstractions
@@ -55,17 +55,17 @@ export log_header, log_section, log_step, log_substep, log_detail, log_debug
 export log_success, log_warning, log_error, log_config, log_table_row
 export @verbose, @normal
 
-# Include sub-modules
-include("logging.jl")
-include("types.jl")
-include("memory.jl")
-include("kernels/utils.jl")
-include("kernels/corrupt.jl")
-include("kernels/stefcal.jl")
-include("kernels/genvis.jl")
-include("sources.jl")
-include("peel_gpu.jl")
-include("pycall_ms_bridge.jl")
+# Include sub-modules (paths relative to src/)
+include("gpu/logging.jl")
+include("gpu/types.jl")
+include("gpu/memory.jl")
+include("gpu/kernels/utils.jl")
+include("gpu/kernels/corrupt.jl")
+include("gpu/kernels/stefcal.jl")
+include("gpu/kernels/genvis.jl")
+include("gpu/sources.jl")
+include("gpu/peel_gpu.jl")
+include("gpu/pycall_ms_bridge.jl")
 
 """
     is_gpu_available()
@@ -95,10 +95,10 @@ end
 
 function __init__()
     if is_gpu_available()
-        @info "GPUTTCal initialized with CUDA" device=CUDA.name(CUDA.device()) memory="$(round(CUDA.available_memory()/1e9, digits=2)) GB"
+        @info "TTCalX initialized with CUDA" device=CUDA.name(CUDA.device()) memory="$(round(CUDA.available_memory()/1e9, digits=2)) GB"
     else
         @warn "CUDA not available - using CPU fallback"
     end
 end
 
-end # module
+end # module TTCalX

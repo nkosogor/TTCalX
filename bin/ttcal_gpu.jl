@@ -32,8 +32,8 @@
 #==============================================================================#
 
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
-include(joinpath(@__DIR__, "..", "src", "gpu", "GPUTTCal.jl"))
-using .GPUTTCal
+include(joinpath(@__DIR__, "..", "src", "TTCalX.jl"))
+using .TTCalX
 using Printf
 
 #==============================================================================#

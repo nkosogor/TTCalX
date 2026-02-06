@@ -62,7 +62,7 @@ The package is pre-installed at `/opt/devel/nkosogor/nkosogor/TTCalX`.
 
 ```bash
 # Activate conda environment with casacore
-conda activate py38_orca_nkosogor
+conda activate /opt/devel/pipeline/envs/py38_orca_nkosogor
 
 # Add Julia to PATH
 export PATH="/opt/devel/nkosogor/nkosogor/julia-1.10.4/bin:$PATH"
@@ -77,7 +77,7 @@ For convenience, you can add these to your `~/.bashrc`:
 
 ```bash
 # TTCalX setup
-alias ttcalx_env='conda activate py38_orca_nkosogor && export PATH="/opt/devel/nkosogor/nkosogor/julia-1.10.4/bin:$PATH"'
+alias ttcalx_env='conda activate /opt/devel/pipeline/envs/py38_orca_nkosogor && export PATH="/opt/devel/nkosogor/nkosogor/julia-1.10.4/bin:$PATH"'
 alias ttcalx='julia --project=/opt/devel/nkosogor/nkosogor/TTCalX /opt/devel/nkosogor/nkosogor/TTCalX/bin/ttcal_gpu.jl'
 
 # Then simply run:
