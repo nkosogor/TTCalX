@@ -1,0 +1,79 @@
+# Documentation workflow for TTCalX
+# Uses Documenter.jl to build and deploy to GitHub Pages
+#
+# Note: TTCalX cannot be loaded in CI (requires CUDA + python-casacore),
+# so we build docs from hand-written pages only (doctest=false, no @autodocs).
+
+name: Documentation
+
+on:
+  push:
+    branches: [main, docs/documenter-jl]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+# Allow only one concurrent deployment
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: write
+  statuses: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10'
+
+      - name: Cache Julia packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.julia/registries
+            ~/.julia/packages
+            ~/.julia/compiled
+          key: julia-docs-${{ hashFiles('docs/Project.toml') }}
+          restore-keys: julia-docs-
+
+      - name: Install Documenter.jl
+        run: |
+          julia --project=docs -e '
+            using Pkg
+            Pkg.develop(PackageSpec(path=pwd()))
+            Pkg.instantiate()
+          '
+        # This will fail because TTCalX deps (CUDA, PyCall) aren't available.
+        # Instead, install only Documenter directly:
+        if: false
+
+      - name: Install docs dependencies only
+        run: |
+          julia --project=docs -e '
+            using Pkg
+            # Only install Documenter — we cannot load TTCalX in CI
+            Pkg.add("Documenter")
+            Pkg.instantiate()
+          '
+
+      - name: Build documentation
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+        run: julia --project=docs docs/make.jl
+
+      - name: Upload docs artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: docs/build/
