@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Tutorial · TTCalX Documentation</title><meta name="title" content="Tutorial · TTCalX Documentation"/><meta property="og:title" content="Tutorial · TTCalX Documentation"/><meta property="twitter:title" content="Tutorial · TTCalX Documentation"/><meta name="description" content="Documentation for TTCalX Documentation."/><meta property="og:description" content="Documentation for TTCalX Documentation."/><meta property="twitter:description" content="Documentation for TTCalX Documentation."/><meta property="og:url" content="https://nkosogor.github.io/TTCalX/tutorial/"/><meta property="twitter:url" content="https://nkosogor.github.io/TTCalX/tutorial/"/><link rel="canonical" href="https://nkosogor.github.io/TTCalX/tutorial/"/><script data-outdated-warner src="../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.050/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL=".."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../assets/documenter.js"></script><script src="../search_index.js"></script><script src="../siteinfo.js"></script><script src="../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../">TTCalX Documentation</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../">Home</a></li><li class="is-active"><a class="tocitem" href>Tutorial</a><ul class="internal"><li><a class="tocitem" href="#Table-of-Contents"><span>Table of Contents</span></a></li><li><a class="tocitem" href="#Quick-Test-(Example-Dataset)"><span>Quick Test (Example Dataset)</span></a></li><li><a class="tocitem" href="#Full-Workflow-on-Calim-(Single-MS)"><span>Full Workflow on Calim (Single MS)</span></a></li><li><a class="tocitem" href="#Batch-Processing-on-Calim-(Multiple-MS)"><span>Batch Processing on Calim (Multiple MS)</span></a></li><li><a class="tocitem" href="#Example-Results"><span>Example Results</span></a></li></ul></li><li><a class="tocitem" href="../calibration/">Calibration</a></li><li><a class="tocitem" href="../sources/">Source Models</a></li><li><a class="tocitem" href="../kernels/">GPU Kernels</a></li><li><a class="tocitem" href="../msio/">MS I/O</a></li><li><a class="tocitem" href="../cli/">CLI Reference</a></li><li><a class="tocitem" href="../api/">API Reference</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li class="is-active"><a href>Tutorial</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Tutorial</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/nkosogor/TTCalX" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/nkosogor/TTCalX/blob/main/docs/src/tutorial.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="tutorial"><a class="docs-heading-anchor" href="#tutorial">Tutorial</a><a id="tutorial-1"></a><a class="docs-heading-anchor-permalink" href="#tutorial" title="Permalink"></a></h1><p>A detailed walkthrough of using TTCalX for direction-dependent calibration, from quick verification to full production workflows.</p><h2 id="Table-of-Contents"><a class="docs-heading-anchor" href="#Table-of-Contents">Table of Contents</a><a id="Table-of-Contents-1"></a><a class="docs-heading-anchor-permalink" href="#Table-of-Contents" title="Permalink"></a></h2><ul><li><a href="#Quick-Test-(Example-Dataset)">Quick Test (Example Dataset)</a></li><li><a href="#Full-Workflow-on-Calim-(Single-MS)">Full Workflow on Calim (Single MS)</a></li><li><a href="#Batch-Processing-on-Calim-(Multiple-MS)">Batch Processing on Calim (Multiple MS)</a></li><li><a href="#Example-Results">Example Results</a></li></ul><hr/><h2 id="Quick-Test-(Example-Dataset)"><a class="docs-heading-anchor" href="#Quick-Test-(Example-Dataset)">Quick Test (Example Dataset)</a><a id="Quick-Test-(Example-Dataset)-1"></a><a class="docs-heading-anchor-permalink" href="#Quick-Test-(Example-Dataset)" title="Permalink"></a></h2><p>A small test dataset (6 channels, ~22 MB) is included in <code>examples/</code> for quick verification. This MS was extracted from a calibrated OVRO-LWA observation at 73 MHz.</p><p><strong>Set up a working directory and run the quick test on calim:</strong></p><pre><code class="language-bash hljs">ttcalx_env
+
+# Create a working directory and copy the example MS (never modify originals)
+mkdir -p /lustre/$USER/ttcalx_test &amp;&amp; cd /lustre/$USER/ttcalx_test
+cp -r /opt/devel/nkosogor/nkosogor/TTCalX/examples/20240524_090003_73MHz_ch0to5.ms test_zest.ms
+
+# Run zest (use --column=DATA for split data)
+ttcalx zest /home/pipeline/sources.json test_zest.ms \
+    --column=DATA --verbose --maxiter=30 --tolerance=1e-4 --minuvw=10</code></pre><p><strong>Image the peeled data with wsclean (dirty image):</strong></p><p>After peeling, TTCalX writes the calibrated visibilities back to the <code>DATA</code> column. Make a quick dirty image to verify using the <code>orca</code> Python wrapper:</p><pre><code class="language-python hljs">from pathlib import Path
+from orca.wrapper.wsclean import wsclean
+
+ms = Path(&quot;test_zest.ms&quot;).resolve()
+out_dir = Path(&quot;images&quot;).resolve()
+out_dir.mkdir(parents=True, exist_ok=True)
+
+wsclean(
+    ms_list=[str(ms)],
+    out_dir=str(out_dir),
+    filename_prefix=&quot;peeled_73MHz_test&quot;,
+    extra_arg_list=[
+        &quot;-pol&quot;, &quot;IV&quot;,
+        &quot;-size&quot;, &quot;4096&quot;, &quot;4096&quot;,
+        &quot;-scale&quot;, &quot;0.03125&quot;,
+        &quot;-niter&quot;, &quot;0&quot;,
+        &quot;-weight&quot;, &quot;briggs&quot;, &quot;0&quot;,
+        &quot;-horizon-mask&quot;, &quot;10deg&quot;,
+        &quot;-taper-inner-tukey&quot;, &quot;30&quot;,
+    ],
+    num_threads=4,
+    mem_gb=50,
+)</code></pre><hr/><h2 id="Full-Workflow-on-Calim-(Single-MS)"><a class="docs-heading-anchor" href="#Full-Workflow-on-Calim-(Single-MS)">Full Workflow on Calim (Single MS)</a><a id="Full-Workflow-on-Calim-(Single-MS)-1"></a><a class="docs-heading-anchor-permalink" href="#Full-Workflow-on-Calim-(Single-MS)" title="Permalink"></a></h2><p>A typical OVRO-LWA calibration workflow: copy data → apply bandpass/delay calibration → peel/zest bright sources → image.</p><h3 id="Step-1:-Copy-data-to-working-directory"><a class="docs-heading-anchor" href="#Step-1:-Copy-data-to-working-directory">Step 1: Copy data to working directory</a><a id="Step-1:-Copy-data-to-working-directory-1"></a><a class="docs-heading-anchor-permalink" href="#Step-1:-Copy-data-to-working-directory" title="Permalink"></a></h3><p>Always work on a copy — never modify pipeline originals.</p><pre><code class="language-bash hljs">mkdir -p /lustre/$USER/ttcalx_test &amp;&amp; cd /lustre/$USER/ttcalx_test
+cp -r /lustre/pipeline/night-time/averaged/73MHz/2024-05-24/09/20240524_090003_73MHz_averaged.ms .
+ls -ld 20240524_090003_73MHz_averaged.ms</code></pre><h3 id="Step-2:-Apply-bandpass-and-delay-calibration"><a class="docs-heading-anchor" href="#Step-2:-Apply-bandpass-and-delay-calibration">Step 2: Apply bandpass and delay calibration</a><a id="Step-2:-Apply-bandpass-and-delay-calibration-1"></a><a class="docs-heading-anchor-permalink" href="#Step-2:-Apply-bandpass-and-delay-calibration" title="Permalink"></a></h3><pre><code class="language-bash hljs">ttcalx_env
+cd /lustre/$USER/ttcalx_test
+
+python3 -c &quot;
+from casatasks import applycal
+
+MS = &#39;20240524_090003_73MHz_averaged.ms&#39;
+DELAY_TABLE  = &#39;/lustre/pipeline/calibration/delay/2024-05-24/20240524_delay.delay&#39;
+BANDPASS_TBL = &#39;/lustre/pipeline/calibration/bandpass/73MHz/2024-05-24/11/bandpass_concat.73MHz_11.bandpass&#39;
+
+applycal(
+    vis=MS,
+    gaintable=[DELAY_TABLE, BANDPASS_TBL],
+    calwt=[False],
+    flagbackup=True,
+)
+&quot;</code></pre><h3 id="Step-3:-Peel/zest-bright-sources-with-TTCalX"><a class="docs-heading-anchor" href="#Step-3:-Peel/zest-bright-sources-with-TTCalX">Step 3: Peel/zest bright sources with TTCalX</a><a id="Step-3:-Peel/zest-bright-sources-with-TTCalX-1"></a><a class="docs-heading-anchor-permalink" href="#Step-3:-Peel/zest-bright-sources-with-TTCalX" title="Permalink"></a></h3><pre><code class="language-bash hljs">ttcalx zest /home/pipeline/sources.json 20240524_090003_73MHz_averaged.ms \
+    --verbose --maxiter=30 --tolerance=1e-4 --minuvw=10</code></pre><h3 id="Step-4:-Image-with-wsclean"><a class="docs-heading-anchor" href="#Step-4:-Image-with-wsclean">Step 4: Image with wsclean</a><a id="Step-4:-Image-with-wsclean-1"></a><a class="docs-heading-anchor-permalink" href="#Step-4:-Image-with-wsclean" title="Permalink"></a></h3><pre><code class="language-python hljs">from pathlib import Path
+from orca.wrapper.wsclean import wsclean
+
+ms = Path(&quot;20240524_090003_73MHz_averaged.ms&quot;).resolve()
+out_dir = Path(&quot;images&quot;).resolve()
+out_dir.mkdir(parents=True, exist_ok=True)
+
+wsclean(
+    ms_list=[str(ms)],
+    out_dir=str(out_dir),
+    filename_prefix=&quot;zested_73MHz&quot;,
+    extra_arg_list=[
+        &quot;-pol&quot;, &quot;IV&quot;,
+        &quot;-size&quot;, &quot;4096&quot;, &quot;4096&quot;,
+        &quot;-scale&quot;, &quot;0.03125&quot;,
+        &quot;-niter&quot;, &quot;0&quot;,
+        &quot;-weight&quot;, &quot;briggs&quot;, &quot;0&quot;,
+        &quot;-horizon-mask&quot;, &quot;10deg&quot;,
+        &quot;-taper-inner-tukey&quot;, &quot;30&quot;,
+    ],
+    num_threads=4,
+    mem_gb=50,
+)</code></pre><hr/><h2 id="Batch-Processing-on-Calim-(Multiple-MS)"><a class="docs-heading-anchor" href="#Batch-Processing-on-Calim-(Multiple-MS)">Batch Processing on Calim (Multiple MS)</a><a id="Batch-Processing-on-Calim-(Multiple-MS)-1"></a><a class="docs-heading-anchor-permalink" href="#Batch-Processing-on-Calim-(Multiple-MS)" title="Permalink"></a></h2><p>Process multiple MS files end-to-end: copy → applycal → zest in batch.</p><h3 id="Step-1:-Copy-data-to-working-directory-2"><a class="docs-heading-anchor" href="#Step-1:-Copy-data-to-working-directory-2">Step 1: Copy data to working directory</a><a class="docs-heading-anchor-permalink" href="#Step-1:-Copy-data-to-working-directory-2" title="Permalink"></a></h3><pre><code class="language-bash hljs">mkdir -p /lustre/$USER/ttcalx_batch &amp;&amp; cd /lustre/$USER/ttcalx_batch
+SRC=/lustre/pipeline/night-time/averaged/73MHz/2024-05-24/09
+cp -r $SRC/20240524_090003_73MHz_averaged.ms .
+cp -r $SRC/20240524_093009_73MHz_averaged.ms .
+cp -r $SRC/20240524_095904_73MHz_averaged.ms .</code></pre><h3 id="Step-2:-Apply-calibration-to-all-files"><a class="docs-heading-anchor" href="#Step-2:-Apply-calibration-to-all-files">Step 2: Apply calibration to all files</a><a id="Step-2:-Apply-calibration-to-all-files-1"></a><a class="docs-heading-anchor-permalink" href="#Step-2:-Apply-calibration-to-all-files" title="Permalink"></a></h3><pre><code class="language-bash hljs">ttcalx_env
+cd /lustre/$USER/ttcalx_batch
+
+python3 -c &quot;
+from casatasks import applycal
+
+DELAY_TABLE  = &#39;/lustre/pipeline/calibration/delay/2024-05-24/20240524_delay.delay&#39;
+BANDPASS_TBL = &#39;/lustre/pipeline/calibration/bandpass/73MHz/2024-05-24/11/bandpass_concat.73MHz_11.bandpass&#39;
+
+ms_files = [
+    &#39;20240524_090003_73MHz_averaged.ms&#39;,
+    &#39;20240524_093009_73MHz_averaged.ms&#39;,
+    &#39;20240524_095904_73MHz_averaged.ms&#39;,
+]
+
+for ms in ms_files:
+    print(f&#39;Applying calibration to {ms}...&#39;)
+    applycal(
+        vis=ms,
+        gaintable=[DELAY_TABLE, BANDPASS_TBL],
+        calwt=[False],
+        flagbackup=True,
+    )
+    print(f&#39;  Done: {ms}&#39;)
+&quot;</code></pre><h3 id="Step-3:-Zest-all-files-in-batch-mode"><a class="docs-heading-anchor" href="#Step-3:-Zest-all-files-in-batch-mode">Step 3: Zest all files in batch mode</a><a id="Step-3:-Zest-all-files-in-batch-mode-1"></a><a class="docs-heading-anchor-permalink" href="#Step-3:-Zest-all-files-in-batch-mode" title="Permalink"></a></h3><p>Pass all MS files at once so TTCalX only compiles once:</p><pre><code class="language-bash hljs">ttcalx zest /home/pipeline/sources.json \
+    20240524_090003_73MHz_averaged.ms \
+    20240524_093009_73MHz_averaged.ms \
+    20240524_095904_73MHz_averaged.ms \
+    --maxiter=30 --tolerance=1e-4 --minuvw=10</code></pre><p>Or using a glob:</p><pre><code class="language-bash hljs">ttcalx zest /home/pipeline/sources.json *.ms \
+    --maxiter=30 --tolerance=1e-4 --minuvw=10</code></pre><h3 id="Step-4:-Image-all-peeled-files"><a class="docs-heading-anchor" href="#Step-4:-Image-all-peeled-files">Step 4: Image all peeled files</a><a id="Step-4:-Image-all-peeled-files-1"></a><a class="docs-heading-anchor-permalink" href="#Step-4:-Image-all-peeled-files" title="Permalink"></a></h3><pre><code class="language-python hljs">from pathlib import Path
+from orca.wrapper.wsclean import wsclean
+
+ms_files = [
+    &quot;20240524_090003_73MHz_averaged.ms&quot;,
+    &quot;20240524_093009_73MHz_averaged.ms&quot;,
+    &quot;20240524_095904_73MHz_averaged.ms&quot;,
+]
+
+out_dir = Path(&quot;images&quot;).resolve()
+out_dir.mkdir(parents=True, exist_ok=True)
+
+for ms_name in ms_files:
+    ms = Path(ms_name).resolve()
+    prefix = ms.stem.replace(&quot;_averaged&quot;, &quot;_zested&quot;)
+    print(f&quot;Imaging {ms_name} -&gt; {prefix}&quot;)
+    wsclean(
+        ms_list=[str(ms)],
+        out_dir=str(out_dir),
+        filename_prefix=prefix,
+        extra_arg_list=[
+            &quot;-pol&quot;, &quot;IV&quot;,
+            &quot;-size&quot;, &quot;4096&quot;, &quot;4096&quot;,
+            &quot;-scale&quot;, &quot;0.03125&quot;,
+            &quot;-niter&quot;, &quot;0&quot;,
+            &quot;-weight&quot;, &quot;briggs&quot;, &quot;0&quot;,
+            &quot;-horizon-mask&quot;, &quot;10deg&quot;,
+            &quot;-taper-inner-tukey&quot;, &quot;30&quot;,
+        ],
+        num_threads=4,
+        mem_gb=50,
+    )</code></pre><h3 id="Expected-Performance"><a class="docs-heading-anchor" href="#Expected-Performance">Expected Performance</a><a id="Expected-Performance-1"></a><a class="docs-heading-anchor-permalink" href="#Expected-Performance" title="Permalink"></a></h3><p>Benchmarked on calim server (NVIDIA RTX A4000 16 GB) with 73 MHz data (352 antennas, 48 channels, zest mode):</p><table><tr><th style="text-align: right">MS file</th><th style="text-align: right">Time</th><th style="text-align: right">Notes</th></tr><tr><td style="text-align: right">1st file</td><td style="text-align: right">~27s</td><td style="text-align: right">Includes JIT compilation</td></tr><tr><td style="text-align: right">2nd file</td><td style="text-align: right">~5-10s</td><td style="text-align: right">Full GPU speed</td></tr><tr><td style="text-align: right">3rd file</td><td style="text-align: right">~5-10s</td><td style="text-align: right">Full GPU speed</td></tr><tr><td style="text-align: right"><strong>Average (excl. JIT)</strong></td><td style="text-align: right"><strong>~5-10s</strong></td><td style="text-align: right"></td></tr></table><div class="admonition is-success" id="Tip-2e19d3d940f88323"><header class="admonition-header">Tip<a class="admonition-anchor" href="#Tip-2e19d3d940f88323" title="Permalink"></a></header><div class="admonition-body"><p><strong>Always use batch mode</strong> — pass all MS files in a single <code>ttcalx</code> call to pay the JIT cost only once.</p></div></div><hr/><h2 id="Example-Results"><a class="docs-heading-anchor" href="#Example-Results">Example Results</a><a id="Example-Results-1"></a><a class="docs-heading-anchor-permalink" href="#Example-Results" title="Permalink"></a></h2><p>Below are dirty images (Stokes I, <code>niter=0</code>) showing the effect of peeling with TTCalX.</p><h3 id="Quick-Test-(6-channels)"><a class="docs-heading-anchor" href="#Quick-Test-(6-channels)">Quick Test (6 channels)</a><a id="Quick-Test-(6-channels)-1"></a><a class="docs-heading-anchor-permalink" href="#Quick-Test-(6-channels)" title="Permalink"></a></h3><p><img src="../img/comparison_test.jpg" alt="Quick Test: Before vs After Peeling"/></p><h3 id="Full-MS-(48-channels)"><a class="docs-heading-anchor" href="#Full-MS-(48-channels)">Full MS (48 channels)</a><a id="Full-MS-(48-channels)-1"></a><a class="docs-heading-anchor-permalink" href="#Full-MS-(48-channels)" title="Permalink"></a></h3><p><strong>09:00:03 UTC:</strong> <img src="../img/comparison_090003.jpg" alt="09:00:03 Before vs After"/></p><p><strong>09:30:09 UTC:</strong> <img src="../img/comparison_093009.jpg" alt="09:30:09 Before vs After"/></p><p><strong>09:59:04 UTC:</strong> <img src="../img/comparison_095904.jpg" alt="09:59:04 Before vs After"/></p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../">« Home</a><a class="docs-footer-nextpage" href="../calibration/">Calibration »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.16.1 on <span class="colophon-date" title="Monday 9 February 2026 19:35">Monday 9 February 2026</span>. Using Julia version 1.10.10.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
