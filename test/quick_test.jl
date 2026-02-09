@@ -32,6 +32,14 @@ println("  TTCalX Quick Test (CPU fallback)")
 println("="^72)
 println()
 
+# Shared state across testsets (must be top-level for Julia 1.10 scoping)
+sources = nothing
+vis = nothing
+cal = nothing
+meta = nothing
+baseline_dict = nothing
+Nrows = 0
+
 # ─── 1. Load TTCalX ─────────────────────────────────────────────────────────
 @testset "Module loading" begin
     push!(LOAD_PATH, joinpath(PROJECT_ROOT, "src"))
@@ -75,8 +83,8 @@ HAS_PYCASACORE = false
 end
 
 # ─── 4. Read sources (pure Julia — always works) ────────────────────────────
-local sources
 @testset "Read sources" begin
+    global sources
     @assert isfile(SOURCES_JSON) "sources.json not found at $SOURCES_JSON"
     sources = TTCalX.read_gpu_sources(SOURCES_JSON)
     @test length(sources) > 0
@@ -94,8 +102,8 @@ if !HAS_PYCASACORE
 else
 
 # ─── 5. Read MS on CPU ──────────────────────────────────────────────────────
-local vis, cal, meta, baseline_dict, Nrows
 @testset "Read MS (CPU)" begin
+    global vis, cal, meta, baseline_dict, Nrows
     vis, cal, meta, baseline_dict, Nrows = TTCalX.read_ms_to_gpu(
         TEST_MS; gpu=false, column="DATA"
     )
