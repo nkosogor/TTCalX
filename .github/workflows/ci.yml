@@ -1,0 +1,111 @@
+# CI workflow for TTCalX — CPU-only quick test
+#
+# Runs the Quick Test (example 6-channel MS) on every PR to main.
+# Uses CPU fallback since GitHub Actions runners have no NVIDIA GPU.
+#
+# What this tests:
+#   - Module loads correctly (CUDA gracefully degrades to CPU)
+#   - python-casacore MS I/O works
+#   - Source model parsing works
+#   - Zest pipeline runs end-to-end on CPU
+#   - Results are written back to the MS without errors
+
+name: CI Quick Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs for the same branch/PR
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quick-test:
+    name: Quick Test (CPU, Julia ${{ matrix.julia-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version: ['1.10', '1.11']
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true  # example MS might use LFS in the future
+
+      # ── System dependencies ───────────────────────────────────────────
+      - name: Install casacore system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-pip \
+            libcasacore-dev \
+            casacore-dev \
+            python3-casacore \
+            || true
+          # Fallback: install via pip if apt packages are missing
+          pip3 install --break-system-packages python-casacore numpy || \
+          pip3 install python-casacore numpy
+
+      - name: Verify python-casacore
+        run: python3 -c "from casacore.tables import table; print('casacore OK')"
+
+      # ── Julia setup ──────────────────────────────────────────────────
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+
+      - name: Cache Julia packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.julia/registries
+            ~/.julia/packages
+            ~/.julia/compiled
+            ~/.julia/artifacts
+          key: julia-${{ matrix.julia-version }}-${{ hashFiles('Project.toml') }}
+          restore-keys: julia-${{ matrix.julia-version }}-
+
+      # ── Install Julia dependencies ────────────────────────────────────
+      - name: Install Julia packages
+        run: |
+          julia --project=. -e '
+            using Pkg
+            # Point PyCall at the system Python
+            ENV["PYTHON"] = strip(read(`which python3`, String))
+            Pkg.instantiate()
+            Pkg.build("PyCall")
+          '
+
+      - name: Verify Julia setup
+        run: |
+          julia --project=. -e '
+            println("Julia ", VERSION)
+            using CUDA
+            println("CUDA.functional() = ", CUDA.functional())
+            using PyCall
+            pyimport("casacore.tables")
+            println("PyCall + casacore OK")
+          '
+
+      # ── Run Quick Test ───────────────────────────────────────────────
+      - name: Run Quick Test (CPU fallback)
+        run: julia --project=. test/quick_test.jl
+
+      # ── Upload logs on failure ────────────────────────────────────────
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-julia${{ matrix.julia-version }}
+          path: |
+            *.log
+            test/*.log
