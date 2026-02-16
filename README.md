@@ -1,9 +1,12 @@
+[![CI](https://github.com/nkosogor/TTCalX/actions/workflows/ci.yml/badge.svg)](https://github.com/nkosogor/TTCalX/actions/workflows/ci.yml)
+[![Documentation](https://github.com/nkosogor/TTCalX/actions/workflows/docs.yml/badge.svg)](https://nkosogor.github.io/TTCalX/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
 # TTCalX
 
 GPU-accelerated direction-dependent calibration developed for the OVRO LWA.
 TTCalX is an extended version of the previous TTCal package by Michael Eastwood (see https://github.com/mweastwood/TTCal.jl).
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 ## Table of Contents
 
@@ -71,23 +74,23 @@ export PATH="/opt/devel/nkosogor/nkosogor/julia-1.10.4/bin:$PATH"
 # Run TTCalX (example: zest 3 sources from an MS file)
 julia --project=/opt/devel/nkosogor/nkosogor/TTCalX \
     /opt/devel/nkosogor/nkosogor/TTCalX/bin/ttcal_gpu.jl \
-    zest /home/pipeline/sources.json your_data.ms
+    zest /opt/devel/nkosogor/nkosogor/TTCalX/sources.json your_data.ms
 ```
 
 For convenience, you can add these to your `~/.bashrc`:
 
 ```bash
 # TTCalX setup
-alias ttcalx_env='conda activate /opt/devel/pipeline/envs/py38_orca_nkosogor && export PATH="/opt/devel/nkosogor/nkosogor/julia-1.10.4/bin:$PATH" && export JULIA_DEPOT_PATH="/tmp/julia_${USER}:/home/pipeline/.julia"'
+alias ttcalx_env='conda activate /opt/devel/pipeline/envs/py38_orca_nkosogor && export PATH="/opt/devel/nkosogor/nkosogor/julia-1.10.4/bin:$PATH" && export JULIA_DEPOT_PATH="/tmp/julia_${USER}:/opt/devel/nkosogor/nkosogor/julia_depot"'
 alias ttcalx='julia --project=/opt/devel/nkosogor/nkosogor/TTCalX /opt/devel/nkosogor/nkosogor/TTCalX/bin/ttcal_gpu.jl'
 
 # Then simply run:
 # ttcalx_env
-# ttcalx zest /home/pipeline/sources.json data.ms
+# ttcalx zest /opt/devel/nkosogor/nkosogor/TTCalX/sources.json data.ms
 
 ```
 
-> **Note:** The `ttcalx_env` alias sets `JULIA_DEPOT_PATH` with two paths: `/tmp/julia_$USER` (writable, for compiled cache) and `/home/pipeline/.julia` (read-only, for pre-installed packages). This way no per-user package installation is needed — only `pipeline` needs to run `Pkg.instantiate()`.
+> **Note:** The `ttcalx_env` alias sets `JULIA_DEPOT_PATH` with two paths: `/tmp/julia_$USER` (writable, for compiled cache) and `/opt/devel/nkosogor/nkosogor/julia_depot` (read-only, for pre-installed packages). This way no per-user package installation is needed — only the maintainer needs to run `Pkg.instantiate()` once.
 
 > **Important:** Do **not** add Julia 1.10.4 to your PATH globally in `~/.bashrc`. Only the alias should set it. Running `ttcalx_env` modifies the current terminal session's PATH and `JULIA_DEPOT_PATH`, so if you also use original (https://github.com/mweastwood/TTCal.jl) TTCal (in `julia060`), use a **separate terminal** for each:
 > - **Terminal 1** (production): `conda activate julia060` → `ttcal.jl peel ...`
@@ -211,7 +214,7 @@ julia bin/ttcal_gpu.jl peel sources.json /path/to/*.ms
 
 ## Source File Format
 
-The sources file is a JSON array of source objects (see [sources.json](sources.json) in this repo or `/home/pipeline/sources.json` on calim servers).
+The sources file is a JSON array of source objects (see [sources.json](sources.json) in this repo).
 
 ## Project Structure
 
@@ -255,13 +258,13 @@ julia --project=/opt/devel/nkosogor/nkosogor/TTCalX -e "using CUDA; println(CUDA
 
 ### "Package CUDA is required but does not seem to be installed"
 
-Make sure `JULIA_DEPOT_PATH` includes `pipeline`'s packages as a secondary (read-only) depot:
+Make sure `JULIA_DEPOT_PATH` includes the shared depot:
 
 ```bash
-export JULIA_DEPOT_PATH="/tmp/julia_${USER}:/home/pipeline/.julia"
+export JULIA_DEPOT_PATH="/tmp/julia_${USER}:/opt/devel/nkosogor/nkosogor/julia_depot"
 ```
 
-This is already included in the `ttcalx_env` alias. The first path (`/tmp`) is writable for compiled cache, the second path reads packages from `pipeline`.
+This is already included in the `ttcalx_env` alias. The first path (`/tmp`) is writable for compiled cache, the second path reads pre-installed packages from the shared depot.
 
 
 
