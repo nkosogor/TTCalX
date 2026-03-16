@@ -261,18 +261,21 @@ function save_fits(path::String, I::Matrix{Float64}, meta, config)
     ra_deg  = rad2deg(meta.phase_center_ra)
     dec_deg = rad2deg(meta.phase_center_dec)
 
-    # Compute reference frequency
+    # Compute reference frequency (band center, matching wsclean convention)
     channels_cpu = meta.channels isa CuArray ? Array(meta.channels) : meta.channels
-    freq_hz  = channels_cpu[1]
-    if length(channels_cpu) > 1
-        dfreq_hz = channels_cpu[2] - channels_cpu[1]
+    Nfreq = length(channels_cpu)
+    if Nfreq > 1
+        chan_width = channels_cpu[2] - channels_cpu[1]
+        center_freq = channels_cpu[1] + (Nfreq - 1) / 2.0 * chan_width
+        total_bw = Nfreq * chan_width
     else
-        dfreq_hz = channels_cpu[1]
+        center_freq = channels_cpu[1]
+        total_bw = channels_cpu[1]
     end
 
-    # wsclean convention: 4D array (1, 1, Ny, Nx) = (STOKES, FREQ, DEC, RA)
-    # Julia is column-major, numpy is row-major: transpose the 2D image
-    img_np = np_mod.array(permutedims(I), dtype=np_mod.float64)
+    # Orientation: transpose Julia [x,y] to FITS [y,x], then flipud (vertical flip)
+    # Empirically verified to match wsclean pixel layout (corr=0.82 with NN gridding)
+    img_np = np_mod.array(reverse(permutedims(I), dims=1), dtype=np_mod.float64)
     img_4d = np_mod.reshape(img_np, (1, 1, N, N))
 
     hdu = astropy_io_fits.PrimaryHDU(data=img_4d)
@@ -292,12 +295,13 @@ function save_fits(path::String, I::Matrix{Float64}, meta, config)
     hdr["CRVAL2"] = dec_deg
     hdr["CUNIT2"] = "deg"
 
-    # Frequency axis (axis 3)
+    # Frequency axis (axis 3) — band center + total bandwidth
     hdr["CTYPE3"] = "FREQ"
     hdr["CRPIX3"] = 1.0
-    hdr["CDELT3"] = dfreq_hz
-    hdr["CRVAL3"] = freq_hz
+    hdr["CDELT3"] = total_bw
+    hdr["CRVAL3"] = center_freq
     hdr["CUNIT3"] = "Hz"
+    hdr["SPECSYS"] = "TOPOCENT"
 
     # Stokes axis (axis 4), Stokes I = 1
     hdr["CTYPE4"] = "STOKES"
@@ -312,6 +316,7 @@ function save_fits(path::String, I::Matrix{Float64}, meta, config)
     hdr["ORIGIN"] = "TTCalX"
     hdr["TELESCOP"] = "OVRO-LWA"
     hdr["EQUINOX"] = 2000.0
+    hdr["LONPOLE"] = 180.0
 
     hdu.writeto(path, overwrite=true)
 end
