@@ -1,0 +1,758 @@
+# GPU Wide-Field Imager Module
+# 
+# Implements GPU-accelerated imaging with w-term correction using w-stacking.
+# Designed to work directly with peeled visibilities on GPU without requiring
+# intermediate MS files.
+#
+# Phase convention (matching CASA / wsclean):
+#   V(u,v,w) = ∫∫ I(l,m) · exp(-2πi(ul + vm + w(n-1))) dl dm / n
+#   I(l,m) ≈ Σ_k V_k · exp(+2πi(u_k·l + v_k·m + w_k·(n-1)))
+#
+# The w-stacking algorithm (Offringa et al. 2014):
+#   1. Bin visibilities by w-value into discrete w-layers
+#   2. Grid visibilities onto each w-layer's UV grid (no phase correction)
+#   3. IFFT each w-layer to image domain (IFFT has the +2πi sign needed)
+#   4. Apply w-correction phase: exp(+2πi · w_layer · (n-1)) per pixel
+#   5. Sum corrected layers → dirty image
+#
+# Key choices:
+#   - Uses IFFT (not FFT) so that the Fourier sign matches the imaging equation
+#   - Natural weighting: no per-cell normalization (best sensitivity)
+#   - Image normalization: divide by total weight sum after FFT
+#   - Hermitian conjugate: V(-u,-v,-w) = conj(V(u,v,w)) for real sky
+#
+# References:
+#   - Cornwell et al. (2008) "W Projection"
+#   - Offringa et al. (2014) "WSCLEAN: An implementation of a fast, generic 
+#     wide-field imager for radio astronomy"
+#   - Thompson, Moran & Swenson, "Interferometry and Synthesis in Radio Astronomy"
+
+module GPUImager
+
+using CUDA
+using LinearAlgebra
+using FFTW
+using Statistics
+
+# Import from parent module (TTCalX)
+using ..TTCalX: GPUVisibilities, GPUMetadata, GPUCalibration
+using ..TTCalX: Nbase, Nfreq, Nant
+using ..TTCalX: GPUPeelingSource, AbstractGPUPeelingSource, peel_gpu!
+using ..TTCalX: thread_index_1d
+using ..TTCalX: grid_nn_kernel!, w_correction_kernel!
+using ..TTCalX: log_step, log_substep, log_detail, log_success, log_warning
+
+# Helper functions
+_is_gpu(x::CuArray) = true
+_is_gpu(x::AbstractArray) = false
+_is_gpu(vis::GPUVisibilities) = _is_gpu(vis.xx)
+
+_zeros(::Type{T}, dims...; gpu::Bool=true) where T = 
+    gpu && CUDA.functional() ? CUDA.zeros(T, dims...) : zeros(T, dims...)
+
+# Export public API
+export GPUImagerConfig, GPUGrid, GPUImage
+export make_image, grid_visibilities!, grid_to_image!
+export field_of_view, image_coordinates, auto_configure_imager
+export w_layer_indices, w_correction_phase, combine_w_layers
+export peel_and_image
+
+#==============================================================================#
+#                          Configuration Types                                  #
+#==============================================================================#
+
+"""
+    GPUImagerConfig(; kwargs...)
+
+Configuration for GPU wide-field imager.
+
+# Fields
+- `image_size::Int`: Image dimensions (square, must be even for FFT centering)
+- `cell_size::Float64`: Angular size of each pixel in radians
+- `w_layers::Int`: Number of w-stacking layers
+- `padding_factor::Float64`: FFT zero-padding factor (≥1.0)
+- `weighting::Symbol`: Visibility weighting scheme (:natural, :uniform, :briggs)
+- `robust::Float64`: Robust parameter for Briggs weighting (-2 to 2)
+- `oversampling::Int`: Gridding convolution oversampling factor
+- `support::Int`: Gridding convolution kernel support (half-width in grid cells)
+- `w_max::Float64`: Maximum |w| in wavelengths (auto-computed if 0)
+"""
+struct GPUImagerConfig
+    image_size::Int
+    cell_size::Float64
+    w_layers::Int
+    padding_factor::Float64
+    weighting::Symbol
+    robust::Float64
+    oversampling::Int
+    support::Int
+    w_max::Float64
+    
+    function GPUImagerConfig(;
+        image_size::Int=512,
+        cell_size::Float64=deg2rad(1.0/60.0),  # 1 arcmin default
+        w_layers::Int=1,
+        padding_factor::Float64=1.0,
+        weighting::Symbol=:natural,
+        robust::Float64=0.0,
+        oversampling::Int=8,
+        support::Int=3,
+        w_max::Float64=0.0
+    )
+        @assert image_size > 0 && iseven(image_size) "image_size must be positive and even"
+        @assert cell_size > 0 "cell_size must be positive"
+        @assert w_layers >= 1 "w_layers must be at least 1"
+        @assert padding_factor >= 1.0 "padding_factor must be >= 1.0"
+        @assert weighting in [:natural, :uniform, :briggs] "weighting must be :natural, :uniform, or :briggs"
+        @assert -2.0 <= robust <= 2.0 "robust must be between -2 and 2"
+        
+        new(image_size, cell_size, w_layers, padding_factor, weighting, 
+            robust, oversampling, support, w_max)
+    end
+end
+
+"""
+    field_of_view(config::GPUImagerConfig) -> Float64
+
+Compute the angular field of view of the image in radians.
+"""
+function field_of_view(config::GPUImagerConfig)
+    return config.image_size * config.cell_size
+end
+
+"""
+    auto_configure_imager(meta, vis; image_size=512, cell_size=nothing) -> GPUImagerConfig
+
+Auto-configure imager based on observation parameters (UVW range, frequencies).
+"""
+function auto_configure_imager(meta::GPUMetadata, vis::GPUVisibilities;
+                               image_size::Int=512,
+                               cell_size::Union{Float64,Nothing}=nothing)
+    # Get UVW on CPU
+    uvw = meta.uvw isa CUDA.CuArray ? Array(meta.uvw) : meta.uvw
+    channels = meta.channels isa CUDA.CuArray ? Array(meta.channels) : meta.channels
+    
+    c = 299792458.0
+    λ_min = c / maximum(channels)
+    
+    # Compute maximum baseline in wavelengths
+    u_max = maximum(abs.(uvw[1, :])) / λ_min
+    v_max = maximum(abs.(uvw[2, :])) / λ_min
+    uv_max = max(u_max, v_max)
+    
+    # Auto cell size: ~3 pixels per beam (wsclean default factor)
+    if cell_size === nothing
+        cell_size = 1.0 / (3.0 * uv_max)  # radians
+    end
+    
+    # Compute w-range across all frequencies
+    w_max_wavelengths = 0.0
+    for β in 1:length(channels)
+        λ = c / channels[β]
+        w_max_β = maximum(abs.(uvw[3, :])) / λ
+        w_max_wavelengths = max(w_max_wavelengths, w_max_β)
+    end
+    
+    # Number of w-layers: phase error < 1 radian requires w_layers ≈ w_max * FoV^2 / 2
+    fov = image_size * cell_size
+    w_layers_needed = max(1, ceil(Int, w_max_wavelengths * fov^2 / 2.0))
+    w_layers = min(w_layers_needed, 128)
+    
+    return GPUImagerConfig(
+        image_size=image_size,
+        cell_size=cell_size,
+        w_layers=w_layers,
+        w_max=w_max_wavelengths
+    )
+end
+
+#==============================================================================#
+#                            Grid Types                                         #
+#==============================================================================#
+
+"""
+    GPUGrid(size, w_layers; gpu=true)
+
+GPU-friendly UV grid for w-stacking.
+
+Stores complex visibility grid and sampling weights with shape (Nu, Nv, Nw_layers).
+"""
+struct GPUGrid{T<:AbstractArray{ComplexF64}, W<:AbstractArray{Float64}}
+    data::T        # Complex visibility grid (Nu, Nv, Nw_layers)
+    weights::W     # Sampling density weights
+    w_values::Vector{Float64}  # w-value at center of each layer
+    
+    function GPUGrid(size::Int, w_layers::Int; gpu::Bool=true)
+        w_values = zeros(Float64, w_layers)
+        
+        if gpu && CUDA.functional()
+            data = CUDA.zeros(ComplexF64, size, size, w_layers)
+            weights = CUDA.zeros(Float64, size, size, w_layers)
+            new{typeof(data), typeof(weights)}(data, weights, w_values)
+        else
+            data = zeros(ComplexF64, size, size, w_layers)
+            weights = zeros(Float64, size, size, w_layers)
+            new{typeof(data), typeof(weights)}(data, weights, w_values)
+        end
+    end
+end
+
+"""Reset grid to zeros."""
+function Base.empty!(grid::GPUGrid)
+    fill!(grid.data, zero(ComplexF64))
+    fill!(grid.weights, zero(Float64))
+    fill!(grid.w_values, 0.0)
+    return grid
+end
+
+#==============================================================================#
+#                           Image Types                                         #
+#==============================================================================#
+
+"""
+    GPUImage(size; gpu=true)
+
+GPU-friendly image storage for full Stokes polarization.
+All images are 2D arrays of Float64 (Nu x Nv).
+"""
+struct GPUImage{T<:AbstractArray{Float64}}
+    stokes_I::T
+    stokes_Q::T
+    stokes_U::T
+    stokes_V::T
+    
+    function GPUImage(size::Int; gpu::Bool=true)
+        if gpu && CUDA.functional()
+            I = CUDA.zeros(Float64, size, size)
+            Q = CUDA.zeros(Float64, size, size)
+            U = CUDA.zeros(Float64, size, size)
+            V = CUDA.zeros(Float64, size, size)
+            new{typeof(I)}(I, Q, U, V)
+        else
+            I = zeros(Float64, size, size)
+            Q = zeros(Float64, size, size)
+            U = zeros(Float64, size, size)
+            V = zeros(Float64, size, size)
+            new{typeof(I)}(I, Q, U, V)
+        end
+    end
+end
+
+"""
+    image_coordinates(img, config) -> (l_coords, m_coords)
+
+Compute image coordinate arrays (l, m) in radians.
+"""
+function image_coordinates(img::GPUImage, config::GPUImagerConfig)
+    N = size(img.stokes_I, 1)
+    cell = config.cell_size
+    half = N ÷ 2
+    l_coords = [(i - half - 1) * cell for i in 1:N]
+    m_coords = [(j - half - 1) * cell for j in 1:N]
+    return l_coords, m_coords
+end
+
+#==============================================================================#
+#                         Gridding Functions                                    #
+#==============================================================================#
+
+"""
+Compute w-layer index for each visibility.
+"""
+function w_layer_indices(w_values::AbstractVector, config::GPUImagerConfig)
+    Nw = config.w_layers
+    
+    if Nw == 1
+        return ones(Int, length(w_values))
+    end
+    
+    w_min, w_max = extrema(w_values)
+    w_range = w_max - w_min
+    
+    if w_range < 1e-10
+        return ones(Int, length(w_values))
+    end
+    
+    layers = floor.(Int, (w_values .- w_min) ./ w_range .* Nw) .+ 1
+    return clamp.(layers, 1, Nw)
+end
+
+"""
+    grid_visibilities!(grid, vis, meta, config) -> grid
+
+Grid visibilities onto UV grid with w-stacking.
+Dispatches to GPU or CPU implementation based on array types.
+"""
+function grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities, 
+                           meta::GPUMetadata, config::GPUImagerConfig)
+    use_gpu = _is_gpu(vis)
+    
+    if use_gpu
+        gpu_grid_visibilities!(grid, vis, meta, config)
+    else
+        cpu_grid_visibilities!(grid, vis, meta, config)
+    end
+    
+    return grid
+end
+
+"""
+CPU implementation of visibility gridding with w-stacking.
+"""
+function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
+                                meta::GPUMetadata, config::GPUImagerConfig)
+    N = config.image_size
+    Nw = config.w_layers
+    cell = config.cell_size
+    Nb = Nbase(vis)
+    Nf = Nfreq(vis)
+    
+    # Get arrays on CPU
+    uvw = meta.uvw isa CUDA.CuArray ? Array(meta.uvw) : meta.uvw
+    channels = meta.channels isa CUDA.CuArray ? Array(meta.channels) : meta.channels
+    flags = vis.flags isa CUDA.CuArray ? Array(vis.flags) : vis.flags
+    
+    vis_xx = vis.xx isa CUDA.CuArray ? Array(vis.xx) : vis.xx
+    vis_yy = vis.yy isa CUDA.CuArray ? Array(vis.yy) : vis.yy
+    vis_xy = vis.xy isa CUDA.CuArray ? Array(vis.xy) : vis.xy
+    vis_yx = vis.yx isa CUDA.CuArray ? Array(vis.yx) : vis.yx
+    
+    c = 299792458.0
+    uv_cell = 1.0 / (N * cell)
+    center = N ÷ 2 + 1
+    
+    # Reset grid
+    empty!(grid)
+    
+    # Compute w-layer boundaries (include both +w and -w for Hermitian conjugates)
+    w_min = Inf
+    w_max = -Inf
+    for β in 1:Nf
+        λ = c / channels[β]
+        for α in 1:Nb
+            w_λ = uvw[3, α] / λ
+            w_min = min(w_min, w_λ, -w_λ)
+            w_max = max(w_max, w_λ, -w_λ)
+        end
+    end
+    if w_min > w_max
+        return grid
+    end
+    w_range = max(w_max - w_min, 1e-10)
+    
+    # Set layer center w-values
+    for w in 1:Nw
+        grid.w_values[w] = w_min + (w - 0.5) * w_range / Nw
+    end
+    
+    # Grid each visibility
+    @inbounds for β in 1:Nf
+        λ = c / channels[β]
+        
+        for α in 1:Nb
+            if flags[α, β]
+                continue
+            end
+            
+            u = uvw[1, α] / λ
+            v = uvw[2, α] / λ
+            w = uvw[3, α] / λ
+            
+            iu = round(Int, u / uv_cell) + center
+            iv = round(Int, v / uv_cell) + center
+            
+            if iu < 1 || iu > N || iv < 1 || iv > N
+                continue
+            end
+            
+            # W-layer assignment
+            if Nw == 1
+                iw = 1
+            else
+                iw = clamp(floor(Int, (w - w_min) / w_range * Nw) + 1, 1, Nw)
+            end
+            
+            # Stokes I from XX and YY
+            V = 0.5 * (vis_xx[α, β] + vis_yy[α, β])
+            
+            grid.data[iu, iv, iw] += V
+            grid.weights[iu, iv, iw] += 1.0
+            
+            # Hermitian conjugate: V(-u,-v,-w) = conj(V(u,v,w))
+            iu_conj = N - iu + 2
+            iv_conj = N - iv + 2
+            if iu_conj >= 1 && iu_conj <= N && iv_conj >= 1 && iv_conj <= N
+                neg_w = -w
+                if Nw == 1
+                    iw_conj = 1
+                else
+                    iw_conj = clamp(floor(Int, (neg_w - w_min) / w_range * Nw) + 1, 1, Nw)
+                end
+                grid.data[iu_conj, iv_conj, iw_conj] += conj(V)
+                grid.weights[iu_conj, iv_conj, iw_conj] += 1.0
+            end
+        end
+    end
+    
+    apply_weighting!(grid, config)
+    return grid
+end
+
+"""
+GPU implementation of visibility gridding using CUDA kernel.
+
+Launches `grid_nn_kernel!` to grid all visibilities on GPU in parallel.
+Each CUDA thread handles one (baseline, channel) pair, using atomic adds
+to accumulate onto the shared UV grid.
+"""
+function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
+                                meta::GPUMetadata, config::GPUImagerConfig)
+    N = config.image_size
+    Nw = config.w_layers
+    cell = config.cell_size
+    Nb = Nbase(vis)
+    Nf = Nfreq(vis)
+    c = 299792458.0
+    
+    uv_cell = 1.0 / (N * cell)
+    center = Int32(N ÷ 2 + 1)
+    
+    empty!(grid)
+    
+    # Compute w-range on CPU
+    uvw_cpu = Array(meta.uvw)
+    channels_cpu = Array(meta.channels)
+    
+    w_min = Inf
+    w_max = -Inf
+    for β in 1:Nf
+        λ = c / channels_cpu[β]
+        for α in 1:Nb
+            w_λ = uvw_cpu[3, α] / λ
+            w_min = min(w_min, w_λ, -w_λ)
+            w_max = max(w_max, w_λ, -w_λ)
+        end
+    end
+    if w_min > w_max
+        return grid
+    end
+    w_range = max(w_max - w_min, 1e-10)
+    
+    for w in 1:Nw
+        grid.w_values[w] = w_min + (w - 0.5) * w_range / Nw
+    end
+    
+    # Extract real/imag parts on GPU
+    vis_xx_re = real.(vis.xx)
+    vis_xx_im = imag.(vis.xx)
+    vis_yy_re = real.(vis.yy)
+    vis_yy_im = imag.(vis.yy)
+    
+    # Allocate split real/imag grid on GPU (kernel uses atomic Float64 adds)
+    grid_re = CUDA.zeros(Float64, N, N, Nw)
+    grid_im = CUDA.zeros(Float64, N, N, Nw)
+    grid_wt = CUDA.zeros(Float64, N, N, Nw)
+    
+    # Launch gridding kernel
+    total_items = Nb * Nf
+    threads = min(256, total_items)
+    blocks = cld(total_items, threads)
+    
+    @cuda blocks=blocks threads=threads grid_nn_kernel!(
+        grid_re, grid_im, grid_wt,
+        vis_xx_re, vis_xx_im,
+        vis_yy_re, vis_yy_im,
+        vis.flags,
+        meta.uvw, meta.channels,
+        Float64(w_min), Float64(w_range), Int32(Nw),
+        Int32(N), Float64(uv_cell), center,
+        Int32(Nb), Int32(Nf)
+    )
+    CUDA.synchronize()
+    
+    # Combine real/imag into complex grid
+    grid.data .= complex.(grid_re, grid_im)
+    grid.weights .= grid_wt
+    
+    CUDA.unsafe_free!(grid_re)
+    CUDA.unsafe_free!(grid_im)
+    CUDA.unsafe_free!(grid_wt)
+    
+    apply_weighting!(grid, config)
+    return grid
+end
+
+"""
+Apply visibility weighting (natural, uniform, or Briggs).
+
+Weighting schemes (matching wsclean):
+- Natural: weight = 1 per sample. Best point-source sensitivity.
+- Uniform: divide each cell by its sample count. Higher resolution but higher noise.
+- Briggs: interpolates between natural (robust=+2) and uniform (robust=-2).
+"""
+function apply_weighting!(grid::GPUGrid, config::GPUImagerConfig)
+    if config.weighting == :natural
+        return grid
+        
+    elseif config.weighting == :uniform
+        safe_w = max.(grid.weights, one(Float64))
+        grid.data ./= safe_w
+        grid.weights .= sign.(grid.weights)
+        
+    elseif config.weighting == :briggs
+        robust = config.robust
+        total_weight = sum(grid.weights)
+        sum_w2 = sum(grid.weights .^ 2)
+        if sum_w2 > 0 && total_weight > 0
+            f2 = (5.0 * 10.0^(-robust))^2 / (sum_w2 / total_weight)
+        else
+            f2 = 1.0
+        end
+        briggs_w = 1.0 ./ (1.0 .+ f2 .* grid.weights)
+        grid.data .*= briggs_w
+        grid.weights .*= briggs_w
+    end
+    
+    return grid
+end
+
+#==============================================================================#
+#                        W-Term Correction                                      #
+#==============================================================================#
+
+"""
+    w_correction_phase(l, m, w) -> ComplexF64
+
+Compute w-correction phase for a point (l, m) at w-value w (in wavelengths).
+
+The w-correction applies the phase: exp(2πi w (√(1-l²-m²) - 1))
+"""
+function w_correction_phase(l::Float64, m::Float64, w::Float64)
+    r2 = l^2 + m^2
+    if r2 >= 1.0
+        return zero(ComplexF64)
+    end
+    n = sqrt(1.0 - r2)
+    return exp(2π * im * w * (n - 1.0))
+end
+
+"""
+    combine_w_layers(grid, config) -> Matrix{ComplexF64}
+
+Combine w-layers into single image by applying w-correction in image domain.
+"""
+function combine_w_layers(grid::GPUGrid, config::GPUImagerConfig)
+    N = config.image_size
+    Nw = size(grid.data, 3)
+    cell = config.cell_size
+    
+    combined = zeros(ComplexF64, N, N)
+    half = N ÷ 2
+    
+    for iw in 1:Nw
+        layer_fft = fftshift(ifft(ifftshift(grid.data[:, :, iw]))) .* N^2
+        w_layer = grid.w_values[iw]
+        
+        for iv in 1:N
+            m = (iv - half - 1) * cell
+            for iu in 1:N
+                l = (iu - half - 1) * cell
+                correction = w_correction_phase(l, m, w_layer)
+                combined[iu, iv] += layer_fft[iu, iv] * correction
+            end
+        end
+    end
+    
+    return combined
+end
+
+#==============================================================================#
+#                        Image Formation                                        #
+#==============================================================================#
+
+"""
+    grid_to_image!(img, grid, config) -> img
+
+Convert gridded visibilities to image via FFT with w-correction.
+Dispatches to GPU or CPU implementation.
+"""
+function grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfig)
+    use_gpu = grid.data isa CUDA.CuArray
+    
+    if use_gpu
+        gpu_grid_to_image!(img, grid, config)
+    else
+        cpu_grid_to_image!(img, grid, config)
+    end
+    
+    return img
+end
+
+"""CPU implementation of grid to image conversion."""
+function cpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfig)
+    N = config.image_size
+    Nw = config.w_layers
+    
+    if Nw == 1
+        dirty = real.(fftshift(ifft(ifftshift(grid.data[:, :, 1])))) .* N^2
+    else
+        combined = combine_w_layers(grid, config)
+        dirty = real.(combined)
+    end
+    
+    total_weight = sum(grid.weights)
+    if total_weight > 0
+        dirty ./= total_weight
+    end
+    
+    copyto!(img.stokes_I, dirty)
+    fill!(img.stokes_Q, 0.0)
+    fill!(img.stokes_U, 0.0)
+    fill!(img.stokes_V, 0.0)
+    
+    return img
+end
+
+"""
+GPU implementation of grid to image conversion.
+
+Uses cuFFT (via AbstractFFTs on CuArrays) for fast Fourier transforms
+and `w_correction_kernel!` for w-term phase correction. Everything stays on GPU.
+"""
+function gpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfig)
+    N = config.image_size
+    Nw = config.w_layers
+    cell = config.cell_size
+    center = Int32(N ÷ 2 + 1)
+    
+    if Nw == 1
+        layer = grid.data[:, :, 1]
+        dirty_complex = fftshift(ifft(ifftshift(layer))) .* Float64(N^2)
+        dirty = real.(dirty_complex)
+    else
+        combined_re = CUDA.zeros(Float64, N, N)
+        combined_im = CUDA.zeros(Float64, N, N)
+        
+        plan = plan_ifft(CUDA.zeros(ComplexF64, N, N))
+        
+        total_pixels = N * N
+        threads = min(256, total_pixels)
+        blocks = cld(total_pixels, threads)
+        
+        for iw in 1:Nw
+            layer = grid.data[:, :, iw]
+            layer_fft = fftshift(plan * ifftshift(layer)) .* Float64(N^2)
+            
+            layer_re = real.(layer_fft)
+            layer_im = imag.(layer_fft)
+            
+            w_val = grid.w_values[iw]
+            @cuda blocks=blocks threads=threads w_correction_kernel!(
+                combined_re, combined_im,
+                layer_re, layer_im,
+                Float64(w_val),
+                Int32(N), Float64(cell),
+                center
+            )
+            CUDA.synchronize()
+        end
+        
+        dirty = combined_re
+        CUDA.unsafe_free!(combined_im)
+    end
+    
+    total_weight = sum(grid.weights)
+    if total_weight > 0
+        dirty ./= total_weight
+    end
+    
+    copyto!(img.stokes_I, dirty)
+    fill!(img.stokes_Q, 0.0)
+    fill!(img.stokes_U, 0.0)
+    fill!(img.stokes_V, 0.0)
+    
+    return img
+end
+
+#==============================================================================#
+#                        High-Level API                                         #
+#==============================================================================#
+
+"""
+    make_image(vis, meta, config) -> GPUImage
+
+Create a dirty image from visibilities.
+
+# Arguments
+- `vis::GPUVisibilities`: Input visibilities
+- `meta::GPUMetadata`: Observation metadata
+- `config::GPUImagerConfig`: Imaging configuration
+
+# Returns
+- `GPUImage`: Dirty image (Stokes I, Q, U, V)
+"""
+function make_image(vis::GPUVisibilities, meta::GPUMetadata, config::GPUImagerConfig)
+    use_gpu = _is_gpu(vis)
+    
+    grid = GPUGrid(config.image_size, config.w_layers, gpu=use_gpu)
+    img = GPUImage(config.image_size, gpu=use_gpu)
+    
+    grid_visibilities!(grid, vis, meta, config)
+    grid_to_image!(img, grid, config)
+    
+    return img
+end
+
+"""
+    peel_and_image(vis, meta, sources, config; kwargs...) -> GPUImage
+
+Peel sources and create image without intermediate MS files.
+
+This is the main workflow function that keeps all data on GPU:
+1. Peel specified sources from visibilities
+2. Grid residual visibilities
+3. Apply w-correction
+4. FFT to create dirty image
+
+# Arguments
+- `vis::GPUVisibilities`: Input visibilities (modified in place)
+- `meta::GPUMetadata`: Observation metadata  
+- `sources::Vector{<:AbstractGPUPeelingSource}`: Sources to peel
+- `config::GPUImagerConfig`: Imaging configuration
+
+# Keyword Arguments
+- `peeliter::Int=3`: Number of peeling iterations
+- `maxiter::Int=20`: Max stefcal iterations per source
+- `tolerance::Float64=1e-3`: Stefcal convergence tolerance
+- `minuvw::Float64=0.0`: Minimum baseline length in wavelengths
+- `phase_center_ra::Float64=0.0`: Phase center RA (radians)
+- `phase_center_dec::Float64=0.0`: Phase center Dec (radians)  
+- `lst::Float64=0.0`: Local sidereal time (radians)
+
+# Returns
+- `GPUImage`: Dirty image of residuals after peeling
+"""
+function peel_and_image(vis::GPUVisibilities, meta::GPUMetadata,
+                        sources::Vector{T}, config::GPUImagerConfig;
+                        peeliter::Int=3, maxiter::Int=20, tolerance::Float64=1e-3,
+                        minuvw::Float64=0.0,
+                        phase_center_ra::Float64=0.0, phase_center_dec::Float64=0.0,
+                        lst::Float64=0.0) where {T}
+    
+    # Step 1: Peel sources (keeps data on GPU)
+    log_step("Peeling $(length(sources)) sources...")
+    calibrations = peel_gpu!(vis, meta, sources;
+                             peeliter=peeliter, maxiter=maxiter, tolerance=tolerance,
+                             minuvw=minuvw,
+                             phase_center_ra=phase_center_ra, phase_center_dec=phase_center_dec,
+                             lst=lst)
+    
+    # Step 2: Image the residuals (still on GPU)
+    log_step("Imaging residuals...")
+    img = make_image(vis, meta, config)
+    
+    log_success("Peel-and-image complete")
+    return img
+end
+
+end # module GPUImager

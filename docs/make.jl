@@ -23,6 +23,7 @@ makedocs(
         "Calibration"     => "calibration.md",
         "Source Models"    => "sources.md",
         "GPU Kernels"     => "kernels.md",
+        "GPU Imager"      => "gpu-imager.md",
         "MS I/O"          => "msio.md",
         "CLI Reference"   => "cli.md",
         "API Reference"   => "api.md",

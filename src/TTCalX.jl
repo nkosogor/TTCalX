@@ -15,6 +15,8 @@ using StaticArrays
 using LinearAlgebra
 using JSON
 using Printf
+using FFTW
+using Statistics
 
 # Re-export CUDA utilities
 export CuArray, CUDA
@@ -48,6 +50,13 @@ export Nbase, Nfreq, Nant
 export read_ms_to_gpu, write_gpu_to_ms!
 export init_pycasacore
 
+# Export imager types and functions
+export GPUImagerConfig, GPUGrid, GPUImage
+export make_image, grid_visibilities!, grid_to_image!
+export field_of_view, image_coordinates, auto_configure_imager
+export w_layer_indices, w_correction_phase, combine_w_layers
+export peel_and_image
+
 # Export logging utilities
 export set_verbosity, get_verbosity, is_quiet, is_verbose, is_normal
 export ProgressBar, update!, finish!
@@ -63,9 +72,12 @@ include("gpu/kernels/utils.jl")
 include("gpu/kernels/corrupt.jl")
 include("gpu/kernels/stefcal.jl")
 include("gpu/kernels/genvis.jl")
+include("gpu/kernels/imager.jl")
 include("gpu/sources.jl")
 include("gpu/peel_gpu.jl")
 include("gpu/pycall_ms_bridge.jl")
+include("gpu/imager.jl")
+using .GPUImager
 
 """
     is_gpu_available()
