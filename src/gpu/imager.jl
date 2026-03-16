@@ -21,6 +21,12 @@
 #   - Image normalization: divide by total weight sum after FFT
 #   - Hermitian conjugate: V(-u,-v,-w) = conj(V(u,v,w)) for real sky
 #
+# Memory optimization:
+#   - Grid stored as split Float64 real/imag arrays — CUDA kernels write
+#     directly via atomic Float64 adds, no temporary 3D allocation needed
+#   - FFT working buffers pre-allocated and reused across w-layers
+#   - In-place cuFFT via plan_ifft! — zero allocation per iteration
+#
 # References:
 #   - Cornwell et al. (2008) "W Projection"
 #   - Offringa et al. (2014) "WSCLEAN: An implementation of a fast, generic 
@@ -49,6 +55,20 @@ _is_gpu(vis::GPUVisibilities) = _is_gpu(vis.xx)
 
 _zeros(::Type{T}, dims...; gpu::Bool=true) where T = 
     gpu && CUDA.functional() ? CUDA.zeros(T, dims...) : zeros(T, dims...)
+
+"""
+In-place 2D FFT quadrant swap (fftshift / ifftshift for even-sized arrays).
+Uses view-based copies that dispatch to GPU kernels on CuArrays.
+"""
+function fftshift_2d!(dst::AbstractMatrix, src::AbstractMatrix)
+    N = size(src, 1)
+    h = N ÷ 2
+    dst[1:h, 1:h]     .= @view src[h+1:N, h+1:N]
+    dst[h+1:N, h+1:N] .= @view src[1:h, 1:h]
+    dst[1:h, h+1:N]   .= @view src[h+1:N, 1:h]
+    dst[h+1:N, 1:h]   .= @view src[1:h, h+1:N]
+    return dst
+end
 
 # Export public API
 export GPUImagerConfig, GPUGrid, GPUImage
@@ -173,33 +193,40 @@ end
 """
     GPUGrid(size, w_layers; gpu=true)
 
-GPU-friendly UV grid for w-stacking.
+GPU-friendly UV grid for w-stacking using split real/imaginary storage.
 
-Stores complex visibility grid and sampling weights with shape (Nu, Nv, Nw_layers).
+Uses separate Float64 arrays for real and imaginary parts so that CUDA
+kernels can use atomic Float64 adds directly — no temporary allocation needed.
+
+Shape: (N, N, Nw_layers) for each of data_re, data_im, weights.
 """
-struct GPUGrid{T<:AbstractArray{ComplexF64}, W<:AbstractArray{Float64}}
-    data::T        # Complex visibility grid (Nu, Nv, Nw_layers)
-    weights::W     # Sampling density weights
+struct GPUGrid{T<:AbstractArray{Float64}}
+    data_re::T     # Real part of visibility grid (N, N, Nw)
+    data_im::T     # Imaginary part of visibility grid (N, N, Nw)
+    weights::T     # Sampling density weights (N, N, Nw)
     w_values::Vector{Float64}  # w-value at center of each layer
     
     function GPUGrid(size::Int, w_layers::Int; gpu::Bool=true)
         w_values = zeros(Float64, w_layers)
         
         if gpu && CUDA.functional()
-            data = CUDA.zeros(ComplexF64, size, size, w_layers)
+            data_re = CUDA.zeros(Float64, size, size, w_layers)
+            data_im = CUDA.zeros(Float64, size, size, w_layers)
             weights = CUDA.zeros(Float64, size, size, w_layers)
-            new{typeof(data), typeof(weights)}(data, weights, w_values)
+            new{typeof(data_re)}(data_re, data_im, weights, w_values)
         else
-            data = zeros(ComplexF64, size, size, w_layers)
+            data_re = zeros(Float64, size, size, w_layers)
+            data_im = zeros(Float64, size, size, w_layers)
             weights = zeros(Float64, size, size, w_layers)
-            new{typeof(data), typeof(weights)}(data, weights, w_values)
+            new{typeof(data_re)}(data_re, data_im, weights, w_values)
         end
     end
 end
 
 """Reset grid to zeros."""
 function Base.empty!(grid::GPUGrid)
-    fill!(grid.data, zero(ComplexF64))
+    fill!(grid.data_re, zero(Float64))
+    fill!(grid.data_im, zero(Float64))
     fill!(grid.weights, zero(Float64))
     fill!(grid.w_values, 0.0)
     return grid
@@ -375,7 +402,8 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
             # Stokes I from XX and YY
             V = 0.5 * (vis_xx[α, β] + vis_yy[α, β])
             
-            grid.data[iu, iv, iw] += V
+            grid.data_re[iu, iv, iw] += real(V)
+            grid.data_im[iu, iv, iw] += imag(V)
             grid.weights[iu, iv, iw] += 1.0
             
             # Hermitian conjugate: V(-u,-v,-w) = conj(V(u,v,w))
@@ -388,7 +416,8 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
                 else
                     iw_conj = clamp(floor(Int, (neg_w - w_min) / w_range * Nw) + 1, 1, Nw)
                 end
-                grid.data[iu_conj, iv_conj, iw_conj] += conj(V)
+                grid.data_re[iu_conj, iv_conj, iw_conj] += real(V)
+                grid.data_im[iu_conj, iv_conj, iw_conj] -= imag(V)  # conj
                 grid.weights[iu_conj, iv_conj, iw_conj] += 1.0
             end
         end
@@ -401,9 +430,8 @@ end
 """
 GPU implementation of visibility gridding using CUDA kernel.
 
-Launches `grid_nn_kernel!` to grid all visibilities on GPU in parallel.
-Each CUDA thread handles one (baseline, channel) pair, using atomic adds
-to accumulate onto the shared UV grid.
+Launches `grid_nn_kernel!` which writes directly to the grid's split re/im
+arrays via atomic Float64 adds — no temporary 3D allocation needed.
 """
 function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
                                 meta::GPUMetadata, config::GPUImagerConfig)
@@ -419,7 +447,7 @@ function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
     
     empty!(grid)
     
-    # Compute w-range on CPU
+    # Compute w-range on CPU (small data transfer)
     uvw_cpu = Array(meta.uvw)
     channels_cpu = Array(meta.channels)
     
@@ -442,24 +470,20 @@ function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
         grid.w_values[w] = w_min + (w - 0.5) * w_range / Nw
     end
     
-    # Extract real/imag parts on GPU
+    # Extract real/imag parts of visibilities on GPU (small: Nbase × Nfreq)
     vis_xx_re = real.(vis.xx)
     vis_xx_im = imag.(vis.xx)
     vis_yy_re = real.(vis.yy)
     vis_yy_im = imag.(vis.yy)
     
-    # Allocate split real/imag grid on GPU (kernel uses atomic Float64 adds)
-    grid_re = CUDA.zeros(Float64, N, N, Nw)
-    grid_im = CUDA.zeros(Float64, N, N, Nw)
-    grid_wt = CUDA.zeros(Float64, N, N, Nw)
-    
-    # Launch gridding kernel
+    # Launch gridding kernel — writes DIRECTLY to grid.data_re/im/weights
+    # No temporary N×N×Nw arrays needed!
     total_items = Nb * Nf
     threads = min(256, total_items)
     blocks = cld(total_items, threads)
     
     @cuda blocks=blocks threads=threads grid_nn_kernel!(
-        grid_re, grid_im, grid_wt,
+        grid.data_re, grid.data_im, grid.weights,
         vis_xx_re, vis_xx_im,
         vis_yy_re, vis_yy_im,
         vis.flags,
@@ -470,13 +494,11 @@ function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
     )
     CUDA.synchronize()
     
-    # Combine real/imag into complex grid
-    grid.data .= complex.(grid_re, grid_im)
-    grid.weights .= grid_wt
-    
-    CUDA.unsafe_free!(grid_re)
-    CUDA.unsafe_free!(grid_im)
-    CUDA.unsafe_free!(grid_wt)
+    # Free vis re/im temporaries
+    CUDA.unsafe_free!(vis_xx_re)
+    CUDA.unsafe_free!(vis_xx_im)
+    CUDA.unsafe_free!(vis_yy_re)
+    CUDA.unsafe_free!(vis_yy_im)
     
     apply_weighting!(grid, config)
     return grid
@@ -496,7 +518,8 @@ function apply_weighting!(grid::GPUGrid, config::GPUImagerConfig)
         
     elseif config.weighting == :uniform
         safe_w = max.(grid.weights, one(Float64))
-        grid.data ./= safe_w
+        grid.data_re ./= safe_w
+        grid.data_im ./= safe_w
         grid.weights .= sign.(grid.weights)
         
     elseif config.weighting == :briggs
@@ -509,7 +532,8 @@ function apply_weighting!(grid::GPUGrid, config::GPUImagerConfig)
             f2 = 1.0
         end
         briggs_w = 1.0 ./ (1.0 .+ f2 .* grid.weights)
-        grid.data .*= briggs_w
+        grid.data_re .*= briggs_w
+        grid.data_im .*= briggs_w
         grid.weights .*= briggs_w
     end
     
@@ -539,18 +563,19 @@ end
 """
     combine_w_layers(grid, config) -> Matrix{ComplexF64}
 
-Combine w-layers into single image by applying w-correction in image domain.
+Combine w-layers into single image by applying w-correction in image domain (CPU).
 """
 function combine_w_layers(grid::GPUGrid, config::GPUImagerConfig)
     N = config.image_size
-    Nw = size(grid.data, 3)
+    Nw = size(grid.data_re, 3)
     cell = config.cell_size
     
     combined = zeros(ComplexF64, N, N)
     half = N ÷ 2
     
     for iw in 1:Nw
-        layer_fft = fftshift(ifft(ifftshift(grid.data[:, :, iw]))) .* N^2
+        layer_data = complex.(grid.data_re[:, :, iw], grid.data_im[:, :, iw])
+        layer_fft = fftshift(ifft(ifftshift(layer_data))) .* N^2
         w_layer = grid.w_values[iw]
         
         for iv in 1:N
@@ -577,7 +602,7 @@ Convert gridded visibilities to image via FFT with w-correction.
 Dispatches to GPU or CPU implementation.
 """
 function grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfig)
-    use_gpu = grid.data isa CUDA.CuArray
+    use_gpu = grid.data_re isa CUDA.CuArray
     
     if use_gpu
         gpu_grid_to_image!(img, grid, config)
@@ -594,7 +619,8 @@ function cpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfi
     Nw = config.w_layers
     
     if Nw == 1
-        dirty = real.(fftshift(ifft(ifftshift(grid.data[:, :, 1])))) .* N^2
+        layer_data = complex.(grid.data_re[:, :, 1], grid.data_im[:, :, 1])
+        dirty = real.(fftshift(ifft(ifftshift(layer_data)))) .* N^2
     else
         combined = combine_w_layers(grid, config)
         dirty = real.(combined)
@@ -616,8 +642,12 @@ end
 """
 GPU implementation of grid to image conversion.
 
-Uses cuFFT (via AbstractFFTs on CuArrays) for fast Fourier transforms
-and `w_correction_kernel!` for w-term phase correction. Everything stays on GPU.
+Pre-allocates all working buffers and reuses them across w-layers.
+Uses in-place cuFFT (plan_ifft!) and fftshift_2d! to avoid per-iteration
+allocations — the main speedup over the previous implementation.
+
+Memory: 2 × N² ComplexF64 + 4 × N² Float64 ≈ N² × 64 bytes of working space.
+For N=4096: ~1 GiB regardless of number of w-layers.
 """
 function gpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfig)
     N = config.image_size
@@ -625,51 +655,72 @@ function gpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfi
     cell = config.cell_size
     center = Int32(N ÷ 2 + 1)
     
+    # Pre-allocate FFT working buffers (reused across all w-layers)
+    buf_a = CUDA.zeros(ComplexF64, N, N)
+    buf_b = CUDA.zeros(ComplexF64, N, N)
+    plan = plan_ifft!(buf_b)  # In-place IFFT plan tied to buf_b
+    
     if Nw == 1
-        layer = grid.data[:, :, 1]
-        dirty_complex = fftshift(ifft(ifftshift(layer))) .* Float64(N^2)
-        dirty = real.(dirty_complex)
+        # Single w-layer: no w-correction needed
+        buf_a .= complex.(@view(grid.data_re[:, :, 1]), @view(grid.data_im[:, :, 1]))
+        fftshift_2d!(buf_b, buf_a)   # ifftshift into buf_b
+        plan * buf_b                   # In-place IFFT (overwrites buf_b)
+        fftshift_2d!(buf_a, buf_b)    # fftshift result into buf_a
+        buf_a .*= Float64(N^2)
+        img.stokes_I .= real.(buf_a)
     else
-        combined_re = CUDA.zeros(Float64, N, N)
+        # W-stacking: cuFFT each layer + GPU w-correction kernel
+        layer_re = CUDA.zeros(Float64, N, N)
+        layer_im = CUDA.zeros(Float64, N, N)
         combined_im = CUDA.zeros(Float64, N, N)
-        
-        plan = plan_ifft(CUDA.zeros(ComplexF64, N, N))
+        fill!(img.stokes_I, 0.0)  # Use stokes_I as accumulator for real part
         
         total_pixels = N * N
         threads = min(256, total_pixels)
         blocks = cld(total_pixels, threads)
         
         for iw in 1:Nw
-            layer = grid.data[:, :, iw]
-            layer_fft = fftshift(plan * ifftshift(layer)) .* Float64(N^2)
+            # Combine split re/im into complex buffer
+            buf_a .= complex.(@view(grid.data_re[:, :, iw]), @view(grid.data_im[:, :, iw]))
             
-            layer_re = real.(layer_fft)
-            layer_im = imag.(layer_fft)
+            # ifftshift → in-place IFFT → fftshift (zero allocation)
+            fftshift_2d!(buf_b, buf_a)
+            plan * buf_b
+            fftshift_2d!(buf_a, buf_b)
+            buf_a .*= Float64(N^2)
             
-            w_val = grid.w_values[iw]
+            # Split into re/im for w-correction kernel
+            layer_re .= real.(buf_a)
+            layer_im .= imag.(buf_a)
+            
+            # Apply w-correction phase and accumulate into img.stokes_I
             @cuda blocks=blocks threads=threads w_correction_kernel!(
-                combined_re, combined_im,
+                img.stokes_I, combined_im,
                 layer_re, layer_im,
-                Float64(w_val),
+                Float64(grid.w_values[iw]),
                 Int32(N), Float64(cell),
                 center
             )
             CUDA.synchronize()
         end
         
-        dirty = combined_re
         CUDA.unsafe_free!(combined_im)
+        CUDA.unsafe_free!(layer_re)
+        CUDA.unsafe_free!(layer_im)
     end
     
+    # Normalize by total weight for correct flux scale
     total_weight = sum(grid.weights)
     if total_weight > 0
-        dirty ./= total_weight
+        img.stokes_I ./= total_weight
     end
     
-    copyto!(img.stokes_I, dirty)
     fill!(img.stokes_Q, 0.0)
     fill!(img.stokes_U, 0.0)
     fill!(img.stokes_V, 0.0)
+    
+    CUDA.unsafe_free!(buf_a)
+    CUDA.unsafe_free!(buf_b)
     
     return img
 end

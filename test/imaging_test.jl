@@ -139,15 +139,17 @@ end
     @testset "Grid and Image types" begin
         # CPU grid
         grid = GPUGrid(64, 2, gpu=false)
-        @test size(grid.data) == (64, 64, 2)
+        @test size(grid.data_re) == (64, 64, 2)
+        @test size(grid.data_im) == (64, 64, 2)
         @test size(grid.weights) == (64, 64, 2)
         @test length(grid.w_values) == 2
-        @test all(grid.data .== 0)
+        @test all(grid.data_re .== 0)
+        @test all(grid.data_im .== 0)
         
         # Reset
-        grid.data[1,1,1] = 1.0 + 0im
+        grid.data_re[1,1,1] = 1.0
         empty!(grid)
-        @test all(grid.data .== 0)
+        @test all(grid.data_re .== 0)
         
         # CPU image
         img = GPUImage(64, gpu=false)
@@ -203,7 +205,7 @@ end
         grid_visibilities!(grid, vis, meta, config)
         
         # Grid should have non-zero values
-        @test sum(abs.(grid.data)) > 0
+        @test sum(grid.data_re .^ 2 .+ grid.data_im .^ 2) > 0
         @test sum(grid.weights) > 0
     end
     
