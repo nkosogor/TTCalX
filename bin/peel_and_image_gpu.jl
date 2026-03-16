@@ -251,12 +251,87 @@ function image_stats(I::Matrix{Float64}, label::String)
     log_substep(@sprintf("Dynamic rng: %.1f  (peak / rms)", maximum(abs.(I)) / std(I)))
 end
 
+"""Save a FITS image with proper WCS headers (matches wsclean convention)."""
+function save_fits(path::String, I::Matrix{Float64}, meta, config)
+    astropy_io_fits = pyimport("astropy.io.fits")
+    np_mod = pyimport("numpy")
+
+    N = config.image_size
+    cell_deg = rad2deg(config.cell_size)
+    ra_deg  = rad2deg(meta.phase_center_ra)
+    dec_deg = rad2deg(meta.phase_center_dec)
+
+    # Compute reference frequency
+    channels_cpu = meta.channels isa CuArray ? Array(meta.channels) : meta.channels
+    freq_hz  = channels_cpu[1]
+    if length(channels_cpu) > 1
+        dfreq_hz = channels_cpu[2] - channels_cpu[1]
+    else
+        dfreq_hz = channels_cpu[1]
+    end
+
+    # wsclean convention: 4D array (1, 1, Ny, Nx) = (STOKES, FREQ, DEC, RA)
+    # Julia is column-major, numpy is row-major: transpose the 2D image
+    img_np = np_mod.array(permutedims(I), dtype=np_mod.float64)
+    img_4d = np_mod.reshape(img_np, (1, 1, N, N))
+
+    hdu = astropy_io_fits.PrimaryHDU(data=img_4d)
+    hdr = hdu.header
+
+    # RA axis (axis 1 in FITS = last numpy axis)
+    hdr["CTYPE1"] = "RA---SIN"
+    hdr["CRPIX1"] = Float64(N ÷ 2 + 1)
+    hdr["CDELT1"] = -cell_deg            # RA increases to the left
+    hdr["CRVAL1"] = ra_deg
+    hdr["CUNIT1"] = "deg"
+
+    # Dec axis (axis 2)
+    hdr["CTYPE2"] = "DEC--SIN"
+    hdr["CRPIX2"] = Float64(N ÷ 2 + 1)
+    hdr["CDELT2"] = cell_deg
+    hdr["CRVAL2"] = dec_deg
+    hdr["CUNIT2"] = "deg"
+
+    # Frequency axis (axis 3)
+    hdr["CTYPE3"] = "FREQ"
+    hdr["CRPIX3"] = 1.0
+    hdr["CDELT3"] = dfreq_hz
+    hdr["CRVAL3"] = freq_hz
+    hdr["CUNIT3"] = "Hz"
+
+    # Stokes axis (axis 4), Stokes I = 1
+    hdr["CTYPE4"] = "STOKES"
+    hdr["CRPIX4"] = 1.0
+    hdr["CDELT4"] = 1.0
+    hdr["CRVAL4"] = 1.0      # 1 = Stokes I
+    hdr["CUNIT4"] = ""
+
+    # Standard FITS keywords
+    hdr["BUNIT"]  = "JY/BEAM"
+    hdr["BTYPE"]  = "Intensity"
+    hdr["ORIGIN"] = "TTCalX"
+    hdr["TELESCOP"] = "OVRO-LWA"
+    hdr["EQUINOX"] = 2000.0
+
+    hdu.writeto(path, overwrite=true)
+end
+
 """Save all output files for an image."""
-function save_image_outputs(I::Matrix{Float64}, prefix::String)
+function save_image_outputs(I::Matrix{Float64}, prefix::String;
+                            meta=nothing, config=nothing)
     save_bin("$(prefix).bin", I)
     save_pgm("$(prefix).pgm", I)
     save_csv("$(prefix).csv", I)
-    log_substep("Saved: $(prefix).bin, .pgm, .csv")
+    formats = ".bin, .pgm, .csv"
+    if meta !== nothing && config !== nothing
+        try
+            save_fits("$(prefix).fits", I, meta, config)
+            formats *= ", .fits"
+        catch e
+            log_warning("FITS save failed: $e (install astropy?)")
+        end
+    end
+    log_substep("Saved: $(prefix)$(formats)")
 end
 
 #==============================================================================#
@@ -316,7 +391,7 @@ function process_ms(ms_path::String, opts, sources)
         
         I = img.stokes_I isa CuArray ? Array(img.stokes_I) : img.stokes_I
         image_stats(I, "Dirty Image")
-        save_image_outputs(I, "$(prefix)_dirty")
+        save_image_outputs(I, "$(prefix)_dirty"; meta=meta, config=config)
         log_substep(@sprintf("Imaging took %.2f s", dt))
     else
         # Image BEFORE peeling
@@ -327,7 +402,7 @@ function process_ms(ms_path::String, opts, sources)
         
         I_before = img_before.stokes_I isa CuArray ? Array(img_before.stokes_I) : img_before.stokes_I
         image_stats(I_before, "Dirty Image BEFORE Peeling")
-        save_image_outputs(I_before, "$(prefix)_before")
+        save_image_outputs(I_before, "$(prefix)_before"; meta=meta, config=config)
         log_substep(@sprintf("Imaging took %.2f s", dt))
         
         # Peel sources
@@ -352,7 +427,7 @@ function process_ms(ms_path::String, opts, sources)
         
         I_after = img_after.stokes_I isa CuArray ? Array(img_after.stokes_I) : img_after.stokes_I
         image_stats(I_after, "Dirty Image AFTER Peeling")
-        save_image_outputs(I_after, "$(prefix)_after")
+        save_image_outputs(I_after, "$(prefix)_after"; meta=meta, config=config)
         log_substep(@sprintf("Imaging took %.2f s", dt))
         
         # Comparison
