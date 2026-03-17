@@ -140,7 +140,7 @@ struct GPUImagerConfig
         weighting::Symbol=:natural,
         robust::Float64=0.0,
         oversampling::Int=8,
-        support::Int=3,
+        support::Int=1,
         w_max::Float64=0.0
     )
         @assert image_size > 0 && iseven(image_size) "image_size must be positive and even"
