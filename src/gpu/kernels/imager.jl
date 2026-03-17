@@ -191,6 +191,9 @@ function grid_convolve_kernel!(
         V_re = 0.5 * (vis_xx_re[α, β] + vis_yy_re[α, β])
         V_im = 0.5 * (vis_xx_im[α, β] + vis_yy_im[α, β])
         
+        # Gaussian sigma for kernel
+        sigma2 = 2.0 * (Float64(support) / 2.5)^2
+
         # Scatter to grid cells within support
         iu_min = max(Int32(1), floor(Int32, u_grid) - support)
         iu_max = min(Int32(N), ceil(Int32, u_grid) + support)
@@ -203,16 +206,49 @@ function grid_convolve_kernel!(
                 du = iu - u_grid
                 
                 r2 = du^2 + dv^2
-                if r2 > support^2
+                if r2 > Float64(support)^2
                     continue
                 end
                 
                 # Gaussian kernel weight
-                kernel_weight = exp(-r2 / (2.0 * (support/2.5)^2))
+                kernel_weight = exp(-r2 / sigma2)
                 
                 CUDA.@atomic grid_data_re[iu, iv, iw] += V_re * kernel_weight
                 CUDA.@atomic grid_data_im[iu, iv, iw] += V_im * kernel_weight
                 CUDA.@atomic grid_weights[iu, iv, iw] += kernel_weight
+            end
+        end
+
+        # Hermitian conjugate: V(-u,-v,-w) = conj(V(u,v,w))
+        u_conj_grid = -u / uv_cell + center
+        v_conj_grid = -v / uv_cell + center
+        neg_w = -w
+        if Nw == 1
+            iw_conj = Int32(1)
+        else
+            iw_conj = clamp(floor(Int32, (neg_w - w_min) / w_range * Nw) + 1, Int32(1), Int32(Nw))
+        end
+
+        iu_min_c = max(Int32(1), floor(Int32, u_conj_grid) - support)
+        iu_max_c = min(Int32(N), ceil(Int32, u_conj_grid) + support)
+        iv_min_c = max(Int32(1), floor(Int32, v_conj_grid) - support)
+        iv_max_c = min(Int32(N), ceil(Int32, v_conj_grid) + support)
+
+        for iv in iv_min_c:iv_max_c
+            dv = iv - v_conj_grid
+            for iu in iu_min_c:iu_max_c
+                du = iu - u_conj_grid
+
+                r2 = du^2 + dv^2
+                if r2 > Float64(support)^2
+                    continue
+                end
+
+                kernel_weight = exp(-r2 / sigma2)
+
+                CUDA.@atomic grid_data_re[iu, iv, iw_conj] += V_re * kernel_weight
+                CUDA.@atomic grid_data_im[iu, iv, iw_conj] -= V_im * kernel_weight  # Conjugate
+                CUDA.@atomic grid_weights[iu, iv, iw_conj] += kernel_weight
             end
         end
     end

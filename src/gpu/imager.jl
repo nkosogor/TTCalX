@@ -45,7 +45,7 @@ using ..TTCalX: GPUVisibilities, GPUMetadata, GPUCalibration
 using ..TTCalX: Nbase, Nfreq, Nant
 using ..TTCalX: GPUPeelingSource, AbstractGPUPeelingSource, peel_gpu!
 using ..TTCalX: thread_index_1d
-using ..TTCalX: grid_nn_kernel!, w_correction_kernel!
+using ..TTCalX: grid_nn_kernel!, grid_convolve_kernel!, w_correction_kernel!
 using ..TTCalX: log_step, log_substep, log_detail, log_success, log_warning
 
 # Helper functions
@@ -373,6 +373,9 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
     end
     
     # Grid each visibility
+    support = config.support
+    sigma2 = support > 0 ? 2.0 * (support / 2.5)^2 : 0.0
+    
     @inbounds for β in 1:Nf
         λ = c / channels[β]
         
@@ -385,40 +388,85 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
             v = uvw[2, α] / λ
             w = uvw[3, α] / λ
             
-            iu = round(Int, u / uv_cell) + center
-            iv = round(Int, v / uv_cell) + center
-            
-            if iu < 1 || iu > N || iv < 1 || iv > N
-                continue
-            end
-            
-            # W-layer assignment
-            if Nw == 1
-                iw = 1
-            else
-                iw = clamp(floor(Int, (w - w_min) / w_range * Nw) + 1, 1, Nw)
-            end
-            
             # Stokes I from XX and YY
             V = 0.5 * (vis_xx[α, β] + vis_yy[α, β])
+            V_re = real(V)
+            V_im = imag(V)
             
-            grid.data_re[iu, iv, iw] += real(V)
-            grid.data_im[iu, iv, iw] += imag(V)
-            grid.weights[iu, iv, iw] += 1.0
-            
-            # Hermitian conjugate: V(-u,-v,-w) = conj(V(u,v,w))
-            iu_conj = N - iu + 2
-            iv_conj = N - iv + 2
-            if iu_conj >= 1 && iu_conj <= N && iv_conj >= 1 && iv_conj <= N
-                neg_w = -w
-                if Nw == 1
-                    iw_conj = 1
-                else
-                    iw_conj = clamp(floor(Int, (neg_w - w_min) / w_range * Nw) + 1, 1, Nw)
+            if support > 0
+                # Convolutional gridding: scatter to nearby cells with Gaussian kernel
+                u_grid = u / uv_cell + center
+                v_grid = v / uv_cell + center
+                
+                # W-layer assignment
+                iw = Nw == 1 ? 1 : clamp(floor(Int, (w - w_min) / w_range * Nw) + 1, 1, Nw)
+                
+                iu_min = max(1, floor(Int, u_grid) - support)
+                iu_max = min(N, ceil(Int, u_grid) + support)
+                iv_min = max(1, floor(Int, v_grid) - support)
+                iv_max = min(N, ceil(Int, v_grid) + support)
+                
+                for jv in iv_min:iv_max
+                    dv = jv - v_grid
+                    for ju in iu_min:iu_max
+                        du = ju - u_grid
+                        r2 = du^2 + dv^2
+                        r2 > support^2 && continue
+                        kw = exp(-r2 / sigma2)
+                        grid.data_re[ju, jv, iw] += V_re * kw
+                        grid.data_im[ju, jv, iw] += V_im * kw
+                        grid.weights[ju, jv, iw] += kw
+                    end
                 end
-                grid.data_re[iu_conj, iv_conj, iw_conj] += real(V)
-                grid.data_im[iu_conj, iv_conj, iw_conj] -= imag(V)  # conj
-                grid.weights[iu_conj, iv_conj, iw_conj] += 1.0
+                
+                # Hermitian conjugate
+                u_conj_grid = -u / uv_cell + center
+                v_conj_grid = -v / uv_cell + center
+                neg_w = -w
+                iw_conj = Nw == 1 ? 1 : clamp(floor(Int, (neg_w - w_min) / w_range * Nw) + 1, 1, Nw)
+                
+                iu_min_c = max(1, floor(Int, u_conj_grid) - support)
+                iu_max_c = min(N, ceil(Int, u_conj_grid) + support)
+                iv_min_c = max(1, floor(Int, v_conj_grid) - support)
+                iv_max_c = min(N, ceil(Int, v_conj_grid) + support)
+                
+                for jv in iv_min_c:iv_max_c
+                    dv = jv - v_conj_grid
+                    for ju in iu_min_c:iu_max_c
+                        du = ju - u_conj_grid
+                        r2 = du^2 + dv^2
+                        r2 > support^2 && continue
+                        kw = exp(-r2 / sigma2)
+                        grid.data_re[ju, jv, iw_conj] += V_re * kw
+                        grid.data_im[ju, jv, iw_conj] -= V_im * kw  # conj
+                        grid.weights[ju, jv, iw_conj] += kw
+                    end
+                end
+            else
+                # Nearest-neighbor gridding
+                iu = round(Int, u / uv_cell) + center
+                iv = round(Int, v / uv_cell) + center
+                
+                if iu < 1 || iu > N || iv < 1 || iv > N
+                    continue
+                end
+                
+                iw = Nw == 1 ? 1 : clamp(floor(Int, (w - w_min) / w_range * Nw) + 1, 1, Nw)
+                
+                grid.data_re[iu, iv, iw] += V_re
+                grid.data_im[iu, iv, iw] += V_im
+                grid.weights[iu, iv, iw] += 1.0
+                
+                # Hermitian conjugate
+                iu_conj = N - iu + 2
+                iv_conj = N - iv + 2
+                if iu_conj >= 1 && iu_conj <= N && iv_conj >= 1 && iv_conj <= N
+                    neg_w = -w
+                    iw_conj = Nw == 1 ? 1 : clamp(floor(Int, (neg_w - w_min) / w_range * Nw) + 1, 1, Nw)
+                    grid.data_re[iu_conj, iv_conj, iw_conj] += V_re
+                    grid.data_im[iu_conj, iv_conj, iw_conj] -= V_im  # conj
+                    grid.weights[iu_conj, iv_conj, iw_conj] += 1.0
+                end
             end
         end
     end
@@ -482,16 +530,31 @@ function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
     threads = min(256, total_items)
     blocks = cld(total_items, threads)
     
-    @cuda blocks=blocks threads=threads grid_nn_kernel!(
-        grid.data_re, grid.data_im, grid.weights,
-        vis_xx_re, vis_xx_im,
-        vis_yy_re, vis_yy_im,
-        vis.flags,
-        meta.uvw, meta.channels,
-        Float64(w_min), Float64(w_range), Int32(Nw),
-        Int32(N), Float64(uv_cell), center,
-        Int32(Nb), Int32(Nf)
-    )
+    support = Int32(config.support)
+    if support > 0
+        @cuda blocks=blocks threads=threads grid_convolve_kernel!(
+            grid.data_re, grid.data_im, grid.weights,
+            vis_xx_re, vis_xx_im,
+            vis_yy_re, vis_yy_im,
+            vis.flags,
+            meta.uvw, meta.channels,
+            Float64(w_min), Float64(w_range), Int32(Nw),
+            Int32(N), Float64(uv_cell), center,
+            support,
+            Int32(Nb), Int32(Nf)
+        )
+    else
+        @cuda blocks=blocks threads=threads grid_nn_kernel!(
+            grid.data_re, grid.data_im, grid.weights,
+            vis_xx_re, vis_xx_im,
+            vis_yy_re, vis_yy_im,
+            vis.flags,
+            meta.uvw, meta.channels,
+            Float64(w_min), Float64(w_range), Int32(Nw),
+            Int32(N), Float64(uv_cell), center,
+            Int32(Nb), Int32(Nf)
+        )
+    end
     CUDA.synchronize()
     
     # Free vis re/im temporaries
@@ -613,6 +676,39 @@ function grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfig)
     return img
 end
 
+"""
+    gridding_correction(N, support) -> Matrix{Float64}
+
+Compute gridding correction image for Gaussian convolution kernel.
+
+The gridding kernel G(u) = exp(-u²/(2σ²)) with σ = support/2.5 (in grid cells)
+has FT g(x) = σ√(2π) exp(-2π²σ²x²/N²) where x is pixel offset from center.
+Dividing the image by g(x)/g(0) corrects for the tapering.
+
+Returns a 2D array of correction factors (≥1 everywhere, =1 at center).
+"""
+function gridding_correction(N::Int, support::Int)
+    if support <= 0
+        return ones(Float64, N, N)
+    end
+    
+    sigma_uv = support / 2.5  # Gaussian sigma in grid cells
+    center = N ÷ 2 + 1
+    
+    # 1D correction: g(x) = exp(-2π²σ²x²/N²), correction = 1/g(x) = exp(+2π²σ²x²/N²)
+    # Cap at modest value to avoid edge blow-up (edges are outside useful FoV anyway)
+    corr_1d = Vector{Float64}(undef, N)
+    max_corr = 3.0  # Cap single-axis correction at 3× (9× for 2D worst case)
+    for i in 1:N
+        x = (i - center) / N  # fractional pixel offset (-0.5 to 0.5)
+        g = exp(-2.0 * π^2 * sigma_uv^2 * x^2)
+        corr_1d[i] = min(1.0 / g, max_corr)
+    end
+    
+    # 2D separable: correction[i,j] = corr_1d[i] * corr_1d[j]
+    return corr_1d * corr_1d'
+end
+
 """CPU implementation of grid to image conversion."""
 function cpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfig)
     N = config.image_size
@@ -629,6 +725,11 @@ function cpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfi
     total_weight = sum(grid.weights)
     if total_weight > 0
         dirty ./= total_weight
+    end
+    
+    # Apply gridding correction (compensate for convolution kernel tapering)
+    if config.support > 0
+        dirty .*= gridding_correction(N, config.support)
     end
     
     copyto!(img.stokes_I, dirty)
@@ -713,6 +814,13 @@ function gpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfi
     total_weight = sum(grid.weights)
     if total_weight > 0
         img.stokes_I ./= total_weight
+    end
+    
+    # Apply gridding correction on GPU (compensate for convolution kernel tapering)
+    if config.support > 0
+        gc = CuArray(gridding_correction(N, config.support))
+        img.stokes_I .*= gc
+        CUDA.unsafe_free!(gc)
     end
     
     fill!(img.stokes_Q, 0.0)
