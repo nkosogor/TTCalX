@@ -352,7 +352,7 @@ function grid_convolve_kernel!(
         
         # Kaiser-Bessel kernel parameters
         W = Float64(support)
-        beta = 2.34 * W
+        beta = 8.6  # wsclean-style KB parameter (alpha)
         inv_i0beta = 1.0 / besseli0_approx(beta)
 
         # Scatter to grid cells within support

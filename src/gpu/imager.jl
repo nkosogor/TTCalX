@@ -136,11 +136,11 @@ struct GPUImagerConfig
         image_size::Int=512,
         cell_size::Float64=deg2rad(1.0/60.0),  # 1 arcmin default
         w_layers::Int=1,
-        padding_factor::Float64=1.2,
+        padding_factor::Float64=1.5,
         weighting::Symbol=:natural,
         robust::Float64=0.0,
         oversampling::Int=8,
-        support::Int=1,
+        support::Int=3,
         w_max::Float64=0.0
     )
         @assert image_size > 0 && iseven(image_size) "image_size must be positive and even"
@@ -405,7 +405,7 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
     # Grid each visibility
     support = config.support
     W = Float64(support)
-    beta = 2.34 * W
+    beta = 8.6  # wsclean-style KB parameter (alpha)
     inv_i0beta = support > 1 ? 1.0 / _besseli0(beta) : 0.0
     
     @inbounds for β in 1:Nf
@@ -839,7 +839,7 @@ function gridding_correction(N::Int, support::Int)
     else
         # Convolution gridding: DFT of the actual truncated Kaiser-Bessel kernel.
         W = Float64(support)
-        beta = 2.34 * W
+        beta = 8.6  # wsclean-style KB parameter (alpha)
         inv_i0beta = 1.0 / _besseli0(beta)
         kernel = zeros(Float64, N)
         for n in -support:support
