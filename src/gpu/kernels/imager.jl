@@ -13,26 +13,37 @@ const GPU_C_IMAGER = 2.99792458e8  # Speed of light m/s
 #==============================================================================#
 
 """
-Prolate spheroidal wave function (PSWF) approximation for gridding convolution.
-Uses a Gaussian approximation.
-
-# Arguments
-- `u`: normalized coordinate (-1 to 1)
-- `support`: kernel half-width
+Modified Bessel function I₀(x) — Abramowitz & Stegun polynomial approximation.
+Accurate to <2e-7 for all x ≥ 0. GPU-safe (no special functions needed).
 """
-@inline function pswf_value(u::Float64, support::Int=3)
-    sigma = support / 2.5
-    return exp(-u^2 / (2 * sigma^2))
+@inline function besseli0_approx(x::Float64)
+    ax = abs(x)
+    if ax < 3.75
+        t = (ax / 3.75)^2
+        return 1.0 + t*(3.5156229 + t*(3.0899424 + t*(1.2067492 +
+               t*(0.2659732 + t*(0.0360768 + t*0.0045813)))))
+    else
+        t = 3.75 / ax
+        return (exp(ax) / sqrt(ax)) *
+               (0.39894228 + t*(0.01328592 + t*(0.00225319 +
+               t*(-0.00157565 + t*(0.00916281 + t*(-0.02057706 +
+               t*(0.02635537 + t*(-0.01647633 + t*0.00392377))))))))
+    end
 end
 
 """
-Compute gridding convolution kernel weight for a single point.
+Kaiser-Bessel gridding kernel (1D). Standard in radio interferometric imaging.
+C(u) = I₀(β √(1 - (u/W)²)) / I₀(β)  for |u| ≤ W, else 0.
+
+β = 2.34 × W gives near-optimal alias suppression.
 """
-@inline function gridding_kernel_weight(du::Float64, dv::Float64, support::Int)
-    if abs(du) > support || abs(dv) > support
+@inline function kb_value(u::Float64, W::Float64, beta::Float64, inv_i0beta::Float64)
+    t = u / W
+    t2 = 1.0 - t * t
+    if t2 <= 0.0
         return 0.0
     end
-    return pswf_value(du / support) * pswf_value(dv / support)
+    return besseli0_approx(beta * sqrt(t2)) * inv_i0beta
 end
 
 #==============================================================================#
@@ -191,8 +202,10 @@ function grid_convolve_kernel!(
         V_re = 0.5 * (vis_xx_re[α, β] + vis_yy_re[α, β])
         V_im = 0.5 * (vis_xx_im[α, β] + vis_yy_im[α, β])
         
-        # Gaussian sigma for kernel
-        sigma2 = 2.0 * (Float64(support) / 2.5)^2
+        # Kaiser-Bessel kernel parameters
+        W = Float64(support)
+        beta = 2.34 * W
+        inv_i0beta = 1.0 / besseli0_approx(beta)
 
         # Scatter to grid cells within support
         iu_min = max(Int32(1), floor(Int32, u_grid) - support)
@@ -202,16 +215,13 @@ function grid_convolve_kernel!(
         
         for iv in iv_min:iv_max
             dv = iv - v_grid
+            kv = kb_value(dv, W, beta, inv_i0beta)
+            if kv == 0.0; continue; end
             for iu in iu_min:iu_max
                 du = iu - u_grid
-                
-                r2 = du^2 + dv^2
-                if r2 > Float64(support)^2
-                    continue
-                end
-                
-                # Gaussian kernel weight
-                kernel_weight = exp(-r2 / sigma2)
+                ku = kb_value(du, W, beta, inv_i0beta)
+                kernel_weight = ku * kv
+                if kernel_weight == 0.0; continue; end
                 
                 CUDA.@atomic grid_data_re[iu, iv, iw] += V_re * kernel_weight
                 CUDA.@atomic grid_data_im[iu, iv, iw] += V_im * kernel_weight
@@ -236,15 +246,13 @@ function grid_convolve_kernel!(
 
         for iv in iv_min_c:iv_max_c
             dv = iv - v_conj_grid
+            kv = kb_value(dv, W, beta, inv_i0beta)
+            if kv == 0.0; continue; end
             for iu in iu_min_c:iu_max_c
                 du = iu - u_conj_grid
-
-                r2 = du^2 + dv^2
-                if r2 > Float64(support)^2
-                    continue
-                end
-
-                kernel_weight = exp(-r2 / sigma2)
+                ku = kb_value(du, W, beta, inv_i0beta)
+                kernel_weight = ku * kv
+                if kernel_weight == 0.0; continue; end
 
                 CUDA.@atomic grid_data_re[iu, iv, iw_conj] += V_re * kernel_weight
                 CUDA.@atomic grid_data_im[iu, iv, iw_conj] -= V_im * kernel_weight  # Conjugate

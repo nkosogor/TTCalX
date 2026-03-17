@@ -53,6 +53,30 @@ _is_gpu(x::CuArray) = true
 _is_gpu(x::AbstractArray) = false
 _is_gpu(vis::GPUVisibilities) = _is_gpu(vis.xx)
 
+"""Modified Bessel I₀ — Abramowitz & Stegun polynomial approximation (CPU)."""
+function _besseli0(x::Float64)
+    ax = abs(x)
+    if ax < 3.75
+        t = (ax / 3.75)^2
+        return 1.0 + t*(3.5156229 + t*(3.0899424 + t*(1.2067492 +
+               t*(0.2659732 + t*(0.0360768 + t*0.0045813)))))
+    else
+        t = 3.75 / ax
+        return (exp(ax) / sqrt(ax)) *
+               (0.39894228 + t*(0.01328592 + t*(0.00225319 +
+               t*(-0.00157565 + t*(0.00916281 + t*(-0.02057706 +
+               t*(0.02635537 + t*(-0.01647633 + t*0.00392377))))))))
+    end
+end
+
+"""1D Kaiser-Bessel kernel value (CPU)."""
+function _kb_value(u::Float64, W::Float64, beta::Float64, inv_i0beta::Float64)
+    t = u / W
+    t2 = 1.0 - t * t
+    t2 <= 0.0 && return 0.0
+    return _besseli0(beta * sqrt(t2)) * inv_i0beta
+end
+
 _zeros(::Type{T}, dims...; gpu::Bool=true) where T = 
     gpu && CUDA.functional() ? CUDA.zeros(T, dims...) : zeros(T, dims...)
 
@@ -116,7 +140,7 @@ struct GPUImagerConfig
         weighting::Symbol=:natural,
         robust::Float64=0.0,
         oversampling::Int=8,
-        support::Int=0,
+        support::Int=3,
         w_max::Float64=0.0
     )
         @assert image_size > 0 && iseven(image_size) "image_size must be positive and even"
@@ -374,7 +398,9 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
     
     # Grid each visibility
     support = config.support
-    sigma2 = support > 0 ? 2.0 * (support / 2.5)^2 : 0.0
+    W = Float64(support)
+    beta = 2.34 * W
+    inv_i0beta = support > 0 ? 1.0 / _besseli0(beta) : 0.0
     
     @inbounds for β in 1:Nf
         λ = c / channels[β]
@@ -394,7 +420,7 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
             V_im = imag(V)
             
             if support > 0
-                # Convolutional gridding: scatter to nearby cells with Gaussian kernel
+                # Convolutional gridding: scatter to nearby cells with KB kernel
                 u_grid = u / uv_cell + center
                 v_grid = v / uv_cell + center
                 
@@ -408,11 +434,12 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
                 
                 for jv in iv_min:iv_max
                     dv = jv - v_grid
+                    kv = _kb_value(dv, W, beta, inv_i0beta)
+                    kv == 0.0 && continue
                     for ju in iu_min:iu_max
                         du = ju - u_grid
-                        r2 = du^2 + dv^2
-                        r2 > support^2 && continue
-                        kw = exp(-r2 / sigma2)
+                        kw = _kb_value(du, W, beta, inv_i0beta) * kv
+                        kw == 0.0 && continue
                         grid.data_re[ju, jv, iw] += V_re * kw
                         grid.data_im[ju, jv, iw] += V_im * kw
                         grid.weights[ju, jv, iw] += kw
@@ -432,11 +459,12 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
                 
                 for jv in iv_min_c:iv_max_c
                     dv = jv - v_conj_grid
+                    kv = _kb_value(dv, W, beta, inv_i0beta)
+                    kv == 0.0 && continue
                     for ju in iu_min_c:iu_max_c
                         du = ju - u_conj_grid
-                        r2 = du^2 + dv^2
-                        r2 > support^2 && continue
-                        kw = exp(-r2 / sigma2)
+                        kw = _kb_value(du, W, beta, inv_i0beta) * kv
+                        kw == 0.0 && continue
                         grid.data_re[ju, jv, iw_conj] += V_re * kw
                         grid.data_im[ju, jv, iw_conj] -= V_im * kw  # conj
                         grid.weights[ju, jv, iw_conj] += kw
@@ -704,11 +732,13 @@ function gridding_correction(N::Int, support::Int)
             end
         end
     else
-        # Convolution gridding: DFT of the actual truncated Gaussian kernel.
-        sigma = Float64(support) / 2.5
+        # Convolution gridding: DFT of the actual truncated Kaiser-Bessel kernel.
+        W = Float64(support)
+        beta = 2.34 * W
+        inv_i0beta = 1.0 / _besseli0(beta)
         kernel = zeros(Float64, N)
         for n in -support:support
-            kernel[mod(n, N) + 1] = exp(-n^2 / (2 * sigma^2))
+            kernel[mod(n, N) + 1] = _kb_value(Float64(n), W, beta, inv_i0beta)
         end
         taper = abs.(fftshift(fft(kernel)))
         taper ./= taper[center]  # normalize so center = 1
