@@ -29,6 +29,7 @@
 #   --wlayers=N       Number of w-layers (default: auto)
 #   --weight=SCHEME   Weighting: natural, uniform, briggs (default: natural)
 #   --robust=R        Briggs robust parameter, -2 to 2 (default: 0)
+#   --taper-inner-tukey=L  Inner UV taper transition width in wavelengths (default: 0=off)
 #   --output=PREFIX   Output file prefix (default: image)
 #   --verbose         Show detailed diagnostic output
 #   --quiet           Suppress all output except errors
@@ -77,6 +78,7 @@ IMAGING OPTIONS:
   --wlayers=N       Number of w-layers [default: auto from w-range]
   --weight=SCHEME   Weighting: natural, uniform, briggs [default: natural]
   --robust=R        Briggs robust parameter, -2 to 2 [default: 0]
+  --taper-inner-tukey=L  Inner UV taper width in wavelengths [default: 0=off]
   --output=PREFIX   Output file prefix [default: image]
 
 CALIBRATION OPTIONS:
@@ -93,8 +95,8 @@ EXAMPLES:
   # Peel sources and image residuals
   julia bin/peel_and_image_gpu.jl peel sources.json data.ms
 
-  # Zest with Briggs weighting
-  julia bin/peel_and_image_gpu.jl zest --weight=briggs --robust=0.5 sources.json data.ms
+  # Zest with Briggs weighting and inner UV taper
+  julia bin/peel_and_image_gpu.jl zest --weight=briggs --robust=0 --taper-inner-tukey=30 sources.json data.ms
 
   # Image only (no peeling)
   julia bin/peel_and_image_gpu.jl image --size=2048 data.ms
@@ -125,6 +127,7 @@ function parse_args(args)
         "w_layers" => 0,
         "weighting" => :natural,
         "robust" => 0.0,
+        "taper_inner_tukey" => 0.0,
         "output" => "image"
     )
     
@@ -161,6 +164,8 @@ function parse_args(args)
             opts["weighting"] = Symbol(split(arg, "=")[2])
         elseif startswith(arg, "--robust=")
             opts["robust"] = parse(Float64, split(arg, "=")[2])
+        elseif startswith(arg, "--taper-inner-tukey=")
+            opts["taper_inner_tukey"] = parse(Float64, split(arg, "=")[2])
         elseif startswith(arg, "--output=")
             opts["output"] = String(split(arg, "=")[2])
         elseif startswith(arg, "--")
@@ -361,7 +366,8 @@ function process_ms(ms_path::String, opts, sources)
             cell_size  = cell_size,
             w_layers   = opts["w_layers"],
             weighting  = opts["weighting"],
-            robust     = opts["robust"]
+            robust     = opts["robust"],
+            taper_inner_tukey = opts["taper_inner_tukey"]
         )
     else
         config = auto_configure_imager(meta, vis;
@@ -372,7 +378,8 @@ function process_ms(ms_path::String, opts, sources)
             cell_size  = config.cell_size,
             w_layers   = opts["w_layers"] > 0 ? opts["w_layers"] : config.w_layers,
             weighting  = opts["weighting"],
-            robust     = opts["robust"]
+            robust     = opts["robust"],
+            taper_inner_tukey = opts["taper_inner_tukey"]
         )
     end
     
@@ -380,6 +387,9 @@ function process_ms(ms_path::String, opts, sources)
                 config.image_size, config.image_size,
                 rad2deg(config.cell_size) * 3600, rad2deg(field_of_view(config))))
     log_substep(@sprintf("W-layers: %d, Weighting: %s", config.w_layers, config.weighting))
+    if config.taper_inner_tukey > 0
+        log_substep(@sprintf("Inner UV taper (Tukey): %.1f wavelengths", config.taper_inner_tukey))
+    end
     
     prefix = opts["output"]
     

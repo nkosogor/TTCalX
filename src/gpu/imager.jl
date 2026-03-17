@@ -80,6 +80,13 @@ end
 _zeros(::Type{T}, dims...; gpu::Bool=true) where T = 
     gpu && CUDA.functional() ? CUDA.zeros(T, dims...) : zeros(T, dims...)
 
+"""CPU-side inner Tukey taper: smooth cosine taper suppressing short baselines."""
+@inline function _inner_tukey_weight(uv_dist::Float64, taper::Float64)
+    taper <= 0.0 && return 1.0
+    uv_dist >= taper && return 1.0
+    return 0.5 * (1.0 - cos(π * uv_dist / taper))
+end
+
 """
 In-place 2D FFT quadrant swap (fftshift / ifftshift for even-sized arrays).
 Uses view-based copies that dispatch to GPU kernels on CuArrays.
@@ -120,6 +127,7 @@ Configuration for GPU wide-field imager.
 - `oversampling::Int`: Gridding convolution oversampling factor
 - `support::Int`: Gridding convolution kernel support (half-width in grid cells)
 - `w_max::Float64`: Maximum |w| in wavelengths (auto-computed if 0)
+- `taper_inner_tukey::Float64`: Inner UV taper transition width in wavelengths (0 = disabled)
 """
 struct GPUImagerConfig
     image_size::Int
@@ -131,6 +139,7 @@ struct GPUImagerConfig
     oversampling::Int
     support::Int
     w_max::Float64
+    taper_inner_tukey::Float64
     
     function GPUImagerConfig(;
         image_size::Int=512,
@@ -141,7 +150,8 @@ struct GPUImagerConfig
         robust::Float64=0.0,
         oversampling::Int=8,
         support::Int=1,
-        w_max::Float64=0.0
+        w_max::Float64=0.0,
+        taper_inner_tukey::Float64=0.0
     )
         @assert image_size > 0 && iseven(image_size) "image_size must be positive and even"
         @assert cell_size > 0 "cell_size must be positive"
@@ -149,9 +159,10 @@ struct GPUImagerConfig
         @assert padding_factor >= 1.0 "padding_factor must be >= 1.0"
         @assert weighting in [:natural, :uniform, :briggs] "weighting must be :natural, :uniform, or :briggs"
         @assert -2.0 <= robust <= 2.0 "robust must be between -2 and 2"
+        @assert taper_inner_tukey >= 0.0 "taper_inner_tukey must be non-negative"
         
         new(image_size, cell_size, w_layers, padding_factor, weighting, 
-            robust, oversampling, support, w_max)
+            robust, oversampling, support, w_max, taper_inner_tukey)
     end
 end
 
@@ -407,6 +418,7 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
     W = Float64(support)
     beta = 8.6  # wsclean-style KB parameter (alpha)
     inv_i0beta = support > 1 ? 1.0 / _besseli0(beta) : 0.0
+    taper = config.taper_inner_tukey
     
     @inbounds for β in 1:Nf
         λ = c / channels[β]
@@ -420,8 +432,12 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
             v = uvw[2, α] / λ
             w = uvw[3, α] / λ
             
-            # Stokes I from XX and YY
-            V = 0.5 * (vis_xx[α, β] + vis_yy[α, β])
+            # Inner UV taper weight
+            uv_dist = sqrt(u * u + v * v)
+            tw = _inner_tukey_weight(uv_dist, taper)
+            
+            # Stokes I from XX and YY, weighted by taper
+            V = 0.5 * (vis_xx[α, β] + vis_yy[α, β]) * tw
             V_re = real(V)
             V_im = imag(V)
             
@@ -566,7 +582,7 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
                 
                 grid.data_re[iu, iv, iw] += V_re
                 grid.data_im[iu, iv, iw] += V_im
-                grid.weights[iu, iv, iw] += 1.0
+                grid.weights[iu, iv, iw] += tw
                 
                 # Hermitian conjugate
                 iu_conj = N - iu + 2
@@ -576,7 +592,7 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
                     iw_conj = Nw == 1 ? 1 : clamp(floor(Int, (neg_w - w_min) / w_range * Nw) + 1, 1, Nw)
                     grid.data_re[iu_conj, iv_conj, iw_conj] += V_re
                     grid.data_im[iu_conj, iv_conj, iw_conj] -= V_im
-                    grid.weights[iu_conj, iv_conj, iw_conj] += 1.0
+                    grid.weights[iu_conj, iv_conj, iw_conj] += tw
                 end
             end
         end
@@ -642,6 +658,7 @@ function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
     blocks = cld(total_items, threads)
     
     support = Int32(config.support)
+    taper = Float64(config.taper_inner_tukey)
     if support > 1
         @cuda blocks=blocks threads=threads grid_convolve_kernel!(
             grid.data_re, grid.data_im, grid.weights,
@@ -652,6 +669,7 @@ function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
             Float64(w_min), Float64(w_range), Int32(Nw),
             Int32(N), Float64(uv_cell), center,
             support,
+            taper,
             Int32(Nb), Int32(Nf)
         )
     elseif support == 1
@@ -663,6 +681,7 @@ function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
             meta.uvw, meta.channels,
             Float64(w_min), Float64(w_range), Int32(Nw),
             Int32(N), Float64(uv_cell), center,
+            taper,
             Int32(Nb), Int32(Nf)
         )
     else
@@ -674,6 +693,7 @@ function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
             meta.uvw, meta.channels,
             Float64(w_min), Float64(w_range), Int32(Nw),
             Int32(N), Float64(uv_cell), center,
+            taper,
             Int32(Nb), Int32(Nf)
         )
     end

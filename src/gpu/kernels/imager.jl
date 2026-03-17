@@ -9,9 +9,27 @@
 const GPU_C_IMAGER = 2.99792458e8  # Speed of light m/s
 
 #==============================================================================#
-#                     Gridding Convolution Functions                           #
+#                     Inner UV Taper (Tukey window)                            #
 #==============================================================================#
 
+"""
+Compute inner Tukey taper weight for a visibility at UV distance `uv_dist` (wavelengths).
+Returns 1.0 if taper is disabled (taper <= 0), otherwise:
+  - 0 at uv_dist=0
+  - smooth cosine transition from 0 to 1 over [0, taper] wavelengths
+  - 1 for uv_dist >= taper
+"""
+@inline function inner_tukey_weight(uv_dist::Float64, taper::Float64)
+    if taper <= 0.0
+        return 1.0
+    end
+    if uv_dist >= taper
+        return 1.0
+    end
+    return 0.5 * (1.0 - cos(π * uv_dist / taper))
+end
+
+#==============================================================================#
 """
 Modified Bessel function I₀(x) — Abramowitz & Stegun polynomial approximation.
 Accurate to <2e-7 for all x ≥ 0. GPU-safe (no special functions needed).
@@ -72,6 +90,8 @@ function grid_nn_kernel!(
     w_min, w_range, Nw,
     # Grid parameters
     N, uv_cell, center,
+    # Inner UV taper (wavelengths, 0=disabled)
+    taper_inner,
     # Dimensions
     Nbase, Nfreq
 )
@@ -95,6 +115,10 @@ function grid_nn_kernel!(
         v = uvw[2, α] / λ
         w = uvw[3, α] / λ
         
+        # Inner UV taper weight
+        uv_dist = sqrt(u * u + v * v)
+        tw = inner_tukey_weight(uv_dist, taper_inner)
+        
         # Grid indices (nearest neighbor)
         iu = round(Int32, u / uv_cell) + center
         iv = round(Int32, v / uv_cell) + center
@@ -111,14 +135,14 @@ function grid_nn_kernel!(
             iw = clamp(floor(Int32, (w - w_min) / w_range * Nw) + 1, Int32(1), Int32(Nw))
         end
         
-        # Stokes I visibility: (XX + YY) / 2
-        V_re = 0.5 * (vis_xx_re[α, β] + vis_yy_re[α, β])
-        V_im = 0.5 * (vis_xx_im[α, β] + vis_yy_im[α, β])
+        # Stokes I visibility: (XX + YY) / 2, weighted by taper
+        V_re = 0.5 * (vis_xx_re[α, β] + vis_yy_re[α, β]) * tw
+        V_im = 0.5 * (vis_xx_im[α, β] + vis_yy_im[α, β]) * tw
         
         # Atomic add to grid
         CUDA.@atomic grid_data_re[iu, iv, iw] += V_re
         CUDA.@atomic grid_data_im[iu, iv, iw] += V_im
-        CUDA.@atomic grid_weights[iu, iv, iw] += 1.0
+        CUDA.@atomic grid_weights[iu, iv, iw] += tw
         
         # Hermitian conjugate: V(-u,-v,-w) = conj(V(u,v,w))
         iu_conj = N - iu + 2
@@ -132,7 +156,7 @@ function grid_nn_kernel!(
             end
             CUDA.@atomic grid_data_re[iu_conj, iv_conj, iw_conj] += V_re
             CUDA.@atomic grid_data_im[iu_conj, iv_conj, iw_conj] -= V_im  # Conjugate
-            CUDA.@atomic grid_weights[iu_conj, iv_conj, iw_conj] += 1.0
+            CUDA.@atomic grid_weights[iu_conj, iv_conj, iw_conj] += tw
         end
     end
     
@@ -169,6 +193,8 @@ function grid_bilinear_kernel!(
     w_min, w_range, Nw,
     # Grid parameters
     N, uv_cell, center,
+    # Inner UV taper (wavelengths, 0=disabled)
+    taper_inner,
     # Dimensions
     Nbase, Nfreq
 )
@@ -189,6 +215,10 @@ function grid_bilinear_kernel!(
         v = uvw[2, α] / λ
         w = uvw[3, α] / λ
         
+        # Inner UV taper weight
+        uv_dist = sqrt(u * u + v * v)
+        tw = inner_tukey_weight(uv_dist, taper_inner)
+        
         # Continuous grid position
         u_grid = u / uv_cell + center
         v_grid = v / uv_cell + center
@@ -200,9 +230,9 @@ function grid_bilinear_kernel!(
             iw = clamp(floor(Int32, (w - w_min) / w_range * Nw) + 1, Int32(1), Int32(Nw))
         end
         
-        # Stokes I visibility
-        V_re = 0.5 * (vis_xx_re[α, β] + vis_yy_re[α, β])
-        V_im = 0.5 * (vis_xx_im[α, β] + vis_yy_im[α, β])
+        # Stokes I visibility, weighted by taper
+        V_re = 0.5 * (vis_xx_re[α, β] + vis_yy_re[α, β]) * tw
+        V_im = 0.5 * (vis_xx_im[α, β] + vis_yy_im[α, β]) * tw
         
         # Bilinear: 4 surrounding cells
         iu0 = floor(Int32, u_grid)
@@ -315,6 +345,8 @@ function grid_convolve_kernel!(
     N, uv_cell, center,
     # Convolution support (half-width)
     support,
+    # Inner UV taper (wavelengths, 0=disabled)
+    taper_inner,
     # Dimensions
     Nbase, Nfreq
 )
@@ -335,6 +367,10 @@ function grid_convolve_kernel!(
         v = uvw[2, α] / λ
         w = uvw[3, α] / λ
         
+        # Inner UV taper weight
+        uv_dist = sqrt(u * u + v * v)
+        tw = inner_tukey_weight(uv_dist, taper_inner)
+        
         # Continuous grid position
         u_grid = u / uv_cell + center
         v_grid = v / uv_cell + center
@@ -346,9 +382,9 @@ function grid_convolve_kernel!(
             iw = clamp(floor(Int32, (w - w_min) / w_range * Nw) + 1, Int32(1), Int32(Nw))
         end
         
-        # Stokes I visibility
-        V_re = 0.5 * (vis_xx_re[α, β] + vis_yy_re[α, β])
-        V_im = 0.5 * (vis_xx_im[α, β] + vis_yy_im[α, β])
+        # Stokes I visibility, weighted by taper
+        V_re = 0.5 * (vis_xx_re[α, β] + vis_yy_re[α, β]) * tw
+        V_im = 0.5 * (vis_xx_im[α, β] + vis_yy_im[α, β]) * tw
         
         # Kaiser-Bessel kernel parameters
         W = Float64(support)
