@@ -136,11 +136,11 @@ struct GPUImagerConfig
         image_size::Int=512,
         cell_size::Float64=deg2rad(1.0/60.0),  # 1 arcmin default
         w_layers::Int=1,
-        padding_factor::Float64=1.0,
+        padding_factor::Float64=1.2,
         weighting::Symbol=:natural,
         robust::Float64=0.0,
         oversampling::Int=8,
-        support::Int=3,
+        support::Int=0,
         w_max::Float64=0.0
     )
         @assert image_size > 0 && iseven(image_size) "image_size must be positive and even"
@@ -153,6 +153,12 @@ struct GPUImagerConfig
         new(image_size, cell_size, w_layers, padding_factor, weighting, 
             robust, oversampling, support, w_max)
     end
+end
+
+"""Compute padded grid size (must be even for FFT centering)."""
+function _padded_size(config::GPUImagerConfig)
+    p = round(Int, config.image_size * config.padding_factor)
+    return iseven(p) ? p : p + 1
 end
 
 """
@@ -352,7 +358,7 @@ CPU implementation of visibility gridding with w-stacking.
 """
 function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
                                 meta::GPUMetadata, config::GPUImagerConfig)
-    N = config.image_size
+    N = size(grid.data_re, 1)  # padded grid size
     Nw = config.w_layers
     cell = config.cell_size
     Nb = Nbase(vis)
@@ -511,7 +517,7 @@ arrays via atomic Float64 adds — no temporary 3D allocation needed.
 """
 function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
                                 meta::GPUMetadata, config::GPUImagerConfig)
-    N = config.image_size
+    N = size(grid.data_re, 1)  # padded grid size
     Nw = config.w_layers
     cell = config.cell_size
     Nb = Nbase(vis)
@@ -657,7 +663,7 @@ end
 Combine w-layers into single image by applying w-correction in image domain (CPU).
 """
 function combine_w_layers(grid::GPUGrid, config::GPUImagerConfig)
-    N = config.image_size
+    N = size(grid.data_re, 1)  # padded grid size
     Nw = size(grid.data_re, 3)
     cell = config.cell_size
     
@@ -753,12 +759,13 @@ end
 
 """CPU implementation of grid to image conversion."""
 function cpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfig)
-    N = config.image_size
+    N_grid = size(grid.data_re, 1)  # padded grid size
+    N_img = config.image_size
     Nw = config.w_layers
     
     if Nw == 1
         layer_data = complex.(grid.data_re[:, :, 1], grid.data_im[:, :, 1])
-        dirty = real.(fftshift(ifft(ifftshift(layer_data)))) .* N^2
+        dirty = real.(fftshift(ifft(ifftshift(layer_data)))) .* N_grid^2
     else
         combined = combine_w_layers(grid, config)
         dirty = real.(combined)
@@ -769,10 +776,12 @@ function cpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfi
         dirty ./= total_weight
     end
     
-    # Apply gridding correction (sinc for NN, DFT-based for convolution)
-    dirty .*= gridding_correction(N, config.support)
+    # Apply gridding correction at padded size
+    dirty .*= gridding_correction(N_grid, config.support)
     
-    copyto!(img.stokes_I, dirty)
+    # Crop center N_img × N_img from padded image
+    offset = (N_grid - N_img) ÷ 2
+    copyto!(img.stokes_I, @view dirty[offset+1:offset+N_img, offset+1:offset+N_img])
     fill!(img.stokes_Q, 0.0)
     fill!(img.stokes_U, 0.0)
     fill!(img.stokes_V, 0.0)
@@ -791,75 +800,77 @@ Memory: 2 × N² ComplexF64 + 4 × N² Float64 ≈ N² × 64 bytes of working sp
 For N=4096: ~1 GiB regardless of number of w-layers.
 """
 function gpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfig)
-    N = config.image_size
+    N_grid = size(grid.data_re, 1)  # padded grid size
+    N_img = config.image_size
     Nw = config.w_layers
     cell = config.cell_size
-    center = Int32(N ÷ 2 + 1)
+    center = Int32(N_grid ÷ 2 + 1)
     
-    # Pre-allocate FFT working buffers (reused across all w-layers)
-    buf_a = CUDA.zeros(ComplexF64, N, N)
-    buf_b = CUDA.zeros(ComplexF64, N, N)
-    plan = plan_ifft!(buf_b)  # In-place IFFT plan tied to buf_b
+    # Pre-allocate FFT working buffers at padded size
+    buf_a = CUDA.zeros(ComplexF64, N_grid, N_grid)
+    buf_b = CUDA.zeros(ComplexF64, N_grid, N_grid)
+    plan = plan_ifft!(buf_b)
+    
+    # Padded real-image accumulator
+    padded = CUDA.zeros(Float64, N_grid, N_grid)
     
     if Nw == 1
-        # Single w-layer: no w-correction needed
         buf_a .= complex.(@view(grid.data_re[:, :, 1]), @view(grid.data_im[:, :, 1]))
-        fftshift_2d!(buf_b, buf_a)   # ifftshift into buf_b
-        plan * buf_b                   # In-place IFFT (overwrites buf_b)
-        fftshift_2d!(buf_a, buf_b)    # fftshift result into buf_a
-        buf_a .*= Float64(N^2)
-        img.stokes_I .= real.(buf_a)
+        fftshift_2d!(buf_b, buf_a)
+        plan * buf_b
+        fftshift_2d!(buf_a, buf_b)
+        buf_a .*= Float64(N_grid^2)
+        padded .= real.(buf_a)
     else
         # W-stacking: cuFFT each layer + GPU w-correction kernel
-        layer_re = CUDA.zeros(Float64, N, N)
-        layer_im = CUDA.zeros(Float64, N, N)
-        combined_im = CUDA.zeros(Float64, N, N)
-        fill!(img.stokes_I, 0.0)  # Use stokes_I as accumulator for real part
+        layer_re = CUDA.zeros(Float64, N_grid, N_grid)
+        layer_im = CUDA.zeros(Float64, N_grid, N_grid)
+        padded_im = CUDA.zeros(Float64, N_grid, N_grid)
         
-        total_pixels = N * N
+        total_pixels = N_grid * N_grid
         threads = min(256, total_pixels)
         blocks = cld(total_pixels, threads)
         
         for iw in 1:Nw
-            # Combine split re/im into complex buffer
             buf_a .= complex.(@view(grid.data_re[:, :, iw]), @view(grid.data_im[:, :, iw]))
-            
-            # ifftshift → in-place IFFT → fftshift (zero allocation)
             fftshift_2d!(buf_b, buf_a)
             plan * buf_b
             fftshift_2d!(buf_a, buf_b)
-            buf_a .*= Float64(N^2)
+            buf_a .*= Float64(N_grid^2)
             
-            # Split into re/im for w-correction kernel
             layer_re .= real.(buf_a)
             layer_im .= imag.(buf_a)
             
-            # Apply w-correction phase and accumulate into img.stokes_I
             @cuda blocks=blocks threads=threads w_correction_kernel!(
-                img.stokes_I, combined_im,
+                padded, padded_im,
                 layer_re, layer_im,
                 Float64(grid.w_values[iw]),
-                Int32(N), Float64(cell),
+                Int32(N_grid), Float64(cell),
                 center
             )
             CUDA.synchronize()
         end
         
-        CUDA.unsafe_free!(combined_im)
+        CUDA.unsafe_free!(padded_im)
         CUDA.unsafe_free!(layer_re)
         CUDA.unsafe_free!(layer_im)
     end
     
-    # Normalize by total weight for correct flux scale
+    # Normalize by total weight
     total_weight = sum(grid.weights)
     if total_weight > 0
-        img.stokes_I ./= total_weight
+        padded ./= total_weight
     end
     
-    # Apply gridding correction on GPU (sinc for NN, DFT-based for convolution)
-    gc = CuArray(gridding_correction(N, config.support))
-    img.stokes_I .*= gc
+    # Apply gridding correction at padded size
+    gc = CuArray(gridding_correction(N_grid, config.support))
+    padded .*= gc
     CUDA.unsafe_free!(gc)
+    
+    # Crop center N_img × N_img from padded image
+    offset = (N_grid - N_img) ÷ 2
+    img.stokes_I .= @view padded[offset+1:offset+N_img, offset+1:offset+N_img]
+    CUDA.unsafe_free!(padded)
     
     fill!(img.stokes_Q, 0.0)
     fill!(img.stokes_U, 0.0)
@@ -890,8 +901,9 @@ Create a dirty image from visibilities.
 """
 function make_image(vis::GPUVisibilities, meta::GPUMetadata, config::GPUImagerConfig)
     use_gpu = _is_gpu(vis)
+    N_pad = _padded_size(config)
     
-    grid = GPUGrid(config.image_size, config.w_layers, gpu=use_gpu)
+    grid = GPUGrid(N_pad, config.w_layers, gpu=use_gpu)
     img = GPUImage(config.image_size, gpu=use_gpu)
     
     grid_visibilities!(grid, vis, meta, config)
