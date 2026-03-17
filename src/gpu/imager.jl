@@ -136,7 +136,7 @@ struct GPUImagerConfig
         image_size::Int=512,
         cell_size::Float64=deg2rad(1.0/60.0),  # 1 arcmin default
         w_layers::Int=1,
-        padding_factor::Float64=1.5,
+        padding_factor::Float64=1.2,
         weighting::Symbol=:natural,
         robust::Float64=0.0,
         oversampling::Int=8,
@@ -837,18 +837,28 @@ function gridding_correction(N::Int, support::Int)
             end
         end
     else
-        # Convolution gridding: DFT of the actual truncated Kaiser-Bessel kernel.
+        # Convolution gridding: analytic FT of the Kaiser-Bessel kernel.
+        # The continuous FT of C(u) = I₀(α√(1-(u/W)²))/I₀(α) for |u|≤W is:
+        #   Ĉ(η) = sinh(√(α²-(2πWη)²)) / √(α²-(2πWη)²)  [inside main lobe]
+        #   Ĉ(η) = sin(√((2πWη)²-α²)) / √((2πWη)²-α²)   [outside main lobe]
+        # Normalized so Ĉ(0) = sinh(α)/α → correction = Ĉ(0)/Ĉ(η)
         W = Float64(support)
-        beta = 8.6  # wsclean-style KB parameter (alpha)
-        inv_i0beta = 1.0 / _besseli0(beta)
-        kernel = zeros(Float64, N)
-        for n in -support:support
-            kernel[mod(n, N) + 1] = _kb_value(Float64(n), W, beta, inv_i0beta)
-        end
-        taper = abs.(fftshift(fft(kernel)))
-        taper ./= taper[center]  # normalize so center = 1
+        alpha = 8.6  # wsclean-style KB parameter
+        c0 = sinh(alpha) / alpha  # Ĉ(0)
         for i in 1:N
-            corr_1d[i] = 1.0 / max(taper[i], 0.01)  # cap at 100×
+            eta = (i - center) / N  # fractional frequency
+            arg2 = alpha^2 - (2π * W * eta)^2
+            if abs(arg2) < 1e-10
+                chat = 1.0
+            elseif arg2 > 0
+                sqarg = sqrt(arg2)
+                chat = sinh(sqarg) / sqarg
+            else
+                sqarg = sqrt(-arg2)
+                chat = sin(sqarg) / sqarg
+            end
+            chat_norm = chat / c0  # normalized so center = 1
+            corr_1d[i] = 1.0 / max(abs(chat_norm), 0.01)  # cap at 100×
         end
     end
     
