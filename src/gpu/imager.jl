@@ -45,7 +45,7 @@ using ..TTCalX: GPUVisibilities, GPUMetadata, GPUCalibration
 using ..TTCalX: Nbase, Nfreq, Nant
 using ..TTCalX: GPUPeelingSource, AbstractGPUPeelingSource, peel_gpu!
 using ..TTCalX: thread_index_1d
-using ..TTCalX: grid_nn_kernel!, grid_convolve_kernel!, w_correction_kernel!
+using ..TTCalX: grid_nn_kernel!, grid_bilinear_kernel!, grid_convolve_kernel!, w_correction_kernel!
 using ..TTCalX: log_step, log_substep, log_detail, log_success, log_warning
 
 # Helper functions
@@ -140,7 +140,7 @@ struct GPUImagerConfig
         weighting::Symbol=:natural,
         robust::Float64=0.0,
         oversampling::Int=8,
-        support::Int=0,
+        support::Int=1,
         w_max::Float64=0.0
     )
         @assert image_size > 0 && iseven(image_size) "image_size must be positive and even"
@@ -406,7 +406,7 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
     support = config.support
     W = Float64(support)
     beta = 2.34 * W
-    inv_i0beta = support > 0 ? 1.0 / _besseli0(beta) : 0.0
+    inv_i0beta = support > 1 ? 1.0 / _besseli0(beta) : 0.0
     
     @inbounds for β in 1:Nf
         λ = c / channels[β]
@@ -425,12 +425,11 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
             V_re = real(V)
             V_im = imag(V)
             
-            if support > 0
-                # Convolutional gridding: scatter to nearby cells with KB kernel
+            if support > 1
+                # KB convolutional gridding
                 u_grid = u / uv_cell + center
                 v_grid = v / uv_cell + center
                 
-                # W-layer assignment
                 iw = Nw == 1 ? 1 : clamp(floor(Int, (w - w_min) / w_range * Nw) + 1, 1, Nw)
                 
                 iu_min = max(1, floor(Int, u_grid) - support)
@@ -472,9 +471,87 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
                         kw = _kb_value(du, W, beta, inv_i0beta) * kv
                         kw == 0.0 && continue
                         grid.data_re[ju, jv, iw_conj] += V_re * kw
-                        grid.data_im[ju, jv, iw_conj] -= V_im * kw  # conj
+                        grid.data_im[ju, jv, iw_conj] -= V_im * kw
                         grid.weights[ju, jv, iw_conj] += kw
                     end
+                end
+            elseif support == 1
+                # Bilinear interpolation: 4 surrounding cells
+                u_grid = u / uv_cell + center
+                v_grid = v / uv_cell + center
+                
+                iw = Nw == 1 ? 1 : clamp(floor(Int, (w - w_min) / w_range * Nw) + 1, 1, Nw)
+                
+                iu0 = floor(Int, u_grid)
+                iu1 = iu0 + 1
+                iv0 = floor(Int, v_grid)
+                iv1 = iv0 + 1
+                fu = u_grid - iu0
+                fv = v_grid - iv0
+                
+                w00 = (1.0 - fu) * (1.0 - fv)
+                w10 = fu * (1.0 - fv)
+                w01 = (1.0 - fu) * fv
+                w11 = fu * fv
+                
+                if iu0 >= 1 && iu0 <= N && iv0 >= 1 && iv0 <= N
+                    grid.data_re[iu0, iv0, iw] += V_re * w00
+                    grid.data_im[iu0, iv0, iw] += V_im * w00
+                    grid.weights[iu0, iv0, iw] += w00
+                end
+                if iu1 >= 1 && iu1 <= N && iv0 >= 1 && iv0 <= N
+                    grid.data_re[iu1, iv0, iw] += V_re * w10
+                    grid.data_im[iu1, iv0, iw] += V_im * w10
+                    grid.weights[iu1, iv0, iw] += w10
+                end
+                if iu0 >= 1 && iu0 <= N && iv1 >= 1 && iv1 <= N
+                    grid.data_re[iu0, iv1, iw] += V_re * w01
+                    grid.data_im[iu0, iv1, iw] += V_im * w01
+                    grid.weights[iu0, iv1, iw] += w01
+                end
+                if iu1 >= 1 && iu1 <= N && iv1 >= 1 && iv1 <= N
+                    grid.data_re[iu1, iv1, iw] += V_re * w11
+                    grid.data_im[iu1, iv1, iw] += V_im * w11
+                    grid.weights[iu1, iv1, iw] += w11
+                end
+                
+                # Hermitian conjugate
+                uc = -u / uv_cell + center
+                vc = -v / uv_cell + center
+                neg_w = -w
+                iw_c = Nw == 1 ? 1 : clamp(floor(Int, (neg_w - w_min) / w_range * Nw) + 1, 1, Nw)
+                
+                iu0c = floor(Int, uc)
+                iu1c = iu0c + 1
+                iv0c = floor(Int, vc)
+                iv1c = iv0c + 1
+                fuc = uc - iu0c
+                fvc = vc - iv0c
+                
+                wc00 = (1.0 - fuc) * (1.0 - fvc)
+                wc10 = fuc * (1.0 - fvc)
+                wc01 = (1.0 - fuc) * fvc
+                wc11 = fuc * fvc
+                
+                if iu0c >= 1 && iu0c <= N && iv0c >= 1 && iv0c <= N
+                    grid.data_re[iu0c, iv0c, iw_c] += V_re * wc00
+                    grid.data_im[iu0c, iv0c, iw_c] -= V_im * wc00
+                    grid.weights[iu0c, iv0c, iw_c] += wc00
+                end
+                if iu1c >= 1 && iu1c <= N && iv0c >= 1 && iv0c <= N
+                    grid.data_re[iu1c, iv0c, iw_c] += V_re * wc10
+                    grid.data_im[iu1c, iv0c, iw_c] -= V_im * wc10
+                    grid.weights[iu1c, iv0c, iw_c] += wc10
+                end
+                if iu0c >= 1 && iu0c <= N && iv1c >= 1 && iv1c <= N
+                    grid.data_re[iu0c, iv1c, iw_c] += V_re * wc01
+                    grid.data_im[iu0c, iv1c, iw_c] -= V_im * wc01
+                    grid.weights[iu0c, iv1c, iw_c] += wc01
+                end
+                if iu1c >= 1 && iu1c <= N && iv1c >= 1 && iv1c <= N
+                    grid.data_re[iu1c, iv1c, iw_c] += V_re * wc11
+                    grid.data_im[iu1c, iv1c, iw_c] -= V_im * wc11
+                    grid.weights[iu1c, iv1c, iw_c] += wc11
                 end
             else
                 # Nearest-neighbor gridding
@@ -498,7 +575,7 @@ function cpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
                     neg_w = -w
                     iw_conj = Nw == 1 ? 1 : clamp(floor(Int, (neg_w - w_min) / w_range * Nw) + 1, 1, Nw)
                     grid.data_re[iu_conj, iv_conj, iw_conj] += V_re
-                    grid.data_im[iu_conj, iv_conj, iw_conj] -= V_im  # conj
+                    grid.data_im[iu_conj, iv_conj, iw_conj] -= V_im
                     grid.weights[iu_conj, iv_conj, iw_conj] += 1.0
                 end
             end
@@ -565,7 +642,7 @@ function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
     blocks = cld(total_items, threads)
     
     support = Int32(config.support)
-    if support > 0
+    if support > 1
         @cuda blocks=blocks threads=threads grid_convolve_kernel!(
             grid.data_re, grid.data_im, grid.weights,
             vis_xx_re, vis_xx_im,
@@ -575,6 +652,17 @@ function gpu_grid_visibilities!(grid::GPUGrid, vis::GPUVisibilities,
             Float64(w_min), Float64(w_range), Int32(Nw),
             Int32(N), Float64(uv_cell), center,
             support,
+            Int32(Nb), Int32(Nf)
+        )
+    elseif support == 1
+        @cuda blocks=blocks threads=threads grid_bilinear_kernel!(
+            grid.data_re, grid.data_im, grid.weights,
+            vis_xx_re, vis_xx_im,
+            vis_yy_re, vis_yy_im,
+            vis.flags,
+            meta.uvw, meta.channels,
+            Float64(w_min), Float64(w_range), Int32(Nw),
+            Int32(N), Float64(uv_cell), center,
             Int32(Nb), Int32(Nf)
         )
     else
@@ -735,6 +823,17 @@ function gridding_correction(N::Int, support::Int)
                 corr_1d[i] = 1.0
             else
                 corr_1d[i] = (π * x) / sin(π * x)  # 1/sinc(x)
+            end
+        end
+    elseif support == 1
+        # Bilinear interpolation: triangle kernel FT = sinc²(η).
+        # Correction = 1/sinc²(η) = (πη/sin(πη))²
+        for i in 1:N
+            x = (i - center) / N
+            if abs(x) < 1e-10
+                corr_1d[i] = 1.0
+            else
+                corr_1d[i] = ((π * x) / sin(π * x))^2
             end
         end
     else

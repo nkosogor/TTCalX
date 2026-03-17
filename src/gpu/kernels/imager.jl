@@ -140,8 +140,156 @@ function grid_nn_kernel!(
 end
 
 #==============================================================================#
-#                    Convolutional Gridding Kernel                             #
+#                     Bilinear Interpolation Gridding Kernel                    #
 #==============================================================================#
+
+"""
+CUDA kernel for bilinear interpolation gridding with Hermitian conjugate.
+
+Each visibility scatters to 4 surrounding grid cells with weights
+proportional to the sub-cell overlap area (triangle / tent function).
+Only 4 atomic adds per visibility — nearly as fast as NN but O(Δx²)
+interpolation error instead of O(Δx).
+
+Correction: divide image by sinc²(η) per axis.
+"""
+function grid_bilinear_kernel!(
+    # Output grid (N, N, Nw)
+    grid_data_re, grid_data_im,
+    grid_weights,
+    # Input visibilities (Nbase, Nfreq)
+    vis_xx_re, vis_xx_im,
+    vis_yy_re, vis_yy_im,
+    flags,
+    # UVW coordinates (3, Nbase)
+    uvw,
+    # Frequency channels (Nfreq,)
+    channels,
+    # W-layer info
+    w_min, w_range, Nw,
+    # Grid parameters
+    N, uv_cell, center,
+    # Dimensions
+    Nbase, Nfreq
+)
+    idx = thread_index_1d()
+    
+    if idx <= Nbase * Nfreq
+        α = ((idx - 1) % Nbase) + 1
+        β = ((idx - 1) ÷ Nbase) + 1
+        
+        if flags[α, β]
+            return nothing
+        end
+        
+        ν = channels[β]
+        λ = GPU_C_IMAGER / ν
+        
+        u = uvw[1, α] / λ
+        v = uvw[2, α] / λ
+        w = uvw[3, α] / λ
+        
+        # Continuous grid position
+        u_grid = u / uv_cell + center
+        v_grid = v / uv_cell + center
+        
+        # W-layer index
+        if Nw == 1
+            iw = Int32(1)
+        else
+            iw = clamp(floor(Int32, (w - w_min) / w_range * Nw) + 1, Int32(1), Int32(Nw))
+        end
+        
+        # Stokes I visibility
+        V_re = 0.5 * (vis_xx_re[α, β] + vis_yy_re[α, β])
+        V_im = 0.5 * (vis_xx_im[α, β] + vis_yy_im[α, β])
+        
+        # Bilinear: 4 surrounding cells
+        iu0 = floor(Int32, u_grid)
+        iu1 = iu0 + Int32(1)
+        iv0 = floor(Int32, v_grid)
+        iv1 = iv0 + Int32(1)
+        fu = u_grid - Float64(iu0)  # fractional part, 0 to 1
+        fv = v_grid - Float64(iv0)
+        
+        # 4 bilinear weights (partition of unity: sum = 1)
+        w00 = (1.0 - fu) * (1.0 - fv)
+        w10 = fu * (1.0 - fv)
+        w01 = (1.0 - fu) * fv
+        w11 = fu * fv
+        
+        # Scatter to 4 cells with bounds checks
+        if iu0 >= 1 && iu0 <= N && iv0 >= 1 && iv0 <= N
+            CUDA.@atomic grid_data_re[iu0, iv0, iw] += V_re * w00
+            CUDA.@atomic grid_data_im[iu0, iv0, iw] += V_im * w00
+            CUDA.@atomic grid_weights[iu0, iv0, iw] += w00
+        end
+        if iu1 >= 1 && iu1 <= N && iv0 >= 1 && iv0 <= N
+            CUDA.@atomic grid_data_re[iu1, iv0, iw] += V_re * w10
+            CUDA.@atomic grid_data_im[iu1, iv0, iw] += V_im * w10
+            CUDA.@atomic grid_weights[iu1, iv0, iw] += w10
+        end
+        if iu0 >= 1 && iu0 <= N && iv1 >= 1 && iv1 <= N
+            CUDA.@atomic grid_data_re[iu0, iv1, iw] += V_re * w01
+            CUDA.@atomic grid_data_im[iu0, iv1, iw] += V_im * w01
+            CUDA.@atomic grid_weights[iu0, iv1, iw] += w01
+        end
+        if iu1 >= 1 && iu1 <= N && iv1 >= 1 && iv1 <= N
+            CUDA.@atomic grid_data_re[iu1, iv1, iw] += V_re * w11
+            CUDA.@atomic grid_data_im[iu1, iv1, iw] += V_im * w11
+            CUDA.@atomic grid_weights[iu1, iv1, iw] += w11
+        end
+        
+        # Hermitian conjugate: V(-u,-v,-w) = conj(V(u,v,w))
+        uc_grid = -u / uv_cell + center
+        vc_grid = -v / uv_cell + center
+        neg_w = -w
+        if Nw == 1
+            iw_c = Int32(1)
+        else
+            iw_c = clamp(floor(Int32, (neg_w - w_min) / w_range * Nw) + 1, Int32(1), Int32(Nw))
+        end
+        
+        iu0c = floor(Int32, uc_grid)
+        iu1c = iu0c + Int32(1)
+        iv0c = floor(Int32, vc_grid)
+        iv1c = iv0c + Int32(1)
+        fuc = uc_grid - Float64(iu0c)
+        fvc = vc_grid - Float64(iv0c)
+        
+        wc00 = (1.0 - fuc) * (1.0 - fvc)
+        wc10 = fuc * (1.0 - fvc)
+        wc01 = (1.0 - fuc) * fvc
+        wc11 = fuc * fvc
+        
+        if iu0c >= 1 && iu0c <= N && iv0c >= 1 && iv0c <= N
+            CUDA.@atomic grid_data_re[iu0c, iv0c, iw_c] += V_re * wc00
+            CUDA.@atomic grid_data_im[iu0c, iv0c, iw_c] -= V_im * wc00
+            CUDA.@atomic grid_weights[iu0c, iv0c, iw_c] += wc00
+        end
+        if iu1c >= 1 && iu1c <= N && iv0c >= 1 && iv0c <= N
+            CUDA.@atomic grid_data_re[iu1c, iv0c, iw_c] += V_re * wc10
+            CUDA.@atomic grid_data_im[iu1c, iv0c, iw_c] -= V_im * wc10
+            CUDA.@atomic grid_weights[iu1c, iv0c, iw_c] += wc10
+        end
+        if iu0c >= 1 && iu0c <= N && iv1c >= 1 && iv1c <= N
+            CUDA.@atomic grid_data_re[iu0c, iv1c, iw_c] += V_re * wc01
+            CUDA.@atomic grid_data_im[iu0c, iv1c, iw_c] -= V_im * wc01
+            CUDA.@atomic grid_weights[iu0c, iv1c, iw_c] += wc01
+        end
+        if iu1c >= 1 && iu1c <= N && iv1c >= 1 && iv1c <= N
+            CUDA.@atomic grid_data_re[iu1c, iv1c, iw_c] += V_re * wc11
+            CUDA.@atomic grid_data_im[iu1c, iv1c, iw_c] -= V_im * wc11
+            CUDA.@atomic grid_weights[iu1c, iv1c, iw_c] += wc11
+        end
+    end
+    
+    return nothing
+end
+
+#==============================================================================#
+#                    Convolutional Gridding Kernel                             #
+#==============================================================================##
 
 """
 CUDA kernel for gridding with convolution kernel (more accurate, slower).
