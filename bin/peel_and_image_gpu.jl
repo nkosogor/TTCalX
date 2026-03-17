@@ -30,6 +30,7 @@
 #   --weight=SCHEME   Weighting: natural, uniform, briggs (default: natural)
 #   --robust=R        Briggs robust parameter, -2 to 2 (default: 0)
 #   --taper-inner-tukey=L  Inner UV taper transition width in wavelengths (default: 0=off)
+#   --skip-before     Skip pre-peeling image (only image after peeling)
 #   --output=PREFIX   Output file prefix (default: image)
 #   --verbose         Show detailed diagnostic output
 #   --quiet           Suppress all output except errors
@@ -79,6 +80,7 @@ IMAGING OPTIONS:
   --weight=SCHEME   Weighting: natural, uniform, briggs [default: natural]
   --robust=R        Briggs robust parameter, -2 to 2 [default: 0]
   --taper-inner-tukey=L  Inner UV taper width in wavelengths [default: 0=off]
+  --skip-before     Skip pre-peeling image (only image after peeling)
   --output=PREFIX   Output file prefix [default: image]
 
 CALIBRATION OPTIONS:
@@ -128,6 +130,7 @@ function parse_args(args)
         "weighting" => :natural,
         "robust" => 0.0,
         "taper_inner_tukey" => 0.0,
+        "skip_before" => false,
         "output" => "image"
     )
     
@@ -166,6 +169,8 @@ function parse_args(args)
             opts["robust"] = parse(Float64, split(arg, "=")[2])
         elseif startswith(arg, "--taper-inner-tukey=")
             opts["taper_inner_tukey"] = parse(Float64, split(arg, "=")[2])
+        elseif arg == "--skip-before"
+            opts["skip_before"] = true
         elseif startswith(arg, "--output=")
             opts["output"] = String(split(arg, "=")[2])
         elseif startswith(arg, "--")
@@ -405,16 +410,21 @@ function process_ms(ms_path::String, opts, sources)
         save_image_outputs(I, "$(prefix)_dirty"; meta=meta, config=config)
         log_substep(@sprintf("Imaging took %.2f s", dt))
     else
-        # Image BEFORE peeling
-        log_step("Imaging BEFORE peeling...")
-        t0 = time()
-        img_before = make_image(vis, meta, config)
-        dt = time() - t0
-        
-        I_before = img_before.stokes_I isa CuArray ? Array(img_before.stokes_I) : img_before.stokes_I
-        image_stats(I_before, "Dirty Image BEFORE Peeling")
-        save_image_outputs(I_before, "$(prefix)_before"; meta=meta, config=config)
-        log_substep(@sprintf("Imaging took %.2f s", dt))
+        # Image BEFORE peeling (unless --skip-before)
+        I_before = nothing
+        if !opts["skip_before"]
+            log_step("Imaging BEFORE peeling...")
+            t0 = time()
+            img_before = make_image(vis, meta, config)
+            dt = time() - t0
+            
+            I_before = img_before.stokes_I isa CuArray ? Array(img_before.stokes_I) : img_before.stokes_I
+            image_stats(I_before, "Dirty Image BEFORE Peeling")
+            save_image_outputs(I_before, "$(prefix)_before"; meta=meta, config=config)
+            log_substep(@sprintf("Imaging took %.2f s", dt))
+        else
+            log_step("Skipping pre-peeling image (--skip-before)")
+        end
         
         # Peel sources
         log_step("Peeling $(length(sources)) source(s) ($(opts["peeliter"]) iterations)...")
@@ -442,17 +452,19 @@ function process_ms(ms_path::String, opts, sources)
         log_substep(@sprintf("Imaging took %.2f s", dt))
         
         # Comparison
-        log_section("Comparison")
-        peak_before = maximum(abs.(I_before))
-        peak_after = maximum(abs.(I_after))
-        rms_before = std(I_before)
-        rms_after = std(I_after)
-        log_substep(@sprintf("Peak: %.4e -> %.4e  (%.1fx reduction)",
-                    peak_before, peak_after, peak_before / max(peak_after, 1e-30)))
-        log_substep(@sprintf("RMS:  %.4e -> %.4e  (%.1fx reduction)",
-                    rms_before, rms_after, rms_before / max(rms_after, 1e-30)))
-        log_substep(@sprintf("DR:   %.0f -> %.0f",
-                    peak_before/rms_before, peak_after/rms_after))
+        if I_before !== nothing
+            log_section("Comparison")
+            peak_before = maximum(abs.(I_before))
+            peak_after = maximum(abs.(I_after))
+            rms_before = std(I_before)
+            rms_after = std(I_after)
+            log_substep(@sprintf("Peak: %.4e -> %.4e  (%.1fx reduction)",
+                        peak_before, peak_after, peak_before / max(peak_after, 1e-30)))
+            log_substep(@sprintf("RMS:  %.4e -> %.4e  (%.1fx reduction)",
+                        rms_before, rms_after, rms_before / max(rms_after, 1e-30)))
+            log_substep(@sprintf("DR:   %.0f -> %.0f",
+                        peak_before/rms_before, peak_after/rms_after))
+        end
         
         # Write back peeled data to MS
         log_step("Writing calibrated data to MS...")
@@ -677,11 +689,19 @@ function main()
     times = Float64[]
     ms_files = opts["ms_files"]
     
+    original_output = opts["output"]
     for (i, ms_path) in enumerate(ms_files)
         log_section("[$i/$(length(ms_files))] $(basename(ms_path))")
+        # Auto-prefix output with MS basename when processing multiple files
+        if length(ms_files) > 1
+            ms_base = replace(basename(ms_path), r"\.ms$" => "")
+            opts["output"] = "$(original_output)_$(ms_base)"
+            log_substep("Output prefix: $(opts["output"])")
+        end
         t = process_ms(ms_path, opts, sources)
         push!(times, t)
     end
+    opts["output"] = original_output
     
     # Summary
     if length(ms_files) > 0
