@@ -116,7 +116,7 @@ struct GPUImagerConfig
         weighting::Symbol=:natural,
         robust::Float64=0.0,
         oversampling::Int=8,
-        support::Int=3,
+        support::Int=0,
         w_max::Float64=0.0
     )
         @assert image_size > 0 && iseven(image_size) "image_size must be positive and even"
@@ -679,30 +679,42 @@ end
 """
     gridding_correction(N, support) -> Matrix{Float64}
 
-Compute gridding correction image for Gaussian convolution kernel.
+Compute gridding correction image to compensate for the gridding kernel taper.
 
-The gridding kernel G(u) = exp(-u²/(2σ²)) with σ = support/2.5 (in grid cells)
-has FT g(x) = σ√(2π) exp(-2π²σ²x²/N²) where x is pixel offset from center.
-Dividing the image by g(x)/g(0) corrects for the tapering.
+- support=0 (NN): correction for sinc taper from sub-cell quantization.
+  Max correction ≈ π/2 per axis (~2.5× in 2D corners). Well-conditioned.
+- support>0 (convolution): DFT of the truncated Gaussian kernel, with cap
+  to avoid extreme amplification at image edges.
 
-Returns a 2D array of correction factors (≥1 everywhere, =1 at center).
+Returns a 2D array of correction factors (=1 at center, ≥1 elsewhere).
 """
 function gridding_correction(N::Int, support::Int)
-    if support <= 0
-        return ones(Float64, N, N)
-    end
-    
-    sigma_uv = support / 2.5  # Gaussian sigma in grid cells
     center = N ÷ 2 + 1
-    
-    # 1D correction: g(x) = exp(-2π²σ²x²/N²), correction = 1/g(x) = exp(+2π²σ²x²/N²)
-    # Cap at modest value to avoid edge blow-up (edges are outside useful FoV anyway)
     corr_1d = Vector{Float64}(undef, N)
-    max_corr = 3.0  # Cap single-axis correction at 3× (9× for 2D worst case)
-    for i in 1:N
-        x = (i - center) / N  # fractional pixel offset (-0.5 to 0.5)
-        g = exp(-2.0 * π^2 * sigma_uv^2 * x^2)
-        corr_1d[i] = min(1.0 / g, max_corr)
+    
+    if support <= 0
+        # NN gridding: sinc correction for sub-cell quantization error.
+        # Averaging over random sub-cell offsets attenuates by sinc(k/N).
+        for i in 1:N
+            x = (i - center) / N  # fractional pixel offset (-0.5 to 0.5)
+            if abs(x) < 1e-10
+                corr_1d[i] = 1.0
+            else
+                corr_1d[i] = (π * x) / sin(π * x)  # 1/sinc(x)
+            end
+        end
+    else
+        # Convolution gridding: DFT of the actual truncated Gaussian kernel.
+        sigma = Float64(support) / 2.5
+        kernel = zeros(Float64, N)
+        for n in -support:support
+            kernel[mod(n, N) + 1] = exp(-n^2 / (2 * sigma^2))
+        end
+        taper = abs.(fftshift(fft(kernel)))
+        taper ./= taper[center]  # normalize so center = 1
+        for i in 1:N
+            corr_1d[i] = 1.0 / max(taper[i], 0.01)  # cap at 100×
+        end
     end
     
     # 2D separable: correction[i,j] = corr_1d[i] * corr_1d[j]
@@ -727,10 +739,8 @@ function cpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfi
         dirty ./= total_weight
     end
     
-    # Apply gridding correction (compensate for convolution kernel tapering)
-    if config.support > 0
-        dirty .*= gridding_correction(N, config.support)
-    end
+    # Apply gridding correction (sinc for NN, DFT-based for convolution)
+    dirty .*= gridding_correction(N, config.support)
     
     copyto!(img.stokes_I, dirty)
     fill!(img.stokes_Q, 0.0)
@@ -816,12 +826,10 @@ function gpu_grid_to_image!(img::GPUImage, grid::GPUGrid, config::GPUImagerConfi
         img.stokes_I ./= total_weight
     end
     
-    # Apply gridding correction on GPU (compensate for convolution kernel tapering)
-    if config.support > 0
-        gc = CuArray(gridding_correction(N, config.support))
-        img.stokes_I .*= gc
-        CUDA.unsafe_free!(gc)
-    end
+    # Apply gridding correction on GPU (sinc for NN, DFT-based for convolution)
+    gc = CuArray(gridding_correction(N, config.support))
+    img.stokes_I .*= gc
+    CUDA.unsafe_free!(gc)
     
     fill!(img.stokes_Q, 0.0)
     fill!(img.stokes_U, 0.0)
