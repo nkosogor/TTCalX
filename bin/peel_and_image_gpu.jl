@@ -276,48 +276,43 @@ function save_fits(path::String, I::Matrix{Float64}, meta, config)
 
     # Orientation: transpose Julia [x,y] to FITS [y,x], then flipud (vertical flip)
     # Empirically verified to match wsclean pixel layout (corr=0.82 with NN gridding)
-    img_np = np_mod.array(reverse(permutedims(I), dims=1), dtype=np_mod.float64)
+    img_np = np_mod.array(reverse(permutedims(I), dims=1), dtype=np_mod.float32)
     img_4d = np_mod.reshape(img_np, (1, 1, N, N))
 
     hdu = astropy_io_fits.PrimaryHDU(data=img_4d)
     hdr = hdu.header
 
-    # RA axis (axis 1 in FITS = last numpy axis)
-    hdr["CTYPE1"] = "RA---SIN"
-    hdr["CRPIX1"] = Float64(N ÷ 2 + 1)
-    hdr["CDELT1"] = -cell_deg            # RA increases to the left
-    hdr["CRVAL1"] = ra_deg
-    hdr["CUNIT1"] = "deg"
+    # Use hdr.set() — PyCall's hdr["key"]=val doesn't work for astropy Headers
+    hdr.set("CTYPE1", "RA---SIN", "Right ascension angle cosine")
+    hdr.set("CRPIX1", Float64(N ÷ 2 + 1))
+    hdr.set("CDELT1", -cell_deg)
+    hdr.set("CRVAL1", ra_deg)
+    hdr.set("CUNIT1", "deg")
 
-    # Dec axis (axis 2)
-    hdr["CTYPE2"] = "DEC--SIN"
-    hdr["CRPIX2"] = Float64(N ÷ 2 + 1)
-    hdr["CDELT2"] = cell_deg
-    hdr["CRVAL2"] = dec_deg
-    hdr["CUNIT2"] = "deg"
+    hdr.set("CTYPE2", "DEC--SIN", "Declination angle cosine")
+    hdr.set("CRPIX2", Float64(N ÷ 2 + 1))
+    hdr.set("CDELT2", cell_deg)
+    hdr.set("CRVAL2", dec_deg)
+    hdr.set("CUNIT2", "deg")
 
-    # Frequency axis (axis 3) — band center + total bandwidth
-    hdr["CTYPE3"] = "FREQ"
-    hdr["CRPIX3"] = 1.0
-    hdr["CDELT3"] = total_bw
-    hdr["CRVAL3"] = center_freq
-    hdr["CUNIT3"] = "Hz"
-    hdr["SPECSYS"] = "TOPOCENT"
+    hdr.set("CTYPE3", "FREQ", "Central frequency")
+    hdr.set("CRPIX3", 1.0)
+    hdr.set("CDELT3", total_bw)
+    hdr.set("CRVAL3", center_freq)
+    hdr.set("CUNIT3", "Hz")
 
-    # Stokes axis (axis 4), Stokes I = 1
-    hdr["CTYPE4"] = "STOKES"
-    hdr["CRPIX4"] = 1.0
-    hdr["CDELT4"] = 1.0
-    hdr["CRVAL4"] = 1.0      # 1 = Stokes I
-    hdr["CUNIT4"] = ""
+    hdr.set("CTYPE4", "STOKES")
+    hdr.set("CRPIX4", 1.0)
+    hdr.set("CDELT4", 1.0)
+    hdr.set("CRVAL4", 1.0)
 
-    # Standard FITS keywords
-    hdr["BUNIT"]  = "JY/BEAM"
-    hdr["BTYPE"]  = "Intensity"
-    hdr["ORIGIN"] = "TTCalX"
-    hdr["TELESCOP"] = "OVRO-LWA"
-    hdr["EQUINOX"] = 2000.0
-    hdr["LONPOLE"] = 180.0
+    hdr.set("BUNIT",  "JY/BEAM", "Units are in Jansky per beam")
+    hdr.set("BTYPE",  "Intensity")
+    hdr.set("EQUINOX", 2000.0, "J2000")
+    hdr.set("LONPOLE", 180.0)
+    hdr.set("SPECSYS", "TOPOCENT")
+    hdr.set("ORIGIN", "TTCalX")
+    hdr.set("TELESCOP", "OVRO-LWA")
 
     hdu.writeto(path, overwrite=true)
 end
