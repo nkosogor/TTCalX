@@ -722,24 +722,25 @@ function apply_weighting!(grid::GPUGrid, config::GPUImagerConfig)
         return grid
         
     elseif config.weighting == :uniform
-        safe_w = max.(grid.weights, one(Float64))
-        grid.data_re ./= safe_w
-        grid.data_im ./= safe_w
-        grid.weights .= sign.(grid.weights)
+        # In-place: no temporary arrays
+        @. grid.data_re = ifelse(grid.weights > 0, grid.data_re / grid.weights, grid.data_re)
+        @. grid.data_im = ifelse(grid.weights > 0, grid.data_im / grid.weights, grid.data_im)
+        @. grid.weights = sign(grid.weights)
         
     elseif config.weighting == :briggs
         robust = config.robust
         total_weight = sum(grid.weights)
-        sum_w2 = sum(grid.weights .^ 2)
+        sum_w2 = mapreduce(x -> x^2, +, grid.weights)  # no temporary
         if sum_w2 > 0 && total_weight > 0
             f2 = (5.0 * 10.0^(-robust))^2 / (sum_w2 / total_weight)
         else
             f2 = 1.0
         end
-        briggs_w = 1.0 ./ (1.0 .+ f2 .* grid.weights)
-        grid.data_re .*= briggs_w
-        grid.data_im .*= briggs_w
-        grid.weights .*= briggs_w
+        # In-place Briggs: fused broadcast, no temporary 3D arrays
+        # Update data first (reads original weights), then weights last
+        @. grid.data_re /= (1.0 + f2 * grid.weights)
+        @. grid.data_im /= (1.0 + f2 * grid.weights)
+        @. grid.weights /= (1.0 + f2 * grid.weights)
     end
     
     return grid
