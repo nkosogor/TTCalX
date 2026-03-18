@@ -20,6 +20,9 @@ __pycache__/
 *.bak
 *~
 
+# Image outputs (copied from server)
+*.png
+
 # MS data files (large)
 *.ms/
 # Exception: keep the small example dataset
