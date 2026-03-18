@@ -31,6 +31,7 @@
 #   --robust=R        Briggs robust parameter, -2 to 2 (default: 0)
 #   --taper-inner-tukey=L  Inner UV taper transition width in wavelengths (default: 0=off)
 #   --skip-before     Skip pre-peeling image (only image after peeling)
+#   --skip-writeback   Don't write peeled data back to MS
 #   --output=PREFIX   Output file prefix (default: image)
 #   --verbose         Show detailed diagnostic output
 #   --quiet           Suppress all output except errors
@@ -81,6 +82,7 @@ IMAGING OPTIONS:
   --robust=R        Briggs robust parameter, -2 to 2 [default: 0]
   --taper-inner-tukey=L  Inner UV taper width in wavelengths [default: 0=off]
   --skip-before     Skip pre-peeling image (only image after peeling)
+  --skip-writeback   Don't write peeled data back to MS
   --output=PREFIX   Output file prefix [default: image]
 
 CALIBRATION OPTIONS:
@@ -131,6 +133,7 @@ function parse_args(args)
         "robust" => 0.0,
         "taper_inner_tukey" => 0.0,
         "skip_before" => false,
+        "skip_writeback" => false,
         "output" => "image"
     )
     
@@ -171,6 +174,8 @@ function parse_args(args)
             opts["taper_inner_tukey"] = parse(Float64, split(arg, "=")[2])
         elseif arg == "--skip-before"
             opts["skip_before"] = true
+        elseif arg == "--skip-writeback"
+            opts["skip_writeback"] = true
         elseif startswith(arg, "--output=")
             opts["output"] = String(split(arg, "=")[2])
         elseif startswith(arg, "--")
@@ -466,9 +471,13 @@ function process_ms(ms_path::String, opts, sources)
                         peak_before/rms_before, peak_after/rms_after))
         end
         
-        # Write back peeled data to MS
-        log_step("Writing calibrated data to MS...")
-        write_gpu_to_ms!(ms_path, vis, baseline_dict, Nrows; column=opts["column"])
+        # Write back peeled data to MS (unless --skip-writeback)
+        if !opts["skip_writeback"]
+            log_step("Writing calibrated data to MS...")
+            write_gpu_to_ms!(ms_path, vis, baseline_dict, Nrows; column=opts["column"])
+        else
+            log_step("Skipping MS write-back (--skip-writeback)")
+        end
     end
     
     t_elapsed = time() - t_start
