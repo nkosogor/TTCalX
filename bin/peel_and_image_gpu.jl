@@ -361,10 +361,12 @@ function process_ms(ms_path::String, opts, sources)
     
     # Read MS
     log_step("Reading MS: $(basename(ms_path))...")
-    vis, cal, meta, baseline_dict, Nrows = read_ms_to_gpu(
+    t_io = time()
+    vis, cal, meta, baseline_dict, Nrows, row_to_baseline, data_shape = read_ms_to_gpu(
         ms_path; gpu=true, column=opts["column"]
     )
-    log_substep("Antennas: $(meta.Nant), Baselines: $(meta.Nbase), Channels: $(meta.Nfreq)")
+    log_substep(@sprintf("Read: %d ant, %d bl, %d ch  (%.2f s)",
+                meta.Nant, meta.Nbase, meta.Nfreq, time() - t_io))
     
     # Configure imager
     log_step("Configuring imager...")
@@ -474,7 +476,9 @@ function process_ms(ms_path::String, opts, sources)
         # Write back peeled data to MS (unless --skip-writeback)
         if !opts["skip_writeback"]
             log_step("Writing calibrated data to MS...")
-            write_gpu_to_ms!(ms_path, vis, baseline_dict, Nrows; column=opts["column"])
+            t_io = time()
+            write_gpu_to_ms!(ms_path, vis, row_to_baseline, data_shape; column=opts["column"])
+            log_substep(@sprintf("Write took %.2f s", time() - t_io))
         else
             log_step("Skipping MS write-back (--skip-writeback)")
         end

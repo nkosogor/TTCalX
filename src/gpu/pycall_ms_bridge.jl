@@ -218,7 +218,7 @@ function read_ms_to_gpu(ms_path::String; gpu::Bool=true, column::String="DATA")
     vis_flags = zeros(Bool, Nbase, Nfreq)
     
     # Handle different possible data layouts - optimized with @inbounds and @simd
-    data_shape = size(raw_data)
+    # (data_shape already computed above for Nfreq detection)
     if length(data_shape) == 3
         # Determine which axis is which
         if data_shape[1] == 4 || data_shape[1] == 2  # (Npol, Nfreq, Nrows)
@@ -309,18 +309,19 @@ function read_ms_to_gpu(ms_path::String; gpu::Bool=true, column::String="DATA")
         cal = GPUCalibration(cal_xx, cal_xy, cal_yx, cal_yy, falses(Nant, Nfreq), true)
     end
     
-    return vis, cal, meta, baseline_dict, Nrows
+    return vis, cal, meta, baseline_dict, Nrows, row_to_baseline, data_shape
 end
 
 
 """
-    write_gpu_to_ms!(ms_path::String, vis::GPUVisibilities, 
-                     baseline_dict::Dict, Nrows::Int; column::String="DATA")
+    write_gpu_to_ms!(ms_path, vis, row_to_baseline, data_shape; column="DATA")
 
 Write GPU visibilities back to a Measurement Set.
+Uses pre-computed row_to_baseline and data_shape from read_ms_to_gpu to avoid
+re-reading ANTENNA1/2 and the existing data column.
 """
 function write_gpu_to_ms!(ms_path::String, vis::GPUVisibilities, 
-                          baseline_dict::Dict, Nrows::Int; 
+                          row_to_baseline::Vector{Int}, data_shape::Tuple;
                           column::String="DATA")
     if tables == PyNULL()
         init_pycasacore() || error("python-casacore not available")
@@ -329,14 +330,7 @@ function write_gpu_to_ms!(ms_path::String, vis::GPUVisibilities,
     log_detail("Opening MS for writing: $ms_path")
     ms = tables.table(ms_path, readonly=false)
     
-    # Read antenna columns to rebuild row mapping
-    ant1 = ms.getcol("ANTENNA1")
-    ant2 = ms.getcol("ANTENNA2")
-    
-    # Get existing data to know shape
-    existing_data = ms.getcol(column)
-    data_shape = size(existing_data)
-    log_debug("Data shape: $data_shape")
+    Nrows = length(row_to_baseline)
     
     # Transfer from GPU to CPU
     xx = Array(vis.xx)
@@ -347,35 +341,12 @@ function write_gpu_to_ms!(ms_path::String, vis::GPUVisibilities,
     
     Nbase, Nfreq = size(xx)
     
-    # Diagnostic: check if visibilities have been modified
-    old_power = sum(abs2, existing_data) / length(existing_data)
-    new_vis_power = (sum(abs2, xx) + sum(abs2, xy) + sum(abs2, yx) + sum(abs2, yy)) / (4 * Nbase * Nfreq)
-    log_debug("Original data mean power: $old_power")
-    log_debug("New visibility mean power: $new_vis_power")
+    # Construct output arrays directly (no re-read of existing data column).
+    # Auto-correlation rows get zeros + flagged; cross-corr rows get peeled vis.
+    new_data = zeros(ComplexF64, data_shape)
+    new_flags = ones(Bool, data_shape)  # Flag all by default (autos stay flagged)
     
-    # Build reverse lookup
-    baseline_lookup = Dict{Tuple{Int,Int}, Int}()
-    for ((a1, a2), idx) in baseline_dict
-        baseline_lookup[(a1, a2)] = idx
-    end
-    
-    # Pre-compute row-to-baseline mapping for faster write
-    row_to_baseline = zeros(Int, Nrows)
-    @inbounds for i in 1:Nrows
-        a1 = Int(ant1[i]) + 1
-        a2 = Int(ant2[i]) + 1
-        if a1 != a2
-            key = (min(a1, a2), max(a1, a2))
-            row_to_baseline[i] = get(baseline_lookup, key, 0)
-        end
-    end
-    
-    # Create output data arrays - use similar() to avoid data copy
-    new_data = similar(existing_data)
-    copyto!(new_data, existing_data)  # Faster than copy() for large arrays
-    new_flags = ms.getcol("FLAG")
-    
-    # Fill in the data - optimized with @inbounds and @simd
+    # Fill in cross-correlation data
     if data_shape[1] == 4 || data_shape[1] == 2  # (Npol, Nfreq, Nrows)
         @inbounds for i in 1:Nrows
             α = row_to_baseline[i]
