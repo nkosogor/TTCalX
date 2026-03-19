@@ -34,6 +34,8 @@
 #   --skip-writeback   Don't write peeled data back to MS
 #   --fits-only        Only save FITS output (skip bin/csv/pgm, default)
 #   --all-formats      Save all formats: bin, csv, pgm, fits
+#   --reader=MODE     MS reader: pycall or native (default: pycall)
+#   --pipeline         Overlap reading next MS with current processing
 #   --output=PREFIX   Output file prefix (default: image)
 #   --verbose         Show detailed diagnostic output
 #   --quiet           Suppress all output except errors
@@ -87,6 +89,8 @@ IMAGING OPTIONS:
   --skip-writeback   Don't write peeled data back to MS
   --fits-only        Only save FITS output (skip bin/csv/pgm, default)
   --all-formats      Save all formats: bin, csv, pgm, fits
+  --reader=MODE     MS reader: pycall or native [default: pycall]
+  --pipeline         Overlap reading next MS with current processing
   --output=PREFIX   Output file prefix [default: image]
 
 CALIBRATION OPTIONS:
@@ -139,6 +143,8 @@ function parse_args(args)
         "skip_before" => false,
         "skip_writeback" => false,
         "fits_only" => true,
+        "reader" => "pycall",
+        "pipeline" => false,
         "output" => "image"
     )
     
@@ -185,6 +191,15 @@ function parse_args(args)
             opts["fits_only"] = true
         elseif arg == "--all-formats"
             opts["fits_only"] = false
+        elseif startswith(arg, "--reader=")
+            reader = String(split(arg, "=")[2])
+            if reader ∉ ("pycall", "native")
+                println("Error: --reader must be 'pycall' or 'native'")
+                exit(1)
+            end
+            opts["reader"] = reader
+        elseif arg == "--pipeline"
+            opts["pipeline"] = true
         elseif startswith(arg, "--output=")
             opts["output"] = String(split(arg, "=")[2])
         elseif startswith(arg, "--")
@@ -366,19 +381,33 @@ end
 # Main processing
 #==============================================================================#
 
-function process_ms(ms_path::String, opts, sources)
+function process_ms(ms_path::String, opts, sources; preloaded_data=nothing)
     t_start = time()
     command = opts["command"]
     image_only = (command == "image")
+    use_native = opts["reader"] == "native"
     
-    # Read MS
-    log_step("Reading MS: $(basename(ms_path))...")
-    t_io = time()
-    vis, cal, meta, baseline_dict, Nrows, row_to_baseline, data_shape = read_ms_to_gpu(
-        ms_path; gpu=true, column=opts["column"]
-    )
-    log_substep(@sprintf("Read: %d ant, %d bl, %d ch  (%.2f s)",
-                meta.Nant, meta.Nbase, meta.Nfreq, time() - t_io))
+    # Read MS (or use preloaded data from pipeline)
+    if preloaded_data !== nothing
+        log_step("Using pre-loaded data for: $(basename(ms_path))")
+        vis, cal, meta, baseline_dict, Nrows, row_to_baseline, data_shape = preloaded_data
+        log_substep(@sprintf("Pre-loaded: %d ant, %d bl, %d ch",
+                    meta.Nant, meta.Nbase, meta.Nfreq))
+    else
+        log_step("Reading MS: $(basename(ms_path))...")
+        t_io = time()
+        if use_native
+            vis, cal, meta, baseline_dict, Nrows, row_to_baseline, data_shape = read_ms_native(
+                ms_path; gpu=true, column=opts["column"]
+            )
+        else
+            vis, cal, meta, baseline_dict, Nrows, row_to_baseline, data_shape = read_ms_to_gpu(
+                ms_path; gpu=true, column=opts["column"]
+            )
+        end
+        log_substep(@sprintf("Read (%s): %d ant, %d bl, %d ch  (%.2f s)",
+                    opts["reader"], meta.Nant, meta.Nbase, meta.Nfreq, time() - t_io))
+    end
     
     # Configure imager
     log_step("Configuring imager...")
@@ -489,8 +518,12 @@ function process_ms(ms_path::String, opts, sources)
         if !opts["skip_writeback"]
             log_step("Writing calibrated data to MS...")
             t_io = time()
-            write_gpu_to_ms!(ms_path, vis, row_to_baseline, data_shape; column=opts["column"])
-            log_substep(@sprintf("Write took %.2f s", time() - t_io))
+            if use_native
+                write_ms_native!(ms_path, vis, row_to_baseline, data_shape; column=opts["column"])
+            else
+                write_gpu_to_ms!(ms_path, vis, row_to_baseline, data_shape; column=opts["column"])
+            end
+            log_substep(@sprintf("Write (%s) took %.2f s", opts["reader"], time() - t_io))
         else
             log_step("Skipping MS write-back (--skip-writeback)")
         end
@@ -674,15 +707,27 @@ function main()
         exit(1)
     end
     
-    # Initialize python-casacore
+    # Initialize reader
     log_section("Initialization")
-    log_step("Loading python-casacore...")
-    if !init_pycasacore()
-        log_error("python-casacore not available")
-        println("Install with: pip install python-casacore")
-        exit(1)
+    use_native = opts["reader"] == "native"
+    if use_native
+        log_step("Using native reader (subprocess + binary pipe)")
+        # Verify the helper script exists
+        helper_path = joinpath(@__DIR__, "ms_io_helper.py")
+        if !isfile(helper_path)
+            log_error("ms_io_helper.py not found at: $helper_path")
+            exit(1)
+        end
+        log_success("Native reader ready")
+    else
+        log_step("Loading python-casacore...")
+        if !init_pycasacore()
+            log_error("python-casacore not available")
+            println("Install with: pip install python-casacore")
+            exit(1)
+        end
+        log_success("python-casacore loaded")
     end
-    log_success("python-casacore loaded")
     
     # Load sources (unless image-only mode)
     sources = []
@@ -702,6 +747,8 @@ function main()
         "Command" => command,
         "Image size" => "$(opts["image_size"]) x $(opts["image_size"])",
         "Weighting" => string(opts["weighting"]),
+        "Reader" => opts["reader"],
+        "Pipeline" => opts["pipeline"] ? "enabled" : "disabled",
         "Sources" => command == "image" ? "N/A" : opts["sources"],
         "Column" => opts["column"],
         "Max iter" => opts["maxiter"],
@@ -715,16 +762,72 @@ function main()
     ms_files = opts["ms_files"]
     
     original_output = opts["output"]
-    for (i, ms_path) in enumerate(ms_files)
-        log_section("[$i/$(length(ms_files))] $(basename(ms_path))")
-        # Auto-prefix output with MS basename when processing multiple files
-        if length(ms_files) > 1
-            ms_base = replace(basename(ms_path), r"\.ms$" => "")
-            opts["output"] = "$(original_output)_$(ms_base)"
-            log_substep("Output prefix: $(opts["output"])")
+    
+    use_pipeline = opts["pipeline"] && length(ms_files) > 1 && use_native
+    if opts["pipeline"] && !use_native
+        log_warning("Pipeline mode requires --reader=native (PyCall blocks GIL). Falling back to sequential.")
+        use_pipeline = false
+    end
+    
+    if use_pipeline
+        log_section("Pipeline mode: overlapping reads with processing")
+        
+        # Read first MS synchronously
+        log_step("Pre-reading first MS: $(basename(ms_files[1]))...")
+        t_preread = time()
+        next_data = read_ms_native(ms_files[1]; gpu=true, column=opts["column"])
+        log_substep(@sprintf("Pre-read took %.2f s", time() - t_preread))
+        
+        for (i, ms_path) in enumerate(ms_files)
+            log_section("[$i/$(length(ms_files))] $(basename(ms_path))")
+            
+            # Use pre-loaded data for current MS
+            current_data = next_data
+            
+            # Start reading next MS in background (if any)
+            read_task = nothing
+            if i < length(ms_files)
+                next_ms = ms_files[i + 1]
+                log_substep("Launching async read of: $(basename(next_ms))")
+                read_task = launch_read_async(next_ms; gpu=true,
+                                              column=opts["column"], reader=:native)
+            end
+            
+            # Auto-prefix output with MS basename when processing multiple files
+            if length(ms_files) > 1
+                ms_base = replace(basename(ms_path), r"\.ms$" => "")
+                opts["output"] = "$(original_output)_$(ms_base)"
+                log_substep("Output prefix: $(opts["output"])")
+            end
+            
+            t = process_ms(ms_path, opts, sources; preloaded_data=current_data)
+            push!(times, t)
+            
+            # Wait for next MS to finish reading
+            if read_task !== nothing
+                log_substep("Waiting for pre-read of: $(basename(ms_files[i + 1]))...")
+                t_wait = time()
+                next_data = fetch(read_task)
+                dt_wait = time() - t_wait
+                if dt_wait > 0.01
+                    log_substep(@sprintf("Pre-read wait: %.2f s", dt_wait))
+                else
+                    log_substep("Pre-read already complete (fully overlapped)")
+                end
+            end
         end
-        t = process_ms(ms_path, opts, sources)
-        push!(times, t)
+    else
+        for (i, ms_path) in enumerate(ms_files)
+            log_section("[$i/$(length(ms_files))] $(basename(ms_path))")
+            # Auto-prefix output with MS basename when processing multiple files
+            if length(ms_files) > 1
+                ms_base = replace(basename(ms_path), r"\.ms$" => "")
+                opts["output"] = "$(original_output)_$(ms_base)"
+                log_substep("Output prefix: $(opts["output"])")
+            end
+            t = process_ms(ms_path, opts, sources)
+            push!(times, t)
+        end
     end
     opts["output"] = original_output
     
