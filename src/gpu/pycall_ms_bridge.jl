@@ -1,12 +1,11 @@
-# MS Bridge — shared processing + PyCall reader/writer
+# MS Bridge using python-casacore via PyCall
 #
-# Provides:
-#   _assemble_gpu_data()     shared processing (baseline mapping, GPU transfer)
-#   _build_write_arrays()    shared write-array construction
-#   read_ms_to_gpu()         PyCall-based MS reader (original)
-#   write_gpu_to_ms!()       PyCall-based MS writer
-#   read_ms_native()         Subprocess-based MS reader (faster, no PyCall overhead)
-#   write_ms_native!()       Subprocess-based MS writer
+# This provides MS file I/O for GPU-TTCal using python-casacore,
+# which is available in most radio astronomy environments.
+#
+# Requirements:
+#   - PyCall.jl 
+#   - python-casacore (pip install python-casacore)
 
 using PyCall
 
@@ -28,34 +27,64 @@ function init_pycasacore()
 end
 
 #==============================================================================#
-#            Shared processing (used by both PyCall and native readers)         #
+#                         MS Reading Functions                                  #
 #==============================================================================#
 
 """
-    _assemble_gpu_data(raw_data, raw_flags, ant1, ant2, raw_uvw,
-                       chan_freq, positions, phase_dir; gpu=true)
+    read_ms_to_gpu(ms_path::String; gpu::Bool=true, column::String="DATA")
 
-Common processing: baseline mapping, visibility extraction, GPU transfer.
-Accepts raw arrays from any reader backend (PyCall or native subprocess).
-Returns: (vis, cal, meta, baseline_dict, Nrows, row_to_baseline, data_shape)
+Read a Measurement Set into GPU-friendly data structures using python-casacore.
+
+Returns: (vis::GPUVisibilities, meta::GPUMetadata)
 """
-function _assemble_gpu_data(raw_data, raw_flags, ant1, ant2, raw_uvw,
-                            chan_freq, positions, phase_dir; gpu::Bool=true)
+function read_ms_to_gpu(ms_path::String; gpu::Bool=true, column::String="DATA")
+    if tables == PyNULL()
+        init_pycasacore() || error("python-casacore not available")
+    end
+    
+    log_detail("Opening MS: $ms_path")
+    ms = tables.table(ms_path, readonly=true)
+    
+    # Read main table data
+    log_detail("Reading $column column...")
+    raw_data = ms.getcol(column)  # Shape: (Npol, Nfreq, Nrows)
+    raw_flags = ms.getcol("FLAG")
+    ant1 = ms.getcol("ANTENNA1")
+    ant2 = ms.getcol("ANTENNA2")
+    raw_uvw = ms.getcol("UVW")  # Shape: (Nrows, 3) or (3, Nrows)
+    
     Nrows = length(ant1)
-
-    # --- Parse channels ---
+    log_debug("Rows: $Nrows")
+    log_debug("UVW shape: $(size(raw_uvw))")
+    
+    # Read spectral window info
+    spw = tables.table(ms_path * "/SPECTRAL_WINDOW", readonly=true)
+    chan_freq = spw.getcol("CHAN_FREQ")
+    log_debug("CHAN_FREQ shape: $(size(chan_freq))")
+    # chan_freq can be (Nfreq,) for single SPW or (Nspw, Nfreq) for multiple
+    # PyCall transposes arrays, so check dimensions carefully
     if ndims(chan_freq) == 1
         Nfreq = length(chan_freq)
         channels = Vector{Float64}(chan_freq)
     elseif size(chan_freq, 1) == 1
+        # Single SPW, shape is (1, Nfreq)
         Nfreq = size(chan_freq, 2)
         channels = vec(Float64.(chan_freq[1, :]))
     else
+        # Multiple SPWs or (Nfreq, 1)
         Nfreq = size(chan_freq, 1)
         channels = vec(Float64.(chan_freq[:, 1]))
     end
-
-    # --- Parse antenna positions (3, Nant) ---
+    spw.close()
+    log_debug("Frequencies: $Nfreq")
+    
+    # Read antenna positions
+    ant_table = tables.table(ms_path * "/ANTENNA", readonly=true)
+    positions = ant_table.getcol("POSITION")
+    log_debug("Positions shape: $(size(positions))")
+    
+    # Handle different possible layouts from casacore
+    # Typically (3, Nant) but could be (Nant, 3)
     if ndims(positions) == 2
         if size(positions, 1) == 3
             Nant = size(positions, 2)
@@ -65,15 +94,28 @@ function _assemble_gpu_data(raw_data, raw_flags, ant1, ant2, raw_uvw,
             antenna_positions = Float64.(permutedims(positions))
         end
     else
+        # 1D array - reshape
         Nant = length(positions) ÷ 3
         antenna_positions = reshape(Float64.(positions), 3, Nant)
     end
-
-    # --- Parse phase center ---
+    ant_table.close()
+    log_debug("Antennas: $Nant")
+    
+    # Read phase center from FIELD table
+    field_table = tables.table(ms_path * "/FIELD", readonly=true)
+    phase_dir = field_table.getcol("PHASE_DIR")
+    field_table.close()
+    log_debug("PHASE_DIR shape: $(size(phase_dir))")
+    
+    # Extract RA/Dec from phase_dir
+    # Shape from python-casacore is typically (Nfield, 1, 2) or (1, 1, 2)
+    # where the last dimension is [RA, Dec]
     if ndims(phase_dir) == 3
+        # (Nfield, Ndir, 2) - RA/Dec in last dimension
         phase_center_ra = Float64(phase_dir[1, 1, 1])
         phase_center_dec = Float64(phase_dir[1, 1, 2])
     elseif ndims(phase_dir) == 2
+        # (Nfield, 2) or (2, Nfield)
         if size(phase_dir, 2) == 2
             phase_center_ra = Float64(phase_dir[1, 1])
             phase_center_dec = Float64(phase_dir[1, 2])
@@ -85,41 +127,51 @@ function _assemble_gpu_data(raw_data, raw_flags, ant1, ant2, raw_uvw,
         phase_center_ra = Float64(phase_dir[1])
         phase_center_dec = Float64(phase_dir[2])
     else
+        log_warning("Could not parse PHASE_DIR, using zenith")
         phase_center_ra = 0.0
-        phase_center_dec = π/2
+        phase_center_dec = π/2  # Zenith
     end
-
-    # --- UVW → (3, Nrows) ---
+    log_debug("Phase center: RA=$(rad2deg(phase_center_ra))°, Dec=$(rad2deg(phase_center_dec))°")
+    
+    ms.close()
+    
+    # Handle UVW shape - can be (Nrows, 3) or (3, Nrows)
     if ndims(raw_uvw) == 2
         if size(raw_uvw, 2) == 3
-            uvw_all = Float64.(permutedims(raw_uvw))
+            # (Nrows, 3) - needs transpose
+            uvw_all = Float64.(permutedims(raw_uvw))  # → (3, Nrows)
         else
+            # (3, Nrows) - already correct
             uvw_all = Float64.(raw_uvw)
         end
     else
+        # 1D - reshape
         uvw_all = reshape(Float64.(raw_uvw), 3, Nrows)
     end
-
-    # --- Baseline mapping ---
+    
+    # Build baseline mapping (excluding auto-correlations)
+    # Map each unique (ant1, ant2) pair to a baseline index
     baseline_dict = Dict{Tuple{Int,Int}, Int}()
     row_to_baseline = zeros(Int, Nrows)
-    baseline_row = Dict{Int, Int}()
-
+    baseline_row = Dict{Int, Int}()  # Store first row for each baseline (to get UVW)
+    
     for i in 1:Nrows
-        a1 = Int(ant1[i]) + 1
+        a1 = Int(ant1[i]) + 1  # Python 0-indexed → Julia 1-indexed
         a2 = Int(ant2[i]) + 1
-        if a1 != a2
+        if a1 != a2  # Skip auto-correlations
             key = (min(a1, a2), max(a1, a2))
             if !haskey(baseline_dict, key)
                 baseline_dict[key] = length(baseline_dict) + 1
-                baseline_row[baseline_dict[key]] = i
+                baseline_row[baseline_dict[key]] = i  # Store first row for UVW
             end
             row_to_baseline[i] = baseline_dict[key]
         end
     end
-
+    
     Nbase = length(baseline_dict)
-
+    log_debug("Baselines: $Nbase (excluding autos)")
+    
+    # Build baselines array and extract UVW
     baselines = zeros(Int32, 2, Nbase)
     uvw = zeros(Float64, 3, Nbase)
     for ((a1, a2), idx) in baseline_dict
@@ -128,13 +180,20 @@ function _assemble_gpu_data(raw_data, raw_flags, ant1, ant2, raw_uvw,
         row = baseline_row[idx]
         uvw[:, idx] = uvw_all[:, row]
     end
-
-    # --- Determine Nfreq from data shape ---
+    log_debug("UVW extracted for $Nbase baselines")
+    # Extract visibilities into SoA format
+    # raw_data shape from casacore via PyCall: typically (Nrows, Nfreq, Npol)
+    log_debug("Raw data shape: $(size(raw_data))")
     data_shape = size(raw_data)
+    
+    # Determine Nfreq from actual data (more reliable than SPECTRAL_WINDOW)
+    # Shape is usually (Nrows, Nfreq, Npol)
     if length(data_shape) == 3
         if data_shape[3] == 4 || data_shape[3] == 2
+            # (Nrows, Nfreq, Npol)
             Nfreq_data = data_shape[2]
         elseif data_shape[1] == 4 || data_shape[1] == 2
+            # (Npol, Nfreq, Nrows)
             Nfreq_data = data_shape[2]
         else
             Nfreq_data = Nfreq
@@ -142,26 +201,30 @@ function _assemble_gpu_data(raw_data, raw_flags, ant1, ant2, raw_uvw,
     else
         Nfreq_data = Nfreq
     end
-
+    
     if Nfreq_data != Nfreq
+        log_debug("Note: Using Nfreq=$Nfreq_data from DATA (SPECTRAL_WINDOW said $Nfreq)")
         Nfreq = Nfreq_data
+        # Regenerate channels if needed
         if length(channels) != Nfreq
             channels = collect(range(1.0, Float64(Nfreq), length=Nfreq))
         end
     end
-
-    # --- Extract visibilities ---
+    
     vis_xx = zeros(ComplexF64, Nbase, Nfreq)
     vis_xy = zeros(ComplexF64, Nbase, Nfreq)
     vis_yx = zeros(ComplexF64, Nbase, Nfreq)
     vis_yy = zeros(ComplexF64, Nbase, Nfreq)
     vis_flags = zeros(Bool, Nbase, Nfreq)
-
+    
+    # Handle different possible data layouts - optimized with @inbounds and @simd
+    # (data_shape already computed above for Nfreq detection)
     if length(data_shape) == 3
-        if data_shape[1] == 4 || data_shape[1] == 2
+        # Determine which axis is which
+        if data_shape[1] == 4 || data_shape[1] == 2  # (Npol, Nfreq, Nrows)
             @inbounds for i in 1:Nrows
                 α = row_to_baseline[i]
-                if α > 0
+                if α > 0  # Not an auto-correlation
                     if data_shape[1] == 4
                         @simd for β in 1:Nfreq
                             vis_xx[α, β] = raw_data[1, β, i]
@@ -170,7 +233,7 @@ function _assemble_gpu_data(raw_data, raw_flags, ant1, ant2, raw_uvw,
                             vis_yy[α, β] = raw_data[4, β, i]
                             vis_flags[α, β] = raw_flags[1, β, i] | raw_flags[2, β, i] | raw_flags[3, β, i] | raw_flags[4, β, i]
                         end
-                    else
+                    else  # 2 pols (XX, YY only)
                         @simd for β in 1:Nfreq
                             vis_xx[α, β] = raw_data[1, β, i]
                             vis_yy[α, β] = raw_data[2, β, i]
@@ -179,7 +242,7 @@ function _assemble_gpu_data(raw_data, raw_flags, ant1, ant2, raw_uvw,
                     end
                 end
             end
-        elseif data_shape[3] == 4 || data_shape[3] == 2
+        elseif data_shape[3] == 4 || data_shape[3] == 2  # (Nrows, Nfreq, Npol) - transposed
             @inbounds for i in 1:Nrows
                 α = row_to_baseline[i]
                 if α > 0
@@ -202,57 +265,89 @@ function _assemble_gpu_data(raw_data, raw_flags, ant1, ant2, raw_uvw,
             end
         end
     end
-
-    # --- GPU transfer ---
-    phase_center_lmn = [0.0, 0.0, 1.0]
-
+    
+    log_debug("Extracted visibilities: $(Nbase) × $(Nfreq)")
+    
+    # Create GPU structures - use (l,m,n) for legacy compatibility
+    phase_center_lmn = [0.0, 0.0, 1.0]  # Zenith direction cosines
+    
     if gpu && CUDA.functional()
+        log_detail("Transferring to GPU...")
         vis = GPUVisibilities(
             CuArray(vis_xx), CuArray(vis_xy),
             CuArray(vis_yx), CuArray(vis_yy),
             CuArray(vis_flags)
         )
         meta = GPUMetadata(
-            CuArray(antenna_positions), CuArray(baselines),
-            CuArray(channels), CuArray(phase_center_lmn),
-            phase_center_ra, phase_center_dec, CuArray(uvw)
-        )
-        cal = GPUCalibration(
-            CuArray(ones(ComplexF64, Nant, Nfreq)),
-            CuArray(zeros(ComplexF64, Nant, Nfreq)),
-            CuArray(zeros(ComplexF64, Nant, Nfreq)),
-            CuArray(ones(ComplexF64, Nant, Nfreq)),
-            CuArray(falses(Nant, Nfreq)), true
+            CuArray(antenna_positions),
+            CuArray(baselines),
+            CuArray(channels),
+            CuArray(phase_center_lmn),
+            phase_center_ra,
+            phase_center_dec,
+            CuArray(uvw)
         )
     else
         vis = GPUVisibilities(vis_xx, vis_xy, vis_yx, vis_yy, vis_flags)
-        meta = GPUMetadata(antenna_positions, baselines, channels, phase_center_lmn,
+        meta = GPUMetadata(antenna_positions, baselines, channels, phase_center_lmn, 
                            phase_center_ra, phase_center_dec, uvw)
-        cal = GPUCalibration(
-            ones(ComplexF64, Nant, Nfreq), zeros(ComplexF64, Nant, Nfreq),
-            zeros(ComplexF64, Nant, Nfreq), ones(ComplexF64, Nant, Nfreq),
-            falses(Nant, Nfreq), true
-        )
     end
-
+    
+    # Create identity calibration
+    cal_xx = ones(ComplexF64, Nant, Nfreq)
+    cal_yy = ones(ComplexF64, Nant, Nfreq)
+    cal_xy = zeros(ComplexF64, Nant, Nfreq)
+    cal_yx = zeros(ComplexF64, Nant, Nfreq)
+    
+    if gpu && CUDA.functional()
+        cal = GPUCalibration(
+            CuArray(cal_xx), CuArray(cal_xy),
+            CuArray(cal_yx), CuArray(cal_yy),
+            CuArray(falses(Nant, Nfreq)), true
+        )
+    else
+        cal = GPUCalibration(cal_xx, cal_xy, cal_yx, cal_yy, falses(Nant, Nfreq), true)
+    end
+    
     return vis, cal, meta, baseline_dict, Nrows, row_to_baseline, data_shape
 end
 
-"""Build output data+flags arrays for MS writing (shared by PyCall and native writers)."""
-function _build_write_arrays(vis::GPUVisibilities, row_to_baseline::Vector{Int},
-                             data_shape::Tuple)
+
+"""
+    write_gpu_to_ms!(ms_path, vis, row_to_baseline, data_shape; column="DATA")
+
+Write GPU visibilities back to a Measurement Set.
+Uses pre-computed row_to_baseline and data_shape from read_ms_to_gpu to avoid
+re-reading ANTENNA1/2 and the existing data column.
+"""
+function write_gpu_to_ms!(ms_path::String, vis::GPUVisibilities, 
+                          row_to_baseline::Vector{Int}, data_shape::Tuple;
+                          column::String="DATA")
+    if tables == PyNULL()
+        init_pycasacore() || error("python-casacore not available")
+    end
+    
+    log_detail("Opening MS for writing: $ms_path")
+    ms = tables.table(ms_path, readonly=false)
+    
+    Nrows = length(row_to_baseline)
+    
+    # Transfer from GPU to CPU
     xx = Array(vis.xx)
     xy = Array(vis.xy)
     yx = Array(vis.yx)
     yy = Array(vis.yy)
     flags = Array(vis.flags)
+    
     Nbase, Nfreq = size(xx)
-    Nrows = length(row_to_baseline)
-
+    
+    # Construct output arrays directly (no re-read of existing data column).
+    # Auto-correlation rows get zeros + flagged; cross-corr rows get peeled vis.
     new_data = zeros(ComplexF64, data_shape)
-    new_flags = ones(Bool, data_shape)
-
-    if data_shape[1] == 4 || data_shape[1] == 2
+    new_flags = ones(Bool, data_shape)  # Flag all by default (autos stay flagged)
+    
+    # Fill in cross-correlation data
+    if data_shape[1] == 4 || data_shape[1] == 2  # (Npol, Nfreq, Nrows)
         @inbounds for i in 1:Nrows
             α = row_to_baseline[i]
             if α > 0
@@ -278,7 +373,7 @@ function _build_write_arrays(vis::GPUVisibilities, row_to_baseline::Vector{Int},
                 end
             end
         end
-    elseif data_shape[3] == 4 || data_shape[3] == 2
+    elseif data_shape[3] == 4 || data_shape[3] == 2  # (Nrows, Nfreq, Npol)
         @inbounds for i in 1:Nrows
             α = row_to_baseline[i]
             if α > 0
@@ -305,165 +400,24 @@ function _build_write_arrays(vis::GPUVisibilities, row_to_baseline::Vector{Int},
             end
         end
     end
-
-    return new_data, new_flags
-end
-
-#==============================================================================#
-#                       PyCall reader / writer                                  #
-#==============================================================================#
-
-"""
-    read_ms_to_gpu(ms_path; gpu=true, column="DATA")
-
-Read MS using python-casacore via PyCall.
-"""
-function read_ms_to_gpu(ms_path::String; gpu::Bool=true, column::String="DATA")
-    if tables == PyNULL()
-        init_pycasacore() || error("python-casacore not available")
-    end
-
-    ms = tables.table(ms_path, readonly=true)
-    raw_data  = ms.getcol(column)
-    raw_flags = ms.getcol("FLAG")
-    ant1      = ms.getcol("ANTENNA1")
-    ant2      = ms.getcol("ANTENNA2")
-    raw_uvw   = ms.getcol("UVW")
-
-    spw = tables.table(ms_path * "/SPECTRAL_WINDOW", readonly=true)
-    chan_freq = spw.getcol("CHAN_FREQ")
-    spw.close()
-
-    ant_table = tables.table(ms_path * "/ANTENNA", readonly=true)
-    positions = ant_table.getcol("POSITION")
-    ant_table.close()
-
-    field_table = tables.table(ms_path * "/FIELD", readonly=true)
-    phase_dir = field_table.getcol("PHASE_DIR")
-    field_table.close()
-
-    ms.close()
-
-    return _assemble_gpu_data(raw_data, raw_flags, ant1, ant2, raw_uvw,
-                              chan_freq, positions, phase_dir; gpu=gpu)
-end
-
-"""
-    write_gpu_to_ms!(ms_path, vis, row_to_baseline, data_shape; column="DATA")
-
-Write visibilities back to MS using python-casacore via PyCall.
-"""
-function write_gpu_to_ms!(ms_path::String, vis::GPUVisibilities,
-                          row_to_baseline::Vector{Int}, data_shape::Tuple;
-                          column::String="DATA")
-    if tables == PyNULL()
-        init_pycasacore() || error("python-casacore not available")
-    end
-
-    new_data, new_flags = _build_write_arrays(vis, row_to_baseline, data_shape)
-
-    ms = tables.table(ms_path, readonly=false)
-    ms.putcol(column, np.array(new_data, dtype=np.complex128))
-    ms.putcol("FLAG", np.array(new_flags, dtype=np.bool_))
+    
+    # Write back - use cached numpy for conversion
+    log_detail("Writing $column column...")
+    new_data_np = np.array(new_data, dtype=np.complex128)
+    new_flags_np = np.array(new_flags, dtype=np.bool_)
+    
+    ms.putcol(column, new_data_np)
+    ms.putcol("FLAG", new_flags_np)
     ms.flush()
     ms.close()
+    
+    log_debug("MS updated: $ms_path")
 end
 
-#==============================================================================#
-#                  Native reader / writer (subprocess + binary pipes)           #
-#==============================================================================#
-
-const MS_IO_HELPER = joinpath(@__DIR__, "..", "..", "bin", "ms_io_helper.py")
-
-"""Read a self-describing binary array from an IO stream."""
-function _read_bin_array(io::IO)
-    ndim = read(io, Int32)
-    shape = ntuple(_ -> read(io, Int64), ndim)
-    dtype_code = read(io, Int32)
-    T = (ComplexF64, Float64, Int32, UInt8)[dtype_code + 1]
-    n = prod(shape)
-    raw = Vector{UInt8}(undef, n * sizeof(T))
-    readbytes!(io, raw, length(raw))
-    arr = reinterpret(T, raw)
-    return reshape(copy(arr), shape...)
-end
-
-"""Write a self-describing binary array to an IO stream."""
-function _write_bin_array(io::IO, arr::AbstractArray)
-    write(io, Int32(ndims(arr)))
-    for s in size(arr)
-        write(io, Int64(s))
-    end
-    if eltype(arr) == ComplexF64
-        write(io, Int32(0))
-    elseif eltype(arr) == Float64
-        write(io, Int32(1))
-    elseif eltype(arr) == Int32
-        write(io, Int32(2))
-    else  # UInt8 / Bool
-        write(io, Int32(3))
-        arr = eltype(arr) == Bool ? UInt8.(arr) : arr
-    end
-    write(io, Array(arr))
-end
-
-"""
-    read_ms_native(ms_path; gpu=true, column="DATA")
-
-Read MS using Python subprocess + binary pipe (no PyCall overhead).
-"""
-function read_ms_native(ms_path::String; gpu::Bool=true, column::String="DATA")
-    cmd = `python3 $MS_IO_HELPER read $ms_path $column`
-    raw_bytes = read(cmd)
-    io = IOBuffer(raw_bytes)
-
-    raw_data  = _read_bin_array(io)
-    raw_flags_u8 = _read_bin_array(io)
-    ant1      = _read_bin_array(io)
-    ant2      = _read_bin_array(io)
-    raw_uvw   = _read_bin_array(io)
-    chan_freq  = _read_bin_array(io)
-    positions = _read_bin_array(io)
-    phase_dir = _read_bin_array(io)
-    close(io)
-
-    # Convert UInt8 flags to Bool
-    raw_flags = raw_flags_u8 .!= 0x00
-
-    return _assemble_gpu_data(raw_data, raw_flags, ant1, ant2, raw_uvw,
-                              chan_freq, positions, phase_dir; gpu=gpu)
-end
-
-"""
-    write_ms_native!(ms_path, vis, row_to_baseline, data_shape; column="DATA")
-
-Write visibilities back to MS using Python subprocess + binary pipe.
-"""
-function write_ms_native!(ms_path::String, vis::GPUVisibilities,
-                          row_to_baseline::Vector{Int}, data_shape::Tuple;
-                          column::String="DATA")
-    new_data, new_flags = _build_write_arrays(vis, row_to_baseline, data_shape)
-
-    cmd = `python3 $MS_IO_HELPER write $ms_path $column`
-    io = open(cmd, "w")
-    _write_bin_array(io, new_data)
-    _write_bin_array(io, UInt8.(new_flags))
-    close(io)
-end
-
-"""
-    launch_read_async(ms_path; gpu=true, column="DATA", reader=:native)
-
-Launch MS reading in background. Returns a Task that yields the read result.
-Only works with native reader (subprocess runs independently of Julia GIL).
-Falls back to synchronous read with pycall reader.
-"""
-function launch_read_async(ms_path::String; gpu::Bool=true,
-                           column::String="DATA", reader::Symbol=:native)
-    if reader == :native
-        return @async read_ms_native(ms_path; gpu=gpu, column=column)
-    else
-        # PyCall can't run async (GIL), so just wrap in a task for consistent API
-        return @async read_ms_to_gpu(ms_path; gpu=gpu, column=column)
-    end
+# Module initialization message (only in verbose mode)
+@verbose begin
+    println("PyCall MS Bridge loaded")
+    println("Functions:")
+    println("  read_ms_to_gpu(ms_path) → (vis, cal, meta, baseline_dict, Nrows)")
+    println("  write_gpu_to_ms!(ms_path, vis, baseline_dict, Nrows)")
 end

@@ -48,7 +48,6 @@ export Nbase, Nfreq, Nant
 
 # Export MS bridge functions (require python-casacore via PyCall at runtime)
 export read_ms_to_gpu, write_gpu_to_ms!
-export read_ms_native, write_ms_native!, launch_read_async
 export init_pycasacore
 
 # Export imager types and functions
