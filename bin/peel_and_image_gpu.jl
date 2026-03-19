@@ -32,6 +32,8 @@
 #   --taper-inner-tukey=L  Inner UV taper transition width in wavelengths (default: 0=off)
 #   --skip-before     Skip pre-peeling image (only image after peeling)
 #   --skip-writeback   Don't write peeled data back to MS
+#   --fits-only        Only save FITS output (skip bin/csv/pgm, default)
+#   --all-formats      Save all formats: bin, csv, pgm, fits
 #   --output=PREFIX   Output file prefix (default: image)
 #   --verbose         Show detailed diagnostic output
 #   --quiet           Suppress all output except errors
@@ -83,6 +85,8 @@ IMAGING OPTIONS:
   --taper-inner-tukey=L  Inner UV taper width in wavelengths [default: 0=off]
   --skip-before     Skip pre-peeling image (only image after peeling)
   --skip-writeback   Don't write peeled data back to MS
+  --fits-only        Only save FITS output (skip bin/csv/pgm, default)
+  --all-formats      Save all formats: bin, csv, pgm, fits
   --output=PREFIX   Output file prefix [default: image]
 
 CALIBRATION OPTIONS:
@@ -134,6 +138,7 @@ function parse_args(args)
         "taper_inner_tukey" => 0.0,
         "skip_before" => false,
         "skip_writeback" => false,
+        "fits_only" => true,
         "output" => "image"
     )
     
@@ -176,6 +181,10 @@ function parse_args(args)
             opts["skip_before"] = true
         elseif arg == "--skip-writeback"
             opts["skip_writeback"] = true
+        elseif arg == "--fits-only"
+            opts["fits_only"] = true
+        elseif arg == "--all-formats"
+            opts["fits_only"] = false
         elseif startswith(arg, "--output=")
             opts["output"] = String(split(arg, "=")[2])
         elseif startswith(arg, "--")
@@ -334,20 +343,23 @@ end
 
 """Save all output files for an image."""
 function save_image_outputs(I::Matrix{Float64}, prefix::String;
-                            meta=nothing, config=nothing)
-    save_bin("$(prefix).bin", I)
-    save_pgm("$(prefix).pgm", I)
-    save_csv("$(prefix).csv", I)
-    formats = ".bin, .pgm, .csv"
+                            meta=nothing, config=nothing, fits_only::Bool=true)
+    formats = String[]
+    if !fits_only
+        save_bin("$(prefix).bin", I)
+        save_pgm("$(prefix).pgm", I)
+        save_csv("$(prefix).csv", I)
+        append!(formats, [".bin", ".pgm", ".csv"])
+    end
     if meta !== nothing && config !== nothing
         try
             save_fits("$(prefix).fits", I, meta, config)
-            formats *= ", .fits"
+            push!(formats, ".fits")
         catch e
             log_warning("FITS save failed: $e (install astropy?)")
         end
     end
-    log_substep("Saved: $(prefix)$(formats)")
+    log_substep("Saved: $(prefix)$(join(formats, ", "))")
 end
 
 #==============================================================================#
@@ -414,7 +426,7 @@ function process_ms(ms_path::String, opts, sources)
         
         I = img.stokes_I isa CuArray ? Array(img.stokes_I) : img.stokes_I
         image_stats(I, "Dirty Image")
-        save_image_outputs(I, "$(prefix)_dirty"; meta=meta, config=config)
+        save_image_outputs(I, "$(prefix)_dirty"; meta=meta, config=config, fits_only=opts["fits_only"])
         log_substep(@sprintf("Imaging took %.2f s", dt))
     else
         # Image BEFORE peeling (unless --skip-before)
@@ -427,7 +439,7 @@ function process_ms(ms_path::String, opts, sources)
             
             I_before = img_before.stokes_I isa CuArray ? Array(img_before.stokes_I) : img_before.stokes_I
             image_stats(I_before, "Dirty Image BEFORE Peeling")
-            save_image_outputs(I_before, "$(prefix)_before"; meta=meta, config=config)
+            save_image_outputs(I_before, "$(prefix)_before"; meta=meta, config=config, fits_only=opts["fits_only"])
             log_substep(@sprintf("Imaging took %.2f s", dt))
         else
             log_step("Skipping pre-peeling image (--skip-before)")
@@ -455,7 +467,7 @@ function process_ms(ms_path::String, opts, sources)
         
         I_after = img_after.stokes_I isa CuArray ? Array(img_after.stokes_I) : img_after.stokes_I
         image_stats(I_after, "Dirty Image AFTER Peeling")
-        save_image_outputs(I_after, "$(prefix)_after"; meta=meta, config=config)
+        save_image_outputs(I_after, "$(prefix)_after"; meta=meta, config=config, fits_only=opts["fits_only"])
         log_substep(@sprintf("Imaging took %.2f s", dt))
         
         # Comparison
