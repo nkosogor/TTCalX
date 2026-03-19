@@ -37,7 +37,7 @@ def write_array(out, arr):
         np.dtype('uint8'): 3,
     }
     out.write(struct.pack('<i', dtype_map[arr.dtype]))
-    out.write(arr.tobytes())
+    out.write(arr.tobytes(order='F'))  # Fortran order for Julia column-major
 
 
 def read_array(inp):
@@ -53,7 +53,8 @@ def read_array(inp):
     raw_data = inp.read(nbytes)
     if len(raw_data) < nbytes:
         raise EOFError(f"Expected {nbytes} bytes, got {len(raw_data)}")
-    return np.frombuffer(raw_data, dtype=dtype).reshape(shape)
+    # Reshape with Fortran order since Julia writes column-major
+    return np.ascontiguousarray(np.frombuffer(raw_data, dtype=dtype).reshape(shape, order='F'))
 
 
 def cmd_read(ms_path, column):
