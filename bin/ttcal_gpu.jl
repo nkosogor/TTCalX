@@ -45,7 +45,7 @@ function print_help()
 GPU-TTCal: GPU-accelerated direction-dependent calibration
 
 USAGE:
-  julia bin/ttcal_gpu.jl <command> [options] <sources.json> <ms1> [ms2] ...
+  julia bin/ttcal_gpu.jl <command> [options] <sources.json> [sources2.json ...] <ms1> [ms2] ...
 
 COMMANDS:
   peel    Diagonal Jones calibration, per frequency channel
@@ -67,8 +67,8 @@ EXAMPLES:
   # Peel sources from a single MS
   julia bin/ttcal_gpu.jl peel sources.json data.ms
   
-  # Zest multiple MS files (batch processing)
-  julia bin/ttcal_gpu.jl zest sources.json *.ms
+  # Zest with both astro and RFI sources
+  julia bin/ttcal_gpu.jl zest sources.json rfi_43.2_ver20251101.json data.ms
   
   # Peel with custom parameters
   julia bin/ttcal_gpu.jl peel --maxiter=50 --minuvw=15 sources.json data.ms
@@ -149,8 +149,31 @@ function parse_args(args)
     end
     
     opts["command"] = positional[1]
-    opts["sources"] = positional[2]
-    opts["ms_files"] = positional[3:end]
+    
+    # Separate JSON source files from MS directories
+    # .json files are source catalogs, everything else is an MS
+    source_files = String[]
+    ms_files = String[]
+    for arg in positional[2:end]
+        if endswith(arg, ".json")
+            push!(source_files, arg)
+        else
+            push!(ms_files, arg)
+        end
+    end
+    
+    if isempty(source_files)
+        println("Error: No source JSON file(s) provided")
+        exit(1)
+    end
+    if isempty(ms_files)
+        println("Error: No measurement set file(s) provided")
+        exit(1)
+    end
+    
+    opts["source_files"] = source_files
+    opts["sources"] = source_files[1]  # backwards compat
+    opts["ms_files"] = ms_files
     
     return opts
 end
@@ -192,7 +215,7 @@ function main()
     log_section("Configuration")
     log_config(
         "Command" => command,
-        "Sources" => opts["sources"],
+        "Sources" => join(opts["source_files"], ", "),
         "Column" => opts["column"],
         "Max iter" => opts["maxiter"],
         "Tolerance" => opts["tolerance"],
@@ -212,10 +235,15 @@ function main()
     end
     log_success("python-casacore loaded")
     
-    # Load sources
-    log_step("Loading sources from $(opts["sources"])...")
-    sources = read_gpu_sources(opts["sources"])
-    log_substep("Loaded $(length(sources)) sources")
+    # Load sources from all JSON files
+    sources = GPUSource[]
+    for src_file in opts["source_files"]
+        log_step("Loading sources from $(src_file)...")
+        file_sources = read_gpu_sources(src_file)
+        log_substep("  $(length(file_sources)) sources from $(basename(src_file))")
+        append!(sources, file_sources)
+    end
+    log_substep("Total: $(length(sources)) sources")
     @verbose for s in sources
         log_detail("$(get_name(s))")
     end

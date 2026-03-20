@@ -845,100 +845,103 @@ where D = |pos_source| is the distance from array center to the source.
 
 The fringe for baseline (i,j) relative to phase center is:
     exp(2πi ν (τ_i - τ_j)) * exp(-2πi ν dot(phase_center, pos_i - pos_j)/c)
+
+Uses CUDA kernel when running on GPU, CPU loop otherwise.
 """
 function gpu_genvis!(vis::GPUVisibilities, meta::GPUMetadata, source::GPURFISource,
                      phase_center_ra::Float64, phase_center_dec::Float64, lst::Float64)
     Nb = meta.Nbase
     Nf = meta.Nfreq
-
-    # Get arrays on CPU for computation
-    channels = meta.channels isa CuArray ? Array(meta.channels) : meta.channels
-    positions = meta.antenna_positions isa CuArray ? Array(meta.antenna_positions) : meta.antenna_positions
-    baselines = meta.baselines isa CuArray ? Array(meta.baselines) : meta.baselines
     Na = meta.Nant
+    use_gpu = _is_gpu(vis)
 
     # Source ITRF position
     src_pos = source.position_itrf
-    D = norm(src_pos)
-
-    # Phase center as ITRF unit vector (from RA/Dec, approximate for this snapshot)
-    # This matches how the MS is phased: the w-projection reference direction
-    pc_l, pc_m, pc_n = 0.0, 0.0, 1.0  # phase center is always (l,m,n) = (0,0,1) by definition
-
-    # Compute per-antenna geometric delay (near-field)
-    # delay_i = (D - |src - ant_i|) / c  (the near-field path difference)
-    # We also need the far-field phase center correction: -dot(phase_center_itrf, ant_i) / c
-    c_light = 299792458.0
-    delays = zeros(Float64, Na)
-    for i in 1:Na
-        ant_x = positions[1, i]
-        ant_y = positions[2, i]
-        ant_z = positions[3, i]
-        dist = sqrt((src_pos[1] - ant_x)^2 + (src_pos[2] - ant_y)^2 + (src_pos[3] - ant_z)^2)
-        delays[i] = (D - dist) / c_light
-    end
+    src_x, src_y, src_z = src_pos[1], src_pos[2], src_pos[3]
+    D = sqrt(src_x^2 + src_y^2 + src_z^2)
 
     # Compute flux at each frequency from RFI spectrum
+    channels_cpu = meta.channels isa CuArray ? Array(meta.channels) : meta.channels
     flux_I = zeros(Float64, Nf)
     flux_Q = zeros(Float64, Nf)
     flux_U = zeros(Float64, Nf)
     flux_V = zeros(Float64, Nf)
     for β in 1:Nf
-        I, Q, U, V = source.spectrum(channels[β])
+        I, Q, U, Vv = source.spectrum(channels_cpu[β])
         flux_I[β] = I
         flux_Q[β] = Q
         flux_U[β] = U
-        flux_V[β] = V
+        flux_V[β] = Vv
     end
 
     # Convert Stokes to visibility basis (linear feeds)
-    flux_xx = Complex.(flux_I .+ flux_Q)
-    flux_xy = Complex.(flux_U, flux_V)
-    flux_yx = Complex.(flux_U, .-flux_V)
-    flux_yy = Complex.(flux_I .- flux_Q)
+    flux_xx_cpu = Complex.(flux_I .+ flux_Q)
+    flux_xy_cpu = Complex.(flux_U, flux_V)
+    flux_yx_cpu = Complex.(flux_U, .-flux_V)
+    flux_yy_cpu = Complex.(flux_I .- flux_Q)
 
-    # Get UVW on CPU (needed for phase center correction)
-    uvw = meta.uvw isa CuArray ? Array(meta.uvw) : meta.uvw
-
-    # Get visibility arrays on CPU
-    use_gpu = _is_gpu(vis)
-    vis_xx = use_gpu ? Array(vis.xx) : vis.xx
-    vis_xy = use_gpu ? Array(vis.xy) : vis.xy
-    vis_yx = use_gpu ? Array(vis.yx) : vis.yx
-    vis_yy = use_gpu ? Array(vis.yy) : vis.yy
-
-    @inbounds for β in 1:Nf
-        freq = channels[β]
-
-        for α in 1:Nb
-            ant1 = baselines[1, α]
-            ant2 = baselines[2, α]
-
-            # Near-field fringe: exp(2πi ν (τ_1 - τ_2))
-            phase_nf = 2π * freq * (delays[ant1] - delays[ant2])
-
-            # Phase center correction: -2π/λ * (u*0 + v*0 + w*1) = -2π*freq*w/c
-            # This subtracts the phase center contribution (same as far-field sources)
-            u = uvw[1, α]
-            v = uvw[2, α]
-            w = uvw[3, α]
-            phase_pc = -2π * freq * w / c_light
-
-            fringe = exp(im * (phase_nf + phase_pc))
-
-            vis_xx[α, β] += flux_xx[β] * fringe
-            vis_xy[α, β] += flux_xy[β] * fringe
-            vis_yx[α, β] += flux_yx[β] * fringe
-            vis_yy[α, β] += flux_yy[β] * fringe
-        end
-    end
-
-    # Copy back to GPU if needed
     if use_gpu
-        copyto!(vis.xx, CuArray(vis_xx))
-        copyto!(vis.xy, CuArray(vis_xy))
-        copyto!(vis.yx, CuArray(vis_yx))
-        copyto!(vis.yy, CuArray(vis_yy))
+        # --- GPU path: use CUDA kernels ---
+        # 1) Compute near-field per-antenna fringes
+        fringes = CUDA.zeros(ComplexF64, Na, Nf)
+        blocks1, threads1 = kernel_config_1d(Na * Nf)
+        @cuda blocks=blocks1 threads=threads1 compute_nearfield_fringes_kernel!(
+            fringes,
+            meta.antenna_positions,
+            src_x, src_y, src_z, D,
+            meta.channels,
+            Na, Nf
+        )
+        CUDA.synchronize()
+
+        # 2) Generate visibilities from antenna fringes using existing point kernel
+        flux_xx = CuArray(flux_xx_cpu)
+        flux_xy = CuArray(flux_xy_cpu)
+        flux_yx = CuArray(flux_yx_cpu)
+        flux_yy = CuArray(flux_yy_cpu)
+
+        blocks2, threads2 = kernel_config_1d(Nb * Nf)
+        @cuda blocks=blocks2 threads=threads2 genvis_point_kernel!(
+            vis.xx, vis.xy, vis.yx, vis.yy,
+            fringes,
+            flux_xx, flux_xy, flux_yx, flux_yy,
+            meta.baselines,
+            Nb, Nf
+        )
+        CUDA.synchronize()
+    else
+        # --- CPU path ---
+        positions = meta.antenna_positions
+        baselines = meta.baselines
+        uvw = meta.uvw
+
+        # Compute per-antenna near-field delays
+        c_light = 299792458.0
+        delays = zeros(Float64, Na)
+        for i in 1:Na
+            ax = positions[1, i]
+            ay = positions[2, i]
+            az = positions[3, i]
+            dist = sqrt((src_x - ax)^2 + (src_y - ay)^2 + (src_z - az)^2)
+            delays[i] = (D - dist) / c_light
+        end
+
+        @inbounds for β in 1:Nf
+            freq = channels_cpu[β]
+            for α in 1:Nb
+                ant1 = baselines[1, α]
+                ant2 = baselines[2, α]
+
+                # Near-field baseline fringe from per-antenna delays
+                phase = 2π * freq * (delays[ant1] - delays[ant2])
+                fringe = exp(im * phase)
+
+                vis.xx[α, β] += flux_xx_cpu[β] * fringe
+                vis.xy[α, β] += flux_xy_cpu[β] * fringe
+                vis.yx[α, β] += flux_yx_cpu[β] * fringe
+                vis.yy[α, β] += flux_yy_cpu[β] * fringe
+            end
+        end
     end
 
     return vis
@@ -1185,10 +1188,9 @@ function cpu_genvis!(vis::GPUVisibilities, meta::GPUMetadata, source::GPUMultiSo
     return vis
 end
 
-"""CPU version of genvis for RFI (near-field) source. Delegates to the shared implementation."""
+"""CPU version of genvis for RFI (near-field) source. gpu_genvis! handles both paths."""
 function cpu_genvis!(vis::GPUVisibilities, meta::GPUMetadata, source::GPURFISource,
                      phase_center_ra::Float64, phase_center_dec::Float64, lst::Float64)
-    # gpu_genvis! for RFI already works on CPU arrays; just call it
     gpu_genvis!(vis, meta, source, phase_center_ra, phase_center_dec, lst)
     return vis
 end

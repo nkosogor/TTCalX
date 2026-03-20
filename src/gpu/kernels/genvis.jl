@@ -560,3 +560,60 @@ function gpu_genvis!(vis::GPUVisibilities, meta::GPUMetadata, source_params::Dic
     CUDA.synchronize()
     vis
 end
+
+
+#==============================================================================#
+#                  RFI Near-Field Fringe Computation                           #
+#==============================================================================#
+
+"""
+Kernel to compute near-field geometric fringes for RFI sources.
+
+Near-field delay for antenna i:
+    τ_i = (D - |pos_source - pos_antenna_i|) / c
+where D = |pos_source| is the distance from array origin to the source.
+
+Output: per-antenna fringes (Nant, Nfreq)
+"""
+function compute_nearfield_fringes_kernel!(
+    # Output: fringes (Nant, Nfreq)
+    fringes,
+    # Antenna positions in ITRF (3, Nant)
+    antenna_positions,
+    # Source ITRF position (3 components passed as scalars)
+    src_x, src_y, src_z,
+    # Distance from origin to source
+    src_D,
+    # Frequency channels (Nfreq,)
+    channels,
+    # Dimensions
+    Nant, Nfreq
+)
+    idx = thread_index_1d()
+
+    if idx <= Nant * Nfreq
+        ant = ((idx - 1) % Nant) + 1
+        β = ((idx - 1) ÷ Nant) + 1
+
+        # Antenna position
+        ax = antenna_positions[1, ant]
+        ay = antenna_positions[2, ant]
+        az = antenna_positions[3, ant]
+
+        # Distance from source to this antenna
+        dx = src_x - ax
+        dy = src_y - ay
+        dz = src_z - az
+        dist = sqrt(dx*dx + dy*dy + dz*dz)
+
+        # Near-field delay: (D - dist) / c
+        delay = (src_D - dist) / GPU_C
+
+        # Fringe
+        ν = channels[β]
+        ϕ = 2.0 * π * ν * delay
+        fringes[ant, β] = exp(1im * ϕ)
+    end
+
+    return nothing
+end
