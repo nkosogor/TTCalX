@@ -27,10 +27,11 @@ export GPUVisibilities, GPUCalibration, GPUSquareVisibilities
 export GPUMetadata, create_gpu_metadata
 
 # Export source types
-export GPUSource, GPUPointSource, GPUGaussianSource, GPUMultiSource
-export GPUPowerLaw, read_gpu_sources
+export GPUSource, GPUPointSource, GPUGaussianSource, GPUMultiSource, GPURFISource
+export GPUPowerLaw, GPURFISpectrum, read_gpu_sources
 export AbstractGPUPeelingSource, GPUPeelingSource, GPUShavingSource, GPUZestingSource, GPUPruningSource
 export unwrap, get_name, is_diagonal, is_wideband, source_direction_lmn, calibration_type
+export wgs84_to_itrf
 
 # Export GPU operations
 export gpu_corrupt!, gpu_applycal!

@@ -32,6 +32,39 @@ function (spectrum::GPUPowerLaw)(frequency::Float64)
             spectrum.U * flux_scale, spectrum.V * flux_scale)
 end
 
+"""
+RFI spectrum: per-channel Stokes flux from a list of frequency channels.
+Uses linear interpolation between channels, matching CPU TTCal's RFISpectrum.
+"""
+struct GPURFISpectrum
+    channels::Vector{Float64}   # Frequency channels in Hz (sorted)
+    I::Vector{Float64}
+    Q::Vector{Float64}
+    U::Vector{Float64}
+    V::Vector{Float64}
+end
+
+function (spectrum::GPURFISpectrum)(frequency::Float64)
+    idx2 = searchsortedfirst(spectrum.channels, frequency)
+    if idx2 == 1
+        return (spectrum.I[1], spectrum.Q[1], spectrum.U[1], spectrum.V[1])
+    end
+    if idx2 > length(spectrum.channels)
+        N = length(spectrum.channels)
+        return (spectrum.I[N], spectrum.Q[N], spectrum.U[N], spectrum.V[N])
+    end
+    idx1 = idx2 - 1
+    nu1 = spectrum.channels[idx1]
+    nu2 = spectrum.channels[idx2]
+    w = (frequency - nu1) / (nu2 - nu1)
+    return (
+        spectrum.I[idx1] + (spectrum.I[idx2] - spectrum.I[idx1]) * w,
+        spectrum.Q[idx1] + (spectrum.Q[idx2] - spectrum.Q[idx1]) * w,
+        spectrum.U[idx1] + (spectrum.U[idx2] - spectrum.U[idx1]) * w,
+        spectrum.V[idx1] + (spectrum.V[idx2] - spectrum.V[idx1]) * w,
+    )
+end
+
 #==============================================================================#
 #                            Source Types                                       #
 #==============================================================================#
@@ -61,6 +94,16 @@ end
 struct GPUMultiSource <: GPUSource
     name::String
     components::Vector{GPUSource}
+end
+
+"""
+RFI (near-field) source with WGS84 or ITRF ground position.
+Uses per-channel RFI spectrum and near-field geometric delays.
+"""
+struct GPURFISource <: GPUSource
+    name::String
+    position_itrf::SVector{3, Float64}  # ITRF XYZ position in meters
+    spectrum::GPURFISpectrum
 end
 
 #==============================================================================#
@@ -150,6 +193,11 @@ function construct_gpu_source(c::Dict)
             push!(components, construct_gpu_source(Dict(d)))
         end
         return GPUMultiSource(name, components)
+    end
+
+    # RFI source: has ground position (el/long/lat) and rfi-frequencies
+    if haskey(c, "rfi-frequencies") && haskey(c, "el")
+        return construct_gpu_rfi_source(name, c)
     end
     
     # Parse direction
@@ -306,6 +354,9 @@ function is_above_horizon(source::GPUSource, phase_center_ra::Float64,
     return lmn[3] > 0.0  # n > 0 means source is above horizon relative to phase center
 end
 
+# RFI sources are always "above horizon" (they are on the ground)
+is_above_horizon(::GPURFISource, ::Float64, ::Float64, ::Float64) = true
+
 """Get source name."""
 get_name(s::GPUSource) = s.name
 get_name(s::AbstractGPUPeelingSource) = get_name(unwrap(s))
@@ -313,3 +364,70 @@ get_name(s::AbstractGPUPeelingSource) = get_name(unwrap(s))
 """Get number of sources."""
 count_sources(sources::Vector{<:GPUSource}) = length(sources)
 count_sources(sources::Vector{<:AbstractGPUPeelingSource}) = length(sources)
+
+#==============================================================================#
+#                     RFI Source Construction                                   #
+#==============================================================================#
+
+"""
+    wgs84_to_itrf(lon_deg, lat_deg, el_m) -> SVector{3, Float64}
+
+Convert WGS84 geodetic coordinates to ITRF Cartesian (meters).
+lon_deg: longitude in degrees, lat_deg: latitude in degrees, el_m: elevation in meters.
+"""
+function wgs84_to_itrf(lon_deg::Float64, lat_deg::Float64, el_m::Float64)
+    # WGS84 ellipsoid parameters
+    a = 6378137.0        # semi-major axis (m)
+    f = 1.0 / 298.257223563
+    e2 = 2f - f^2        # eccentricity squared
+
+    lon = deg2rad(lon_deg)
+    lat = deg2rad(lat_deg)
+
+    sin_lat = sin(lat)
+    cos_lat = cos(lat)
+    sin_lon = sin(lon)
+    cos_lon = cos(lon)
+
+    N = a / sqrt(1.0 - e2 * sin_lat^2)  # radius of curvature in prime vertical
+
+    x = (N + el_m) * cos_lat * cos_lon
+    y = (N + el_m) * cos_lat * sin_lon
+    z = (N * (1.0 - e2) + el_m) * sin_lat
+
+    return SVector(x, y, z)
+end
+
+"""
+    construct_gpu_rfi_source(name, c) -> GPURFISource
+
+Build a GPURFISource from a JSON dict with rfi-frequencies, rfi-I, rfi-V, etc.
+and WGS84/ITRF ground position.
+"""
+function construct_gpu_rfi_source(name::String, c::Dict)
+    # Parse position
+    sys = get(c, "sys", "WGS84")
+    lon = Float64(c["long"])
+    lat = Float64(c["lat"])
+    el  = Float64(c["el"])
+
+    if sys == "WGS84"
+        pos_itrf = wgs84_to_itrf(lon, lat, el)
+    elseif sys == "ITRF"
+        # Already ITRF Cartesian in (el=x?, long=y?, lat=z?) — match CasaCore convention
+        pos_itrf = SVector(el, lon, lat)
+    else
+        error("Unknown coordinate system for RFI source '$name': $sys")
+    end
+
+    # Parse RFI spectrum
+    channels = Float64.(c["rfi-frequencies"])
+    N = length(channels)
+    rfi_I = Float64.(c["rfi-I"])
+    rfi_Q = Float64.(get(c, "rfi-Q", zeros(N)))
+    rfi_U = Float64.(get(c, "rfi-U", zeros(N)))
+    rfi_V = Float64.(get(c, "rfi-V", zeros(N)))
+
+    spectrum = GPURFISpectrum(channels, rfi_I, rfi_Q, rfi_U, rfi_V)
+    return GPURFISource(name, pos_itrf, spectrum)
+end
