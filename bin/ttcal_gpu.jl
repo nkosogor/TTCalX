@@ -259,7 +259,7 @@ function main()
         
         # Read MS
         log_step("Reading MS data...")
-        vis, cal, meta, baseline_dict, Nrows = read_ms_to_gpu(
+        vis, cal, meta, baseline_dict, Nrows, row_to_baseline, data_shape = read_ms_to_gpu(
             ms_path; gpu=true, column=opts["column"]
         )
         
@@ -280,7 +280,7 @@ function main()
         
         # Write back
         log_step("Writing calibrated data...")
-        write_gpu_to_ms!(ms_path, vis, baseline_dict, Nrows; column=opts["column"])
+        write_gpu_to_ms!(ms_path, vis, row_to_baseline, data_shape; column=opts["column"])
         
         t_elapsed = time() - t_start
         push!(times, t_elapsed)
