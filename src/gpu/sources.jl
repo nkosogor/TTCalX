@@ -9,8 +9,8 @@ using StaticArrays
 #==============================================================================#
 
 """
-Power-law spectrum for astronomical sources.
-flux(ν) = stokes * (ν / reference_frequency)^index[1] * ...
+Power-law spectrum for astronomical sources (TTCal's convention):
+log10 flux(ν) = log10 stokes + Σₙ index[n] · log10(ν / reference_frequency)ⁿ
 """
 struct GPUPowerLaw
     I::Float64
@@ -22,12 +22,14 @@ struct GPUPowerLaw
 end
 
 function (spectrum::GPUPowerLaw)(frequency::Float64)
-    ratio = log(frequency / spectrum.reference_frequency)
+    # TTCal's PowerLaw: log10 S = log10 S0 + Σ αₙ log10(ν/ν0)ⁿ.  (Natural logs
+    # agree only for a single index; curvature terms such as Cyg A's need log10.)
+    ratio = log10(frequency / spectrum.reference_frequency)
     log_flux = zero(Float64)
     for (i, idx) in enumerate(spectrum.index)
         log_flux += idx * ratio^i
     end
-    flux_scale = exp(log_flux)
+    flux_scale = 10.0^log_flux
     return (spectrum.I * flux_scale, spectrum.Q * flux_scale, 
             spectrum.U * flux_scale, spectrum.V * flux_scale)
 end
@@ -151,7 +153,12 @@ function construct_gpu_source(c::Dict)
         end
         return GPUMultiSource(name, components)
     end
-    
+
+    # Terrestrial (near-field) RFI emitter, see rfi.jl
+    if haskey(c, "rfi-frequencies") && haskey(c, "el")
+        return construct_gpu_rfi_source(c)
+    end
+
     # Parse direction
     ra, dec = parse_source_direction(c)
     
