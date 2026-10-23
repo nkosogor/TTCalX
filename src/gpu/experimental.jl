@@ -659,3 +659,76 @@ function zero_short_baselines!(vis::GPUVisibilities, meta::GPUMetadata, minuvw::
     vis.xx .*= m; vis.xy .*= m; vis.yx .*= m; vis.yy .*= m
     vis
 end
+
+#==============================================================================#
+#              CPU-TTCal-exact far-field model (host computation)               #
+#==============================================================================#
+
+_components(s::GPUMultiSource) = s.components
+_components(s::GPUSource) = GPUSource[s]
+
+"""Gaussian axes in ITRF and widths, as CPU TTCal `additional_precomputation`."""
+function _gaussian_axes(c::GPUGaussianSource, R)
+    s = _unit(c.ra, c.dec)
+    z = SVector(0.0, 0.0, 1.0)
+    north = z - dot(z, s) * s
+    north = north / norm(north)
+    east = cross(north, s)
+    θ = c.position_angle
+    major = R * (cos(θ) * north + sin(θ) * east)
+    minor = R * (-sin(θ) * north + cos(θ) * east)
+    wmaj = π^2 * sin(c.major_fwhm)^2 / (4log(2))
+    wmin = π^2 * sin(c.minor_fwhm)^2 / (4log(2))
+    major, minor, wmaj, wmin
+end
+
+"""
+    genvis_exact!(vis, meta, source, mjd_utc)
+
+Add a sky source's model the way CPU TTCal does (`genvis!` with a constant
+beam): per component, skipped below the horizon; fringe exp(-ik (r₂-r₁)·(ŝ-ŝ₀))
+with apparent ITRF directions (`j2000_to_itrf_matrix`); Gaussian coherency
+from the 3-D baseline projected on the component's major/minor axes built
+from its local north/east (TTCalX's kernels use the (u,v) projection, a PA
+measured from east and a different rotation, and no foreshortening); and
+Stokes → linear with xy = U - iV.  Computed on the host, then uploaded.
+"""
+function genvis_exact!(vis::GPUVisibilities, meta::GPUMetadata, source::GPUSource, mjd_utc::Float64)
+    R = j2000_to_itrf_matrix(mjd_utc)
+    pos = Array(meta.antenna_positions)
+    bl = Array(meta.baselines)
+    ch = Array(meta.channels)
+    Nb, Nf = meta.Nbase, meta.Nfreq
+    s0 = R * _unit(meta.phase_center_ra, meta.phase_center_dec)
+    up = vec(sum(pos, dims=2)); up = up / norm(up)
+    hxx = zeros(ComplexF64, Nb, Nf); hxy = similar(hxx); hyx = similar(hxx); hyy = similar(hxx)
+    for c in _components(source)
+        s = R * _unit(c.ra, c.dec)
+        dot(s, up) > 0 || continue
+        gauss = c isa GPUGaussianSource ? _gaussian_axes(c, R) : nothing
+        delay = [dot(SVector(pos[1, i], pos[2, i], pos[3, i]), s - s0) for i in axes(pos, 2)]
+        for β in 1:Nf
+            I, Q, U, V = c.spectrum(ch[β])
+            fxx, fxy, fyx, fyy = complex(I + Q), complex(U, -V), complex(U, V), complex(I - Q)
+            k = 2π * ch[β] / SPEED_OF_LIGHT
+            λ = SPEED_OF_LIGHT / ch[β]
+            @inbounds for α in 1:Nb
+                a1, a2 = bl[1, α], bl[2, α]
+                v = cis(-k * (delay[a2] - delay[a1]))
+                if gauss !== nothing
+                    major, minor, wmaj, wmin = gauss
+                    b = SVector(pos[1, a2] - pos[1, a1], pos[2, a2] - pos[2, a1], pos[3, a2] - pos[3, a1])
+                    v *= exp(-wmaj * (dot(b, major) / λ)^2 - wmin * (dot(b, minor) / λ)^2)
+                end
+                hxx[α, β] += fxx * v; hxy[α, β] += fxy * v
+                hyx[α, β] += fyx * v; hyy[α, β] += fyy * v
+            end
+        end
+    end
+    if _is_gpu(vis)
+        vis.xx .+= CuArray(hxx); vis.xy .+= CuArray(hxy); vis.yx .+= CuArray(hyx); vis.yy .+= CuArray(hyy)
+    else
+        vis.xx .+= hxx; vis.xy .+= hxy; vis.yx .+= hyx; vis.yy .+= hyy
+    end
+    vis
+end
