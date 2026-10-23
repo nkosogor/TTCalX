@@ -9,6 +9,8 @@
 #   - Source model parsing works
 #   - Zest pipeline runs end-to-end on CPU
 #   - Results are written back to the MS without errors
+#   - Unit tests (test/runtests.jl): geometry, RFI sources, exact sky model,
+#     solvers, phase prior, host backend, fast MS I/O
 
 name: CI Quick Test
 
@@ -99,6 +101,10 @@ jobs:
       # ── Run Quick Test ───────────────────────────────────────────────
       - name: Run Quick Test (CPU fallback)
         run: julia --project=. test/quick_test.jl
+
+      # ── Unit tests ───────────────────────────────────────────────────
+      - name: Run unit tests (CPU)
+        run: julia --project=. -t 2 test/runtests.jl
 
       # ── Upload logs on failure ────────────────────────────────────────
       - name: Upload test artifacts on failure

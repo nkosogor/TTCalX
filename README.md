@@ -29,6 +29,8 @@ TTCalX is an extended version of the previous TTCal package by Michael Eastwood 
   - [Batch Processing (Recommended)](#batch-processing-recommended)
 - [Tutorial](docs/TUTORIAL.md)
 - [Source File Format](#source-file-format)
+- [CPU-TTCal-matched zesting (sky + RFI)](#cpu-ttcal-matched-zesting-sky--rfi)
+- [Tests](#tests)
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
   - [CUDA not found](#cuda-not-found)
@@ -216,6 +218,51 @@ julia bin/ttcal_gpu.jl peel sources.json /path/to/*.ms
 
 The sources file is a JSON array of source objects (see [sources.json](sources.json) in this repo).
 
+## CPU-TTCal-matched zesting (sky + RFI)
+
+The library also provides the pieces to zest exactly like the main pipeline's CPU TTCal
+(`ttcal.jl zest`, then `ttcal_dev` for the RFI model), on the GPU or on CPU threads.
+They are opt-in: the existing `ttcal_gpu.jl` and `peel_gpu!`/`zest_gpu!` code paths are not
+changed, except for two fixes in `sources.jl` that affect every caller (see below).
+
+| Piece | What it does |
+|---|---|
+| `geometric_uvw!(meta, ms_mjd(ms))` | Replaces the MS UVW (OVRO-LWA: r₁−r₂, unprecessed) with precessed ITRF baselines, so the far-field model follows the apparent sky as in CPU TTCal |
+| `genvis_exact!(vis, meta, source, mjd)` | CPU TTCal's sky model: per-component horizon, 3-D Gaussian projection on the local north/east axes, `xy = U − iV` |
+| `GPURFISource` (JSON entries with `rfi-frequencies`) | Near-field RFI emitter, as ttcal_dev's `RFISource`; model via `gpu_genvis!` |
+| `solve_gains!(cal, data, model, meta; solver=:rk4)` | CPU TTCal's solver (RK4 of the StefCal step, per-channel convergence); `solver=:damped` is `gpu_stefcal!`'s iteration; optional Tukey phase prior `reg=phase_regularization(...)` |
+| Host arrays (`read_ms_to_gpu(ms; gpu=false)`) | The same operations on CPU threads (`julia -t N`), same results as the GPU |
+| `read_ms_fast` / `write_ms_fast!` | Same results as `read_ms_to_gpu` / `write_gpu_to_ms!`, with the row gather/scatter in numpy |
+
+A zest of one source with CPU TTCal's settings:
+
+```julia
+vis, _, meta, bl, nrows = read_ms_fast(ms)
+mjd = ms_mjd(ms)
+geometric_uvw!(meta, mjd)
+model = GPUVisibilities(meta.Nbase, meta.Nfreq)
+genvis_exact!(model, meta, source, mjd)
+model.flags .= vis.flags                       # flagged data out of both sides of the solve
+cal = calibration_type(GPUZestingSource(source), meta.Nant, meta.Nfreq)
+solve_gains!(cal, vis, model, meta; solver=:rk4, maxiter=5, tolerance=1e-4, minuvw=5.0)
+gpu_corrupt!(model, cal, meta)
+gpu_subsrc!(vis, model)
+write_ms_fast!(ms, vis, bl, nrows)
+```
+
+**Behaviour changes for all callers** (`sources.jl`):
+- `GPUPowerLaw` uses TTCal's base-10 logs. Natural logs agreed only for single-index
+  spectra, so curved spectra such as Cyg A's were several times too faint.
+- Source JSON entries with `rfi-frequencies` are now read as `GPURFISource` (near-field
+  RFI emitters) instead of failing to parse.
+
+## Tests
+
+```bash
+julia --project=. -t 4 test/runtests.jl     # unit tests (CPU; GPU checks run if CUDA works)
+julia --project=. test/quick_test.jl        # end-to-end smoke test on the example MS
+```
+
 ## Project Structure
 
 ```
@@ -229,6 +276,13 @@ TTCalX/
 │       ├── sources.jl            # Source models
 │       ├── peel_gpu.jl           # Peeling implementation
 │       ├── pycall_ms_bridge.jl   # MS I/O via python-casacore
+│       ├── geometry.jl           # Precession/nutation/GAST, geometric UVW
+│       ├── rfi.jl                # Near-field RFI sources
+│       ├── genvis_exact.jl       # CPU-TTCal-exact sky model (GPU kernel + host threads)
+│       ├── regularization.jl     # Tukey phase prior
+│       ├── solver.jl             # solve_gains!: RK4 / damped StefCal, GPU + host
+│       ├── host_backend.jl       # Multithreaded CPU versions of the peel operations
+│       ├── ms_io.jl              # Faster MS read/write, ms_mjd
 │       ├── memory.jl             # Memory utilities
 │       ├── logging.jl            # Progress bars & verbosity
 │       └── kernels/              # CUDA kernels
@@ -236,6 +290,9 @@ TTCalX/
 │           ├── stefcal.jl
 │           ├── corrupt.jl
 │           └── genvis.jl
+├── test/
+│   ├── runtests.jl               # Unit tests
+│   └── quick_test.jl             # Smoke test on the example MS
 ├── examples/
 │   ├── sources.json              # Example sources file
 │   └── 20240524_090003_73MHz_ch0to5.ms  # Test dataset (6 ch, ~22 MB)
