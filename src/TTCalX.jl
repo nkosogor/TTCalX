@@ -50,7 +50,7 @@ export init_pycasacore
 
 # Experimental: RFI sources, phase-prior regularization, CPU-compatible solver
 export GPURFISource, GPURFISpectrum, is_rfi, wgs84_to_itrf, uvw_geometry, apply_uvw_convention!
-export j2000_to_itrf_matrix, geometric_uvw!, ms_mjd
+export j2000_to_itrf_matrix, geometric_uvw!, ms_mjd, zero_short_baselines!
 export PhaseRegularization, phase_regularization, regularized_fraction
 export antenna_planar_distances, gpu_stefcal_exp!, save_calibration_bin
 

@@ -632,3 +632,30 @@ function save_calibration_bin(path::String, cal::GPUCalibration)
     end
     size(h)
 end
+
+"""
+    zero_short_baselines!(vis, meta, minuvw)
+
+Zero a model's entries on baselines shorter than `minuvw` wavelengths.  CPU
+TTCal's `peel!` flags those baselines in the dataset before peeling, so its
+subtract!/add! skip them and they leave zest untouched; applying this to each
+coherency reproduces that (TTCalX otherwise subtracts the gain-corrupted
+model on short baselines whose gains were never constrained by the solve).
+"""
+function zero_short_baselines!(vis::GPUVisibilities, meta::GPUMetadata, minuvw::Float64)
+    minuvw <= 0 && return vis
+    pos = Array(meta.antenna_positions)
+    bl = Array(meta.baselines)
+    ch = Array(meta.channels)
+    mask = trues(meta.Nbase, meta.Nfreq)
+    for α in 1:meta.Nbase
+        a1, a2 = bl[1, α], bl[2, α]
+        len = sqrt((pos[1, a1] - pos[1, a2])^2 + (pos[2, a1] - pos[2, a2])^2 + (pos[3, a1] - pos[3, a2])^2)
+        for β in 1:meta.Nfreq
+            len < minuvw * SPEED_OF_LIGHT / ch[β] && (mask[α, β] = false)
+        end
+    end
+    m = _is_gpu(vis) ? CuArray(mask) : mask
+    vis.xx .*= m; vis.xy .*= m; vis.yx .*= m; vis.yy .*= m
+    vis
+end
