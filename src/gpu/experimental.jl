@@ -512,6 +512,10 @@ _as_cal(g, cal::GPUCalibration) = GPUCalibration(g[1], g[2], g[3], g[4], cal.fla
 
 """Compute steps k = newgain(g) - g (optionally regularized) for gains g."""
 function _stefcal_steps!(k, g, cal, meas_sq, model_sq, meta, reg)
+    if !_is_gpu(cal)
+        reg === nothing || error("the phase prior is only implemented for GPU arrays")
+        return _host_stefcal_steps!(k, g, cal, meas_sq, model_sq, meta)
+    end
     Na = meta.Nant
     Nf = Nfreq(cal)
     blocks, threads = kernel_config_1d(Na * Nf)
@@ -519,7 +523,11 @@ function _stefcal_steps!(k, g, cal, meas_sq, model_sq, meta, reg)
         if cal.is_diagonal
             gpu_stefcal_step_diagonal!(k[1], k[4], _as_cal(g, cal), meas_sq, model_sq, meta)
         else
-            gpu_stefcal_step_full!(k[1], k[2], k[3], k[4], _as_cal(g, cal), meas_sq, model_sq, meta)
+            @cuda blocks=blocks threads=threads stefcal_step_full_herm_kernel!(
+                k[1], k[2], k[3], k[4], g[1], g[2], g[3], g[4],
+                meas_sq.xx, meas_sq.xy, meas_sq.yx, meas_sq.yy,
+                model_sq.xx, model_sq.xy, model_sq.yx, model_sq.yy, Na, Nf)
+            CUDA.synchronize()
         end
         return k
     end
@@ -551,24 +559,28 @@ convergence test); `solver=:rk4` reproduces CPU TTCal's `solve!`: RK4 of the
 StefCal step, `maxiter` iterations per channel and a per-channel test
 ‖g_new - g‖/‖g‖ < tolerance, after which that channel is frozen.  `reg`
 (a `PhaseRegularization`) applies the Tukey phase prior in every step.
+Host arrays run the same steps on host threads (without `reg`).
 """
 function gpu_stefcal_exp!(calibration::GPUCalibration, measured::GPUVisibilities,
                           model::GPUVisibilities, meta::GPUMetadata;
                           maxiter::Int=20, tolerance::Float64=1e-3, minuvw::Float64=0.0,
                           solver::Symbol=:damped, reg=nothing)
-    _is_gpu(measured) || error("gpu_stefcal_exp! needs GPU arrays")
+    use_gpu = _is_gpu(measured)
     Na = meta.Nant
     wideband = Nfreq(calibration) == 1 && Nfreq(measured) > 1
-    meas_sq = GPUSquareVisibilities(Na, wideband ? 1 : Nfreq(measured), gpu=true)
-    model_sq = GPUSquareVisibilities(Na, wideband ? 1 : Nfreq(model), gpu=true)
-    gpu_makesquare!(meas_sq, measured, meta)
-    gpu_makesquare!(model_sq, model, meta)
+    !use_gpu && wideband && error("host gpu_stefcal_exp! is per-channel only")
+    meas_sq = GPUSquareVisibilities(Na, wideband ? 1 : Nfreq(measured), gpu=use_gpu)
+    model_sq = GPUSquareVisibilities(Na, wideband ? 1 : Nfreq(model), gpu=use_gpu)
+    makesquare! = use_gpu ? gpu_makesquare! : host_makesquare!
+    makesquare!(meas_sq, measured, meta)
+    makesquare!(model_sq, model, meta)
     if minuvw > 0
-        flag_short_baselines!(meas_sq, meta, minuvw)
-        flag_short_baselines!(model_sq, meta, minuvw)
+        flag_short! = use_gpu ? flag_short_baselines_gpu! : flag_short_baselines!
+        flag_short!(meas_sq, meta, minuvw)
+        flag_short!(model_sq, meta, minuvw)
     end
     Nf = Nfreq(calibration)
-    zero_like() = ntuple(_ -> CUDA.zeros(ComplexF64, Na, Nf), 4)
+    zero_like() = ntuple(_ -> use_gpu ? CUDA.zeros(ComplexF64, Na, Nf) : zeros(ComplexF64, Na, Nf), 4)
     g = _gains(calibration)
     diag = calibration.is_diagonal
     comps = diag ? (1, 4) : (1, 2, 3, 4)
@@ -612,7 +624,7 @@ function gpu_stefcal_exp!(calibration::GPUCalibration, measured::GPUVisibilities
                 dn .+= _chan_sq(gnew[c] .- g[c])
                 gn .+= _chan_sq(g[c])
             end
-            mask = CuArray(reshape(active, 1, Nf))
+            mask = use_gpu ? CuArray(reshape(active, 1, Nf)) : reshape(active, 1, Nf)
             for c in comps
                 g[c] .= ifelse.(mask, gnew[c], g[c])
             end
@@ -693,8 +705,12 @@ from the 3-D baseline projected on the component's major/minor axes built
 from its local north/east (TTCalX's kernels use the (u,v) projection, a PA
 measured from east and a different rotation, and no foreshortening); and
 Stokes → linear with xy = U - iV.  Computed on the host, then uploaded.
+
+Reference implementation (single-threaded; `c` is abstractly typed, so the
+inner loop is dynamically dispatched).  `genvis_exact!` computes the same
+model with a GPU kernel or host threads.
 """
-function genvis_exact!(vis::GPUVisibilities, meta::GPUMetadata, source::GPUSource, mjd_utc::Float64)
+function genvis_exact_reference!(vis::GPUVisibilities, meta::GPUMetadata, source::GPUSource, mjd_utc::Float64)
     R = j2000_to_itrf_matrix(mjd_utc)
     pos = Array(meta.antenna_positions)
     bl = Array(meta.baselines)
@@ -733,4 +749,318 @@ function genvis_exact!(vis::GPUVisibilities, meta::GPUMetadata, source::GPUSourc
         vis.xx .+= hxx; vis.xy .+= hxy; vis.yx .+= hyx; vis.yy .+= hyy
     end
     vis
+end
+
+"""
+Per-component tables for `genvis_exact!`: geometric delay (m) per antenna,
+linear-feed fluxes per channel, and Gaussian axes/widths (zero for points).
+Components below the horizon are dropped.
+"""
+function _exact_tables(meta::GPUMetadata, source::GPUSource, mjd_utc::Float64)
+    R = j2000_to_itrf_matrix(mjd_utc)
+    pos = Array(meta.antenna_positions)
+    ch = Array(meta.channels)
+    s0 = R * _unit(meta.phase_center_ra, meta.phase_center_dec)
+    up = vec(sum(pos, dims=2)); up = up / norm(up)
+    comps = [c for c in _components(source) if dot(R * _unit(c.ra, c.dec), up) > 0]
+    Na, Nf, Nc = size(pos, 2), length(ch), length(comps)
+    delay = zeros(Na, Nc)
+    flux = zeros(ComplexF64, 4, Nf, Nc)
+    shape = zeros(9, Nc)   # major (3), minor (3), wmaj, wmin, is_gaussian
+    for (n, c) in enumerate(comps)
+        s = R * _unit(c.ra, c.dec)
+        for i in 1:Na
+            delay[i, n] = dot(SVector(pos[1, i], pos[2, i], pos[3, i]), s - s0)
+        end
+        for β in 1:Nf
+            I, Q, U, V = c.spectrum(ch[β])
+            flux[1, β, n] = complex(I + Q); flux[2, β, n] = complex(U, -V)
+            flux[3, β, n] = complex(U, V); flux[4, β, n] = complex(I - Q)
+        end
+        if c isa GPUGaussianSource
+            major, minor, wmaj, wmin = _gaussian_axes(c, R)
+            shape[1:3, n] .= major; shape[4:6, n] .= minor
+            shape[7, n] = wmaj; shape[8, n] = wmin; shape[9, n] = 1
+        end
+    end
+    delay, flux, shape
+end
+
+"""Model at one (baseline, channel), summed over components (same arithmetic as the reference)."""
+@inline function _exact_vis(α, β, delay, flux, shape, positions, baselines, channels, Nc)
+    a1 = baselines[1, α]; a2 = baselines[2, α]
+    ν = channels[β]
+    k = 2π * ν / SPEED_OF_LIGHT
+    λ = SPEED_OF_LIGHT / ν
+    bx = positions[1, a2] - positions[1, a1]
+    by = positions[2, a2] - positions[2, a1]
+    bz = positions[3, a2] - positions[3, a1]
+    axx = zero(ComplexF64); axy = zero(ComplexF64); ayx = zero(ComplexF64); ayy = zero(ComplexF64)
+    for n in 1:Nc
+        v = cis(-k * (delay[a2, n] - delay[a1, n]))
+        if shape[9, n] != 0
+            pmaj = (bx * shape[1, n] + by * shape[2, n] + bz * shape[3, n]) / λ
+            pmin = (bx * shape[4, n] + by * shape[5, n] + bz * shape[6, n]) / λ
+            v *= exp(-shape[7, n] * pmaj^2 - shape[8, n] * pmin^2)
+        end
+        axx += flux[1, β, n] * v; axy += flux[2, β, n] * v
+        ayx += flux[3, β, n] * v; ayy += flux[4, β, n] * v
+    end
+    axx, axy, ayx, ayy
+end
+
+function genvis_exact_kernel!(xx, xy, yx, yy, delay, flux, shape, positions, baselines, channels,
+                              Nbase, Nfreq, Nc)
+    idx = thread_index_1d()
+    if idx <= Nbase * Nfreq
+        α = ((idx - 1) % Nbase) + 1
+        β = ((idx - 1) ÷ Nbase) + 1
+        vxx, vxy, vyx, vyy = _exact_vis(α, β, delay, flux, shape, positions, baselines, channels, Nc)
+        xx[α, β] += vxx; xy[α, β] += vxy; yx[α, β] += vyx; yy[α, β] += vyy
+    end
+    return nothing
+end
+
+"""
+    genvis_exact!(vis, meta, source, mjd_utc)
+
+CPU-TTCal-exact far-field model (see `genvis_exact_reference!` for the
+definition): the per-component tables are built on the host (Na delays,
+Nf fluxes), then every (baseline, channel) is evaluated by a GPU kernel,
+or by host threads for host arrays.
+"""
+function genvis_exact!(vis::GPUVisibilities, meta::GPUMetadata, source::GPUSource, mjd_utc::Float64)
+    delay, flux, shape = _exact_tables(meta, source, mjd_utc)
+    Nc = size(delay, 2)
+    Nc == 0 && return vis
+    Nb, Nf = meta.Nbase, meta.Nfreq
+    if _is_gpu(vis)
+        blocks, threads = kernel_config_1d(Nb * Nf)
+        @cuda blocks=blocks threads=threads genvis_exact_kernel!(
+            vis.xx, vis.xy, vis.yx, vis.yy, CuArray(delay), CuArray(flux), CuArray(shape),
+            meta.antenna_positions, meta.baselines, meta.channels, Nb, Nf, Nc)
+        CUDA.synchronize()
+    else
+        pos, bl, ch = meta.antenna_positions, meta.baselines, meta.channels
+        Threads.@threads for β in 1:Nf
+            @inbounds for α in 1:Nb
+                vxx, vxy, vyx, vyy = _exact_vis(α, β, delay, flux, shape, pos, bl, ch, Nc)
+                vis.xx[α, β] += vxx; vis.xy[α, β] += vxy
+                vis.yx[α, β] += vyx; vis.yy[α, β] += vyy
+            end
+        end
+    end
+    vis
+end
+
+#==============================================================================#
+#              Host (CPU) backend: multithreaded, same arithmetic               #
+#==============================================================================#
+# TTCalX's peel operations launch CUDA kernels unconditionally.  These methods
+# run the same per-element arithmetic on host arrays, one channel per thread
+# (start Julia with -t N), so the daemon can zest with ZEST_DEVICE=cpu.
+
+const HostVisibilities = GPUVisibilities{<:Array}
+
+_channel(a::AbstractMatrix, β) = view(a, :, β:β)
+_channel(a::AbstractArray{<:Any,3}, β) = view(a, :, :, β:β)
+_channel(v::GPUVisibilities, β) = GPUVisibilities(_channel(v.xx, β), _channel(v.xy, β),
+                                                  _channel(v.yx, β), _channel(v.yy, β), _channel(v.flags, β))
+_channel(c::GPUCalibration, β) = GPUCalibration(_channel(c.xx, β), _channel(c.xy, β), _channel(c.yx, β),
+                                                _channel(c.yy, β), _channel(c.flags, β), c.is_diagonal)
+_channel(s::GPUSquareVisibilities, β) = GPUSquareVisibilities(_channel(s.xx, β), _channel(s.xy, β),
+                                                              _channel(s.yx, β), _channel(s.yy, β))
+
+function gpu_corrupt!(vis::HostVisibilities, cal::GPUCalibration, meta::GPUMetadata)
+    Nfreq(cal) == 1 && return cpu_corrupt!(vis, cal, meta)
+    Threads.@threads for β in 1:Nfreq(vis)
+        cpu_corrupt!(_channel(vis, β), _channel(cal, β), meta)
+    end
+    vis
+end
+
+gpu_subsrc!(data::HostVisibilities, model::GPUVisibilities) = cpu_subsrc!(data, model)
+gpu_putsrc!(data::HostVisibilities, model::GPUVisibilities) = cpu_putsrc!(data, model)
+
+"""As the `makesquare_kernel!` (not `cpu_makesquare!`, which keeps autos and accumulates)."""
+function host_makesquare!(sq::GPUSquareVisibilities, vis::GPUVisibilities, meta::GPUMetadata)
+    bl = meta.baselines
+    Threads.@threads for β in 1:Nfreq(vis)
+        for a in (sq.xx, sq.xy, sq.yx, sq.yy)
+            fill!(view(a, :, :, β), zero(ComplexF64))
+        end
+        @inbounds for α in 1:meta.Nbase
+            vis.flags[α, β] && continue
+            a1, a2 = bl[1, α], bl[2, α]
+            a1 == a2 && continue
+            vxx, vxy, vyx, vyy = vis.xx[α, β], vis.xy[α, β], vis.yx[α, β], vis.yy[α, β]
+            sq.xx[a1, a2, β] = vxx; sq.xy[a1, a2, β] = vxy
+            sq.yx[a1, a2, β] = vyx; sq.yy[a1, a2, β] = vyy
+            sq.xx[a2, a1, β] = conj(vxx); sq.xy[a2, a1, β] = conj(vyx)
+            sq.yx[a2, a1, β] = conj(vxy); sq.yy[a2, a1, β] = conj(vyy)
+        end
+    end
+    sq
+end
+
+"""StefCal steps on the host: `cpu_stefcal_step_*!` (the kernels' arithmetic) per channel thread."""
+function _host_stefcal_steps!(k, g, cal, meas_sq, model_sq, meta)
+    c = _as_cal(g, cal)
+    Threads.@threads for β in 1:Nfreq(cal)
+        kc = map(x -> _channel(x, β), k)
+        if cal.is_diagonal
+            cpu_stefcal_step_diagonal!(kc[1], kc[4], _channel(c, β), _channel(meas_sq, β),
+                                       _channel(model_sq, β), meta)
+        else
+            cpu_stefcal_step_full!(kc[1], kc[2], kc[3], kc[4], _channel(c, β), _channel(meas_sq, β),
+                                   _channel(model_sq, β), meta)
+        end
+    end
+    k
+end
+
+"""
+    flag_short_baselines_gpu!(sq, meta, minuvw)
+
+`flag_short_baselines!` without the host round trip (it copies all four
+Nant×Nant×Nfreq matrices to the host and back, ~40% of a zest solve):
+zero every entry whose baseline is shorter than `minuvw` wavelengths.
+"""
+function flag_short_baselines_gpu!(sq::GPUSquareVisibilities, meta::GPUMetadata, minuvw::Float64)
+    minuvw <= 0 && return sq
+    pos = meta.antenna_positions
+    L = sqrt.((pos[1, :] .- pos[1, :]').^2 .+ (pos[2, :] .- pos[2, :]').^2 .+ (pos[3, :] .- pos[3, :]').^2)
+    Nf = size(sq.xx, 3)
+    ch = meta.channels[1:min(Nf, length(meta.channels))]
+    keep = reshape(L, size(L)..., 1) .>= reshape(minuvw .* (SPEED_OF_LIGHT ./ ch), 1, 1, :)
+    # the host loop skips ant1 == ant2; those entries are zero after makesquare
+    for a in (sq.xx, sq.xy, sq.yx, sq.yy)
+        a .= ifelse.(keep, a, zero(ComplexF64))
+    end
+    sq
+end
+
+"""
+`stefcal_step_full_kernel!` reading the square matrices by columns.  The
+square visibilities are Hermitian (makesquare fills [a2,a1] with the
+conjugate transpose of [a1,a2]), so M[i,j] = (M[j,i])ᴴ: xx = conj(xx[j,i]),
+xy = conj(yx[j,i]), yx = conj(xy[j,i]), yy = conj(yy[j,i]).  Thread j then
+reads [j,i], adjacent threads read adjacent addresses (coalesced) instead of
+addresses Nant apart; the arithmetic, and so the result, is unchanged.
+"""
+function stefcal_step_full_herm_kernel!(
+    step_xx, step_xy, step_yx, step_yy,
+    gain_xx, gain_xy, gain_yx, gain_yy,
+    meas_xx, meas_xy, meas_yx, meas_yy,
+    model_xx, model_xy, model_yx, model_yy,
+    Nant, Nfreq
+)
+    idx = thread_index_1d()
+    if idx <= Nant * Nfreq
+        j = ((idx - 1) % Nant) + 1
+        β = ((idx - 1) ÷ Nant) + 1
+        num_xx = ComplexF64(0); num_xy = ComplexF64(0); num_yx = ComplexF64(0); num_yy = ComplexF64(0)
+        den_xx = ComplexF64(0); den_xy = ComplexF64(0); den_yx = ComplexF64(0); den_yy = ComplexF64(0)
+        for i in 1:Nant
+            gi_xx = gain_xx[i, β]; gi_xy = gain_xy[i, β]; gi_yx = gain_yx[i, β]; gi_yy = gain_yy[i, β]
+            m_xx = conj(model_xx[j, i, β]); m_xy = conj(model_yx[j, i, β])
+            m_yx = conj(model_xy[j, i, β]); m_yy = conj(model_yy[j, i, β])
+            v_xx = conj(meas_xx[j, i, β]); v_xy = conj(meas_yx[j, i, β])
+            v_yx = conj(meas_xy[j, i, β]); v_yy = conj(meas_yy[j, i, β])
+            gm_xx = gi_xx*m_xx + gi_xy*m_yx
+            gm_xy = gi_xx*m_xy + gi_xy*m_yy
+            gm_yx = gi_yx*m_xx + gi_yy*m_yx
+            gm_yy = gi_yx*m_xy + gi_yy*m_yy
+            num_xx += conj(gm_xx)*v_xx + conj(gm_yx)*v_yx
+            num_xy += conj(gm_xx)*v_xy + conj(gm_yx)*v_yy
+            num_yx += conj(gm_xy)*v_xx + conj(gm_yy)*v_yx
+            num_yy += conj(gm_xy)*v_xy + conj(gm_yy)*v_yy
+            den_xx += conj(gm_xx)*gm_xx + conj(gm_yx)*gm_yx
+            den_xy += conj(gm_xx)*gm_xy + conj(gm_yx)*gm_yy
+            den_yx += conj(gm_xy)*gm_xx + conj(gm_yy)*gm_yx
+            den_yy += conj(gm_xy)*gm_xy + conj(gm_yy)*gm_yy
+        end
+        det_den = den_xx*den_yy - den_xy*den_yx
+        if abs(det_den) > eps(Float64)
+            inv_det = 1.0 / det_den
+            inv_xx = den_yy * inv_det; inv_xy = -den_xy * inv_det
+            inv_yx = -den_yx * inv_det; inv_yy = den_xx * inv_det
+            sol_xx = inv_xx*num_xx + inv_xy*num_yx
+            sol_xy = inv_xx*num_xy + inv_xy*num_yy
+            sol_yx = inv_yx*num_xx + inv_yy*num_yx
+            sol_yy = inv_yx*num_xy + inv_yy*num_yy
+            step_xx[j, β] = conj(sol_xx) - gain_xx[j, β]
+            step_xy[j, β] = conj(sol_yx) - gain_xy[j, β]
+            step_yx[j, β] = conj(sol_xy) - gain_yx[j, β]
+            step_yy[j, β] = conj(sol_yy) - gain_yy[j, β]
+        else
+            step_xx[j, β] = ComplexF64(0); step_xy[j, β] = ComplexF64(0)
+            step_yx[j, β] = ComplexF64(0); step_yy[j, β] = ComplexF64(0)
+        end
+    end
+    return nothing
+end
+
+#==============================================================================#
+#                       Faster MS write-back (numpy)                            #
+#==============================================================================#
+
+const _ms_writer = PyNULL()
+
+const _MS_WRITER_PY = """
+import numpy as np
+from casacore.tables import table
+
+def write(ms_path, column, index, xx, xy, yx, yy, flags):
+    t = table(ms_path, readonly=False, ack=False)
+    try:
+        a1 = t.getcol("ANTENNA1"); a2 = t.getcol("ANTENNA2")
+        b = index[np.minimum(a1, a2), np.maximum(a1, a2)] - 1
+        b[a1 == a2] = -1
+        rows = np.nonzero(b >= 0)[0]
+        b = b[rows]
+        if len(np.unique(b)) != len(b):
+            return False          # several rows per baseline: use write_gpu_to_ms!
+        data = t.getcol(column)
+        if data.ndim != 3 or data.shape[2] != 4:
+            return False
+        flag = t.getcol("FLAG")
+        for p, v in enumerate((xx, xy, yx, yy)):
+            data[rows, :, p] = v[b, :]
+            flag[rows, :, p] = flags[b, :]
+        t.putcol(column, data)
+        t.putcol("FLAG", flag)
+        t.flush()
+        return True
+    finally:
+        t.close()
+"""
+
+"""
+    write_ms_fast!(ms_path, vis, baseline_dict, Nrows; column="DATA")
+
+Same result as `write_gpu_to_ms!` (cross-correlation DATA replaced, FLAG
+set to the per-baseline flag in all four polarizations, autos untouched),
+but the row scatter runs in numpy on the arrays casacore returns, without
+converting the column to a Julia array and back.  Falls back to
+`write_gpu_to_ms!` when a baseline has several rows or the MS is not 4-pol.
+"""
+function write_ms_fast!(ms_path::String, vis::GPUVisibilities, baseline_dict::Dict, Nrows::Int;
+                        column::String="DATA")
+    if _ms_writer == PyNULL()
+        mod = PyCall.pyimport("types").ModuleType("ttcalx_ms_writer")
+        PyCall.pybuiltin("exec")(_MS_WRITER_PY, mod."__dict__")
+        copy!(_ms_writer, mod.write)
+    end
+    Na = maximum(maximum(k) for k in keys(baseline_dict))
+    index = zeros(Int, Na, Na)            # 0-based antennas in the MS → 1-based baseline
+    for ((a1, a2), α) in baseline_dict
+        index[a1, a2] = α
+    end
+    ok = _ms_writer(ms_path, column, PyCall.PyReverseDims(permutedims(index)),
+                    PyCall.PyReverseDims(permutedims(Array(vis.xx))), PyCall.PyReverseDims(permutedims(Array(vis.xy))),
+                    PyCall.PyReverseDims(permutedims(Array(vis.yx))), PyCall.PyReverseDims(permutedims(Array(vis.yy))),
+                    PyCall.PyReverseDims(permutedims(Array(vis.flags))))
+    ok || write_gpu_to_ms!(ms_path, vis, baseline_dict, Nrows; column=column)
+    nothing
 end
