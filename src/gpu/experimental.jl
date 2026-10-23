@@ -246,7 +246,8 @@ function gpu_genvis!(vis::GPUVisibilities, meta::GPUMetadata, source::GPURFISour
     elseif geometry != :none
         error("unknown RFI geometry $geometry")
     end
-    hxx = zeros(ComplexF64, Nb, Nf); hxy = similar(hxx); hyx = similar(hxx); hyy = similar(hxx)
+    hxx = zeros(ComplexF64, Nb, Nf); hxy = zeros(ComplexF64, Nb, Nf)
+    hyx = zeros(ComplexF64, Nb, Nf); hyy = zeros(ComplexF64, Nb, Nf)
     @inbounds for β in 1:Nf
         I, Q, U, V = source.spectrum(channels[β])
         fxx, fxy, fyx, fyy = complex(I + Q), complex(U, -V), complex(U, V), complex(I - Q)
@@ -701,7 +702,8 @@ function genvis_exact!(vis::GPUVisibilities, meta::GPUMetadata, source::GPUSourc
     Nb, Nf = meta.Nbase, meta.Nfreq
     s0 = R * _unit(meta.phase_center_ra, meta.phase_center_dec)
     up = vec(sum(pos, dims=2)); up = up / norm(up)
-    hxx = zeros(ComplexF64, Nb, Nf); hxy = similar(hxx); hyx = similar(hxx); hyy = similar(hxx)
+    hxx = zeros(ComplexF64, Nb, Nf); hxy = zeros(ComplexF64, Nb, Nf)
+    hyx = zeros(ComplexF64, Nb, Nf); hyy = zeros(ComplexF64, Nb, Nf)
     for c in _components(source)
         s = R * _unit(c.ra, c.dec)
         dot(s, up) > 0 || continue
