@@ -1064,3 +1064,99 @@ function write_ms_fast!(ms_path::String, vis::GPUVisibilities, baseline_dict::Di
     ok || write_gpu_to_ms!(ms_path, vis, baseline_dict, Nrows; column=column)
     nothing
 end
+
+#==============================================================================#
+#                         Faster MS read (numpy)                                #
+#==============================================================================#
+
+const _ms_reader = PyNULL()
+
+const _MS_READER_PY = """
+import numpy as np
+from casacore.tables import table
+
+def read(ms_path, column):
+    t = table(ms_path, ack=False)
+    try:
+        a1 = t.getcol("ANTENNA1"); a2 = t.getcol("ANTENNA2")
+        cross = np.nonzero(a1 != a2)[0]
+        lo = np.minimum(a1[cross], a2[cross]); hi = np.maximum(a1[cross], a2[cross])
+        if len(np.unique(lo.astype(np.int64) * 1000003 + hi)) != len(cross):
+            return None           # several rows per baseline: use read_ms_to_gpu
+        data = t.getcol(column)
+        if data.ndim != 3 or data.shape[2] != 4:
+            return None
+        data = data[cross]
+        flag = t.getcol("FLAG")[cross].any(axis=2)
+        uvw = t.getcol("UVW")[cross]
+        f = lambda x: np.asfortranarray(x)
+        return (f(lo + 1), f(hi + 1), f(uvw.T.astype(np.float64)),
+                f(data[:, :, 0].astype(np.complex128)), f(data[:, :, 1].astype(np.complex128)),
+                f(data[:, :, 2].astype(np.complex128)), f(data[:, :, 3].astype(np.complex128)),
+                f(flag), len(a1))
+    finally:
+        t.close()
+"""
+
+"""
+    read_ms_fast(ms_path; gpu=true, column="DATA") -> (vis, cal, meta, baseline_dict, Nrows)
+
+Same result as `read_ms_to_gpu` for single-time, 4-pol MSs (baselines in
+order of first appearance, (min, max) antenna pairs, autos dropped, flags
+OR'd over polarizations, UVW of the baseline's row), with the row gather done
+in numpy.  The small subtables are read by `read_ms_to_gpu`'s own code path
+via `_ms_subtables`.  Falls back to `read_ms_to_gpu` otherwise.
+"""
+function read_ms_fast(ms_path::String; gpu::Bool=true, column::String="DATA")
+    if _ms_reader == PyNULL()
+        mod = PyCall.pyimport("types").ModuleType("ttcalx_ms_reader")
+        PyCall.pybuiltin("exec")(_MS_READER_PY, mod."__dict__")
+        copy!(_ms_reader, mod.read)
+    end
+    r = _ms_reader(ms_path, column)
+    r === nothing && return read_ms_to_gpu(ms_path; gpu=gpu, column=column)
+    lo, hi = Vector{Int}(r[1]), Vector{Int}(r[2])
+    uvw = Matrix{Float64}(r[3])
+    xx, xy, yx, yy = (Matrix{ComplexF64}(x) for x in r[4:7])
+    flags, Nrows = Matrix{Bool}(r[8]), r[9]
+    channels, antenna_positions, phase_center_ra, phase_center_dec = _ms_subtables(ms_path)
+    Nbase, Nfreq = size(xx)
+    length(channels) == Nfreq || return read_ms_to_gpu(ms_path; gpu=gpu, column=column)
+    Nant = size(antenna_positions, 2)
+    baselines = Int32.(permutedims(hcat(lo, hi)))
+    baseline_dict = Dict{Tuple{Int,Int}, Int}((Int(lo[α]), Int(hi[α])) => α for α in 1:Nbase)
+    phase_center_lmn = [0.0, 0.0, 1.0]
+    up(x) = gpu && CUDA.functional() ? CuArray(x) : x
+    vis = GPUVisibilities(up(xx), up(xy), up(yx), up(yy), up(flags))
+    meta = GPUMetadata(up(antenna_positions), up(baselines), up(channels), up(phase_center_lmn),
+                       phase_center_ra, phase_center_dec, up(uvw))
+    cal = GPUCalibration(up(ones(ComplexF64, Nant, Nfreq)), up(zeros(ComplexF64, Nant, Nfreq)),
+                         up(zeros(ComplexF64, Nant, Nfreq)), up(ones(ComplexF64, Nant, Nfreq)),
+                         gpu && CUDA.functional() ? CuArray(falses(Nant, Nfreq)) : falses(Nant, Nfreq), true)
+    vis, cal, meta, baseline_dict, Int(Nrows)
+end
+
+"""Channels, antenna positions (3, Nant) and phase centre as parsed by `read_ms_to_gpu`."""
+function _ms_subtables(ms_path::String)
+    spw = tables.table(ms_path * "/SPECTRAL_WINDOW", readonly=true)
+    chan_freq = spw.getcol("CHAN_FREQ"); spw.close()
+    channels = ndims(chan_freq) == 1 ? Vector{Float64}(chan_freq) :
+               size(chan_freq, 1) == 1 ? vec(Float64.(chan_freq[1, :])) : vec(Float64.(chan_freq[:, 1]))
+    ant = tables.table(ms_path * "/ANTENNA", readonly=true)
+    positions = ant.getcol("POSITION"); ant.close()
+    antenna_positions = ndims(positions) == 2 ?
+        (size(positions, 1) == 3 ? Float64.(positions) : Float64.(permutedims(positions))) :
+        reshape(Float64.(positions), 3, length(positions) ÷ 3)
+    field = tables.table(ms_path * "/FIELD", readonly=true)
+    pd = field.getcol("PHASE_DIR"); field.close()
+    ra, dec = if ndims(pd) == 3
+        Float64(pd[1, 1, 1]), Float64(pd[1, 1, 2])
+    elseif ndims(pd) == 2
+        size(pd, 2) == 2 ? (Float64(pd[1, 1]), Float64(pd[1, 2])) : (Float64(pd[1, 1]), Float64(pd[2, 1]))
+    elseif ndims(pd) == 1 && length(pd) >= 2
+        Float64(pd[1]), Float64(pd[2])
+    else
+        0.0, π / 2
+    end
+    channels, antenna_positions, ra, dec
+end
