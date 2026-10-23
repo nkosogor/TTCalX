@@ -48,6 +48,12 @@ export Nbase, Nfreq, Nant
 export read_ms_to_gpu, write_gpu_to_ms!
 export init_pycasacore
 
+# Experimental: RFI sources, phase-prior regularization, CPU-compatible solver
+export GPURFISource, GPURFISpectrum, is_rfi, wgs84_to_itrf, uvw_geometry, apply_uvw_convention!
+export j2000_to_itrf_matrix, geometric_uvw!, ms_mjd
+export PhaseRegularization, phase_regularization, regularized_fraction
+export antenna_planar_distances, gpu_stefcal_exp!, save_calibration_bin
+
 # Export logging utilities
 export set_verbosity, get_verbosity, is_quiet, is_verbose, is_normal
 export ProgressBar, update!, finish!
@@ -66,6 +72,7 @@ include("gpu/kernels/genvis.jl")
 include("gpu/sources.jl")
 include("gpu/peel_gpu.jl")
 include("gpu/pycall_ms_bridge.jl")
+include("gpu/experimental.jl")
 
 """
     is_gpu_available()
