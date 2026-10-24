@@ -161,7 +161,27 @@ rejection on either side):
 With `--qa compute` the orca QA rule rejected 2 of the 12 41 MHz snapshots (08:45:12 and
 08:55:13, the latter with a 30x higher residual rms) and none at 69 MHz.
 
-**Full hour.** FULLHOUR
+**Full hour, 41 MHz.** The 308 snapshots of 2026-10-23 08h that the prototype study used were
+re-prepared from the night-time averaged archive (same bad-antenna lists and BP/XY tables) and
+re-peeled with TTCalX CPU-matched zest (RFI on). With the main pipeline's 20 QA rejections
+(288 snapshots), against the main-pipeline WSClean image (concat, chgcentre, AOFlagger, pilot QA,
+`I-Deep-Taper-Robust-0`; sigma = its residual rms 0.819 Jy/beam):
+
+| | package | prototype (original peel) |
+|---|---|---|
+| restored diff/sigma, el > 10 / > 60 / 30-60 / 10-30 deg | 0.073 / 0.090 / 0.061 / 0.074 | 0.111 / 0.159 / 0.090 / 0.083 |
+| max abs diff / sigma | 2.5 | 15.8 |
+| BMAJ, BMIN ratio; BPA difference | 1.0008, 1.0006; 0.007 deg | 1.018, 1.031; -1.9 deg |
+| source flux ratio (50 brightest) | 1.0002 +- 0.0024 | 1.0026 +- 0.0069 |
+| residual rms ratio | 0.993 | 0.992 |
+
+(The prototype reached 0.072 sigma only when restored with WSClean's beam.) Timing: 118 s for
+the 1-h I + V (load and rotation 28 s, weights and setup 9 s, dirty I 10 s, multiscale CLEAN with
+3 major cycles 57 s, dirty V 10 s); 216 s for 1 h + 6 x 10 min, I + V, with on-the-fly QA. The
+main pipeline took 42 min for the same products on the same node (-j 44: concat 9.4 min,
+chgcentre 1.8, AOFlagger 4.5, pilot snapshots 8.6, imaging 17.6). Without AOFlagger, our QA
+rejected 9 snapshots, all among the main pipeline's 20 (median V rms 0.887 Jy/beam, MAD-std
+0.0057).
 
 **Package vs the validated prototype** (same inputs, restoring beam forced to the prototype's):
 dirty images agree to ~3e-7 sigma rms; restored snapshots to 2e-7-2e-4 sigma rms (worst pixel

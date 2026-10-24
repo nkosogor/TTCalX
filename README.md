@@ -264,11 +264,14 @@ that makes the main-pipeline imaging products from peeled snapshot MSes on one G
 WSClean with the orca settings:
 
 - `ttcalx-image snapshot`: 10-s CLEANed Stokes I (`SNAPSHOT_CLEAN_I_PARAMS`) + dirty Stokes V
-  (pilot snapshot) + QA JSON, ~0.6 s (41 MHz) / ~0.9 s (69 MHz) per snapshot on an RTX A4000;
+  (pilot snapshot) + QA JSON, 0.55 s (41 MHz) / 0.8 s (69 MHz) per snapshot on an RTX A4000;
 - `ttcalx-image hour`: 1-h and 6 x 10-min Stokes I (multiscale `I-Deep-Taper-Robust-0`,
-  `I-Taper-10min`) and dirty V, with chgcentre-exact phase rotation and the orca snapshot QA.
+  `I-Taper-10min`) and dirty V, with chgcentre-exact phase rotation and the orca snapshot QA;
+  one 41 MHz band-hour (288 snapshots) in 2 min (1 h) / 3.6 min (1 h + 6 x 10 min), 0.073 sigma
+  from the main-pipeline WSClean image.
 
-The restoring beam is a port of WSClean's PSF fit (BMAJ/BMIN within 1e-5 of WSClean's).
+The restoring beam is a port of WSClean's PSF fit: it returns WSClean's BMAJ/BMIN to ~1e-6 on
+WSClean's PSFs, and the beams fitted to our own PSFs are within 0.1 % of WSClean's.
 
 ```bash
 pip install -e 'python/ttcalx_imager[gpu,test]'
