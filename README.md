@@ -30,6 +30,7 @@ TTCalX is an extended version of the previous TTCal package by Michael Eastwood 
 - [Tutorial](docs/TUTORIAL.md)
 - [Source File Format](#source-file-format)
 - [CPU-TTCal-matched zesting (sky + RFI)](#cpu-ttcal-matched-zesting-sky--rfi)
+- [GPU CLEAN imager (Python)](#gpu-clean-imager-python)
 - [Tests](#tests)
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
@@ -256,6 +257,29 @@ write_ms_fast!(ms, vis, bl, nrows)
 - Source JSON entries with `rfi-frequencies` are now read as `GPURFISource` (near-field
   RFI emitters) instead of failing to parse.
 
+## GPU CLEAN imager (Python)
+
+`python/ttcalx_imager` is a pip-installable Python package (CuPy + cuFINUFFT + python-casacore)
+that makes the main-pipeline imaging products from peeled snapshot MSes on one GPU, emulating
+WSClean with the orca settings:
+
+- `ttcalx-image snapshot`: 10-s CLEANed Stokes I (`SNAPSHOT_CLEAN_I_PARAMS`) + dirty Stokes V
+  (pilot snapshot) + QA JSON, ~0.6 s (41 MHz) / ~0.9 s (69 MHz) per snapshot on an RTX A4000;
+- `ttcalx-image hour`: 1-h and 6 x 10-min Stokes I (multiscale `I-Deep-Taper-Robust-0`,
+  `I-Taper-10min`) and dirty V, with chgcentre-exact phase rotation and the orca snapshot QA.
+
+The restoring beam is a port of WSClean's PSF fit (BMAJ/BMIN within 1e-5 of WSClean's).
+
+```bash
+pip install -e 'python/ttcalx_imager[gpu,test]'
+ttcalx-image snapshot /data/41MHz/*.ms --out-dir snap41/
+ttcalx-image hour @list41.txt --band 41 --out hour41/41MHz --lst-hour 2 --qa-dir snap41/
+pytest python/ttcalx_imager/tests          # GPU tests are skipped without CuPy/CUDA
+```
+
+See [docs/src/gpu-clean-imager.md](docs/src/gpu-clean-imager.md) for the conventions, the
+mapping to WSClean options, validation numbers and limitations.
+
 ## Tests
 
 ```bash
@@ -293,6 +317,9 @@ TTCalX/
 ├── test/
 │   ├── runtests.jl               # Unit tests
 │   └── quick_test.jl             # Smoke test on the example MS
+├── python/ttcalx_imager/         # GPU CLEAN imager (Python package, `ttcalx-image` CLI)
+│   ├── src/ttcalx_imager/        # msio, weights, gridder, rotate, clean, beam, snapshot, hour, ...
+│   └── tests/                    # pytest (GPU tests skipped without CUDA)
 ├── examples/
 │   ├── sources.json              # Example sources file
 │   └── 20240524_090003_73MHz_ch0to5.ms  # Test dataset (6 ch, ~22 MB)
