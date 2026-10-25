@@ -20,6 +20,7 @@ the concatenation and AOFlagger steps:
 
 ``mode='vis'`` grids everything directly in the hour frame instead (slower, same result).
 """
+import gc
 import json
 import math
 import multiprocessing as mp
@@ -326,9 +327,13 @@ def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, b
                 del v
             outs.append(dict(name=name, n_snap=len(sn), npts=G.npts, theo_beam_pix=theo, files=files,
                              K=sorted(set(g.svd.K for g in W.sub)) if mode == "wsnap" else G.svd.K, **di))
-            del G
+            # imgfn (a bound method of W / G) and the residual closure keep the gridders alive:
+            # drop every reference before the next interval allocates its own (82 MHz 10-min OOM)
+            del G, imgfn
             if mode == "wsnap":
                 del W
+            gc.collect()
+            cp.fft.config.get_plan_cache().clear()
             cp.get_default_memory_pool().free_all_blocks()
         summary["products"][key] = outs
         if prod.image_i and prod.v_tag and prod.naming == "orca":
