@@ -225,6 +225,15 @@ The library also provides the pieces to zest exactly like the main pipeline's CP
 They are opt-in: the existing `ttcal_gpu.jl` and `peel_gpu!`/`zest_gpu!` code paths are not
 changed, except for two fixes in `sources.jl` that affect every caller (see below).
 
+**In short:**
+- Sky + RFI zesting that reproduces CPU TTCal, at a few seconds per snapshot on one GPU
+  (about 50x faster than CPU TTCal).
+- Near-field RFI sources, peeled after the sky sources or jointly with them.
+- Optional regularised (Tukey phase-prior) peeling; it stabilises joint RFI solves when Cas A is low.
+- Runs on CPU threads too (`julia -t N`), with the same results as the GPU.
+- Recommended settings: `solver=:rk4, maxiter=5, tolerance=1e-4, minuvw=5`, exact model,
+  `geometric_uvw!`, model flags copied from the data.
+
 | Piece | What it does |
 |---|---|
 | `geometric_uvw!(meta, ms_mjd(ms))` | Replaces the MS UVW (OVRO-LWA: r₁−r₂, unprecessed) with precessed ITRF baselines, so the far-field model follows the apparent sky as in CPU TTCal |
@@ -248,6 +257,30 @@ solve_gains!(cal, vis, model, meta; solver=:rk4, maxiter=5, tolerance=1e-4, minu
 gpu_corrupt!(model, cal, meta)
 gpu_subsrc!(vis, model)
 write_ms_fast!(ms, vis, bl, nrows)
+```
+
+Variations (same steps, change one line):
+
+```julia
+# Damped solver (gpu_stefcal!'s iteration) instead of RK4
+solve_gains!(cal, vis, model, meta; solver=:damped, maxiter=30, tolerance=1e-2, minuvw=5.0)
+
+# Regularised peeling: Tukey phase prior allowing ~0.5 deg position error, tapering over 0.5 deg
+reg = phase_regularization(meta, 0.5, 0.5; lambda=1.0)
+solve_gains!(cal, vis, model, meta; solver=:rk4, maxiter=5, tolerance=1e-4, minuvw=5.0, reg=reg)
+
+# Diagonal gains (peel) instead of full Jones (zest)
+cal = calibration_type(GPUPeelingSource(source), meta.Nant, meta.Nfreq)
+
+# RFI emitter: sources.json entries with "rfi-frequencies" come back as GPURFISource
+sources = read_gpu_sources("sources_with_rfi.json")
+rfi = first(filter(is_rfi, sources))
+gpu_genvis!(model, meta, rfi, meta.phase_center_ra, meta.phase_center_dec, 0.0)
+# ...then solve/corrupt/subtract as above: after the sky sources (as the main pipeline),
+#    or as one more direction in the same peel loop (joint).
+
+# CPU threads instead of the GPU (run with julia -t 24)
+vis, _, meta, bl, nrows = read_ms_fast(ms; gpu=false)
 ```
 
 **Behaviour changes for all callers** (`sources.jl`):
