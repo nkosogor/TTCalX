@@ -253,3 +253,31 @@ def test_hour_date_obs_includes_rejected_first_snapshot(tmp_path, monkeypatch):
                     products=[bands.HourProduct("t", 1, bands.DEEP_I.with_(niter=5))], qa="none", exclude=[0])
     want = Time(61337.0, format="mjd", scale="utc").isot[:21]
     assert fits.getheader(f"{out}-t-image.fits")["DATE-OBS"] == want
+
+
+def test_multiscale_absolute_threshold_without_auto_mask():
+    """-threshold T with auto-mask/auto-threshold off: no mask phase, the whole sky is cleaned
+    down to T (residual peak < T at the end), and the iteration cap is reported."""
+    from ttcalx_imager.clean import Convolver, deconvolve_multiscale, horizon_mask
+    N, sdeg, theo = 256, 0.3, 3.0
+    rng = np.random.default_rng(12)
+    yy, xx = np.mgrid[:N, :N] - N // 2
+    psf = cp.asarray(np.exp(-0.5 * (xx ** 2 + yy ** 2) / (theo / 2.3548) ** 2), dtype=cp.float32)
+    C = Convolver(N, N); K = C.kfft(psf)
+    sky = cp.zeros((N, N), cp.float32)
+    for k in range(40):
+        sky[int(rng.integers(30, 226)), int(rng.integers(30, 226))] = float(rng.uniform(2, 50))
+    dirty = (C(sky, K) + cp.asarray(rng.normal(0, 0.3, (N, N)), dtype=cp.float32)).astype(cp.float32)
+    residual = lambda M: (dirty - C(M, K)).astype(cp.float32)
+    T = 1.5
+    params = bands.DEEP_I.with_(auto_mask=0.0, auto_threshold=0.0, local_rms=False, threshold=T, niter=10 ** 6)
+    _, R, M, info = deconvolve_multiscale(dirty, psf, sdeg, theo, params, residual_fn=residual, beam=(0.9, 0.9, 0.0))
+    assert all(m["phase"] == 2 for m in info["majors"])
+    assert not info["niter_reached"]
+    inside = horizon_mask(N, sdeg, params.horizon_deg)
+    assert float(cp.abs(R[inside]).max()) < T * 1.02
+    deficit = float(sky.sum() - M.sum())                 # each source may keep < T in the residual
+    assert -0.02 * float(sky.sum()) < deficit < 40 * T
+    _, _, _, info2 = deconvolve_multiscale(dirty, psf, sdeg, theo, params.with_(niter=50), residual_fn=residual,
+                                           beam=(0.9, 0.9, 0.0))
+    assert info2["niter_reached"]

@@ -51,8 +51,9 @@ class CleanParams:
     niter: int = 50000
     gain: float = 0.1
     mgain: float = 0.9999
-    auto_mask: float = 5.0
-    auto_threshold: float = 1.0
+    auto_mask: float = 5.0              # 0 = off: no auto-mask phase, clean the whole sky (as WSClean)
+    auto_threshold: float = 1.0         # 0 = off (WSClean: option not given)
+    threshold: float = 0.0              # absolute stopping threshold [Jy] (WSClean -threshold); 0 = none
     local_rms: bool = True
     local_rms_window: float = 25.0      # WSClean default (-local-rms-window), in synthesized beams
     horizon_deg: float = 10.0           # -horizon-mask 10deg

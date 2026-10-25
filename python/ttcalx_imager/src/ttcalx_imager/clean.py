@@ -392,7 +392,9 @@ def deconvolve_multiscale(dirty, psf, scale_deg, theo_pix, params, residual_fn=N
     # pixels above the horizon (r < 1), the region of the MAD noise estimate (as clean_snapshot)
     above = horizon_mask(N, scale_deg, 0.0)
     R = dirty.copy(); M = cp.zeros((N, N), cp.float32)
-    nit = 0; phase = 1; masks = None; comp_masks = None; nmajor = 0
+    # auto_mask = 0: no auto-mask phase (phase 2 from the start, unmasked); the stopping threshold
+    # is max(threshold, auto_threshold * sigma) as WSClean's -threshold / -auto-threshold
+    nit = 0; phase = 1 if params.auto_mask else 2; masks = None; comp_masks = None; nmajor = 0
     info = dict(majors=[])
     while True:
         # radler applies -local-rms only while auto-masking (phase 1): its logs print "Lowest RMS
@@ -404,7 +406,7 @@ def deconvolve_multiscale(dirty, psf, scale_deg, theo_pix, params, residual_fn=N
             fac = cp.ones((N, N), cp.float32); sigma = mad_std(R[above])
         region = sky if (phase == 1 or not masks) else (sky & cp.stack(masks).any(axis=0))
         peak = float(cp.where(region, cp.abs(R) * fac, 0).max())
-        thr = (params.auto_mask if phase == 1 else params.auto_threshold) * sigma
+        thr = max(params.threshold, (params.auto_mask if phase == 1 else params.auto_threshold) * sigma)
         stop = max(thr, (1 - params.mgain) * peak) if residual_fn is not None else thr
         log(f" major {nmajor}: peak {peak:.4g} sigma {sigma:.4g} phase {phase} stop {stop:.4g}")
         info["majors"].append(dict(peak=peak, sigma=sigma, phase=phase, stop=stop, nit=nit))
@@ -428,5 +430,6 @@ def deconvolve_multiscale(dirty, psf, scale_deg, theo_pix, params, residual_fn=N
                 phase = 2; masks = [m.copy() for m in comp_masks]
                 continue
             break
-    info.update(nit=nit, nmajor=nmajor, beam=D.beam, scales=D.scales)
+    info.update(nit=nit, nmajor=nmajor, beam=D.beam, scales=D.scales, niter_reached=nit >= params.niter,
+                max_major_reached=nmajor >= max_major)
     return D.restore(M, R), R, M, info
