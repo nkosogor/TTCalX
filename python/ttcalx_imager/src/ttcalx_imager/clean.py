@@ -293,7 +293,7 @@ class MultiScaleClean:
     S_s * S_s * PSF, then exact FFT update of the full residual with S_s * PSF."""
 
     def __init__(self, psf, N, scale_deg, theo_pix, beam=None, scale_bias=0.8, gain=0.1, horizon_deg=10.0,
-                 kmax=60000, max_scale_frac=0.5, multiscale=True, log=None):
+                 kmax=60000, max_scale_frac=0.5, multiscale=True, max_scales=0, log=None):
         self.N = N; self.sdeg = scale_deg; self.gain = gain; self.kmax = kmax
         self.log = log or (lambda *a: None)
         self.psf = cp.asarray(psf, dtype=cp.float32)
@@ -305,6 +305,8 @@ class MultiScaleClean:
             s = 4 * theo_pix
             while s < N * max_scale_frac:
                 scales.append(s); s *= 2
+        if max_scales:
+            scales = scales[:max_scales]
         self.scales = scales
         self.C = Convolver(N, N, extra=2)
         Kpsf = self.C.kfft(self.psf)
@@ -387,7 +389,8 @@ def deconvolve_multiscale(dirty, psf, scale_deg, theo_pix, params, residual_fn=N
     log = log or (lambda *a: None)
     N = dirty.shape[0]
     D = MultiScaleClean(psf, N, scale_deg, theo_pix, beam=beam, scale_bias=params.multiscale_scale_bias,
-                        gain=params.gain, horizon_deg=params.horizon_deg, multiscale=params.multiscale, log=log)
+                        gain=params.gain, horizon_deg=params.horizon_deg, multiscale=params.multiscale,
+                        max_scales=params.multiscale_max_scales, log=log)
     sky = D.mask
     # pixels above the horizon (r < 1), the region of the MAD noise estimate (as clean_snapshot)
     above = horizon_mask(N, scale_deg, 0.0)
@@ -424,11 +427,18 @@ def deconvolve_multiscale(dirty, psf, scale_deg, theo_pix, params, residual_fn=N
             phase = 2; masks = [m.copy() for m in comp_masks] if comp_masks else None
             continue
         final = stop <= thr * 1.0000001
+        M_prev, R_prev = M.copy(), R.copy()
         R, M, nit, comp_masks = D.minor(R, M, stop, fac, scale_masks=masks if phase == 2 else None,
                                         maxiter=params.niter, niter_done=nit, comp_masks=comp_masks)
         did = nit - info["majors"][-1]["nit"]
         if residual_fn is not None and did > 0:
             R = residual_fn(M); nmajor += 1
+        if not (bool(cp.isfinite(M).all()) and bool(cp.isfinite(R).all())):
+            # divergence (e.g. deep cleaning of large scales whose PSF response is ~1e-4): keep the
+            # last finite model and stop instead of writing NaN images
+            log(f"  diverged in major {nmajor}: reverting to the previous model and stopping")
+            M, R = M_prev, R_prev; info["diverged"] = True
+            break
         if did == 0 and phase == 2:
             break
         if nit >= params.niter or nmajor >= max_major:
@@ -438,6 +448,7 @@ def deconvolve_multiscale(dirty, psf, scale_deg, theo_pix, params, residual_fn=N
                 phase = 2; masks = [m.copy() for m in comp_masks]
                 continue
             break
+    info.setdefault("diverged", False)
     info.update(nit=nit, nmajor=nmajor, beam=D.beam, scales=D.scales, niter_reached=nit >= params.niter,
                 max_major_reached=nmajor >= max_major)
     return D.restore(M, R), R, M, info

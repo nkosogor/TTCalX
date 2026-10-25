@@ -62,6 +62,7 @@ class CleanParams:
     taper_inner_tukey: float = 30.0     # -taper-inner-tukey 30 (lambda)
     multiscale: bool = False
     multiscale_scale_bias: float = 0.8
+    multiscale_max_scales: int = 0      # WSClean -multiscale-max-scales (number of scales incl. 0); 0 = unlimited
     nmajor: int = 2                     # snapshot only: fixed number of GPU major cycles
 
     def with_(self, **kw):

@@ -311,3 +311,27 @@ def test_multiscale_fits_mask(tmp_path):
     assert all(M[y - 2:y + 3, x - 2:x + 3].sum() < 0.05 * S[y, x] for y, x in zip(ys, xs))
     assert np.abs(R[30:226, 30:N // 2 - 8]).max() < T * 1.02           # inside: cleaned to T
     assert np.abs(R[:, N // 2 + 8:]).max() > 4.0                        # outside: sources remain
+
+
+def test_multiscale_max_scales_and_divergence_guard():
+    """multiscale_max_scales keeps the first n scales (WSClean -multiscale-max-scales); a
+    residual that turns non-finite stops the CLEAN with the last finite model."""
+    from ttcalx_imager.clean import Convolver, MultiScaleClean, deconvolve_multiscale
+    N, theo = 256, 3.0
+    yy, xx = np.mgrid[:N, :N] - N // 2
+    psf = cp.asarray(np.exp(-0.5 * (xx ** 2 + yy ** 2) / (theo / 2.3548) ** 2), dtype=cp.float32)
+    assert len(MultiScaleClean(psf, N, 0.3, theo, beam=(0.9, 0.9, 0)).scales) > 3
+    assert MultiScaleClean(psf, N, 0.3, theo, beam=(0.9, 0.9, 0), max_scales=3).scales == [0, 12.0, 24.0]
+    C = Convolver(N, N); K = C.kfft(psf)
+    sky = cp.zeros((N, N), cp.float32); sky[100, 120] = 50.0
+    dirty = C(sky, K).astype(cp.float32)
+    calls = []
+
+    def residual(M):
+        calls.append(1)
+        R = (dirty - C(M, K)).astype(cp.float32)
+        return R if len(calls) < 2 else R * cp.float32(np.nan)       # second major cycle "diverges"
+    params = bands.DEEP_I.with_(auto_mask=0.0, auto_threshold=0.0, local_rms=False, threshold=0.01, niter=10 ** 5)
+    _, R, M, info = deconvolve_multiscale(dirty, psf, 0.3, theo, params, residual_fn=residual, beam=(0.9, 0.9, 0.0))
+    assert info["diverged"] and bool(cp.isfinite(M).all()) and bool(cp.isfinite(R).all())
+    assert float(M.sum()) > 40.0
