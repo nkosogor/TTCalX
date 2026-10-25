@@ -281,3 +281,33 @@ def test_multiscale_absolute_threshold_without_auto_mask():
     _, _, _, info2 = deconvolve_multiscale(dirty, psf, sdeg, theo, params.with_(niter=50), residual_fn=residual,
                                            beam=(0.9, 0.9, 0.0))
     assert info2["niter_reached"]
+
+
+def test_multiscale_fits_mask(tmp_path):
+    """fits_mask (WSClean -fits-mask): components of every scale only inside the mask; inside it
+    the residual is cleaned to the absolute threshold, outside it is left untouched."""
+    from astropy.io import fits
+    from ttcalx_imager.clean import Convolver, deconvolve_multiscale
+    N, sdeg, theo = 256, 0.3, 3.0
+    rng = np.random.default_rng(13)
+    yy, xx = np.mgrid[:N, :N] - N // 2
+    psf = cp.asarray(np.exp(-0.5 * (xx ** 2 + yy ** 2) / (theo / 2.3548) ** 2), dtype=cp.float32)
+    C = Convolver(N, N); K = C.kfft(psf)
+    sky = cp.zeros((N, N), cp.float32)
+    for k in range(30):
+        sky[int(rng.integers(40, 216)), int(rng.integers(40, 216))] = float(rng.uniform(5, 40))
+    dirty = (C(sky, K) + cp.asarray(rng.normal(0, 0.2, (N, N)), dtype=cp.float32)).astype(cp.float32)
+    residual = lambda M: (dirty - C(M, K)).astype(cp.float32)
+    mask = np.zeros((N, N), np.float32); mask[:, : N // 2] = 1          # left half only
+    p = str(tmp_path / "mask.fits"); fits.writeto(p, mask[None, None])
+    T = 1.0
+    params = bands.DEEP_I.with_(auto_mask=0.0, auto_threshold=0.0, local_rms=False, threshold=T, niter=10 ** 6,
+                                fits_mask=p)
+    _, R, M, info = deconvolve_multiscale(dirty, psf, sdeg, theo, params, residual_fn=residual, beam=(0.9, 0.9, 0.0))
+    M = cp.asnumpy(M); R = cp.asnumpy(R)
+    S = cp.asnumpy(sky); ys, xs = np.nonzero(S[:, N // 2 + 8:]); xs = xs + N // 2 + 8
+    # component centres are restricted (large-scale footprints may cross the edge, as in WSClean):
+    # sources outside the mask receive no flux
+    assert all(M[y - 2:y + 3, x - 2:x + 3].sum() < 0.05 * S[y, x] for y, x in zip(ys, xs))
+    assert np.abs(R[30:226, 30:N // 2 - 8]).max() < T * 1.02           # inside: cleaned to T
+    assert np.abs(R[:, N // 2 + 8:]).max() > 4.0                        # outside: sources remain

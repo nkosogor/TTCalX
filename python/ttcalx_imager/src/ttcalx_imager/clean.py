@@ -395,6 +395,14 @@ def deconvolve_multiscale(dirty, psf, scale_deg, theo_pix, params, residual_fn=N
     # auto_mask = 0: no auto-mask phase (phase 2 from the start, unmasked); the stopping threshold
     # is max(threshold, auto_threshold * sigma) as WSClean's -threshold / -auto-threshold
     nit = 0; phase = 1 if params.auto_mask else 2; masks = None; comp_masks = None; nmajor = 0
+    user_mask = None
+    if params.fits_mask:      # WSClean -fits-mask: components (of every scale) only inside the mask
+        from astropy.io import fits as _fits
+        user_mask = cp.asarray(_fits.getdata(params.fits_mask).squeeze() > 0.5)
+        if user_mask.shape != (N, N):
+            raise ValueError(f"fits_mask {params.fits_mask}: shape {user_mask.shape} != image {(N, N)}")
+        sky = sky & user_mask
+        D.mask = sky
     info = dict(majors=[])
     while True:
         # radler applies -local-rms only while auto-masking (phase 1): its logs print "Lowest RMS
