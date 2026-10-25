@@ -217,6 +217,9 @@ julia bin/ttcal_gpu.jl peel sources.json /path/to/*.ms
 ## Source File Format
 
 The sources file is a JSON array of source objects (see [sources.json](sources.json) in this repo).
+Also included:
+- [sources/sources_7src_tauA.json](sources/sources_7src_tauA.json): Cyg A, Cas A, Tau A, Vir A, Her A, Hya A, Per B
+- [sources/rfi_43.2_ver20251101.json](sources/rfi_43.2_ver20251101.json): the main pipeline's near-field RFI model
 
 ## CPU-TTCal-matched zesting (sky + RFI)
 
@@ -281,6 +284,8 @@ gpu_genvis!(model, meta, rfi, meta.phase_center_ra, meta.phase_center_dec, 0.0)
 
 # CPU threads instead of the GPU (run with julia -t 24)
 vis, _, meta, bl, nrows = read_ms_fast(ms; gpu=false)
+model = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=false)
+cal = calibration_type(GPUZestingSource(source), meta.Nant, meta.Nfreq; gpu=false)
 ```
 
 **Behaviour changes for all callers** (`sources.jl`):
