@@ -78,3 +78,38 @@ def test_point_source_snapshot_clean():
     assert mdl[y0 - 2:y0 + 3, x0 - 2:x0 + 3].sum() == pytest.approx(10.0, rel=0.03)
     bmaj, bmin, bpa = r["info"]["beam"]
     assert 0 < bmin <= bmaj < 20 * sdeg
+
+
+def test_hour_orca_products_naming(tmp_path, monkeypatch):
+    """image_hour with orca products: one load, WSClean/orca file names, V-only product."""
+    import os
+    from ttcalx_imager import hour
+    rng = np.random.default_rng(3)
+    ant = rng.normal(0, 80, (60, 3)); ant[:, 2] *= 0.05
+    b = (ant[:, None] - ant[None])[np.triu_indices(60, 1)]
+    freqs = np.array([23.0e6, 23.1e6])
+    lam = 299792458.0 / freqs
+
+    def snap(i):
+        u = (b[:, 0:1] / lam).ravel().astype(np.float32); v = (b[:, 1:2] / lam).ravel().astype(np.float32)
+        w = (b[:, 2:3] / lam).ravel().astype(np.float32)
+        n = u.size
+        noise = lambda: (rng.normal(size=n) + 1j * rng.normal(size=n)).astype(np.complex64)
+        return dict(path=f"s{i}", stem=f"20261024_1000{i}3_23MHz", time=100.0 + 10 * i, tstart=95.0 + 10 * i,
+                    freqs=freqs, chan_width=1e5, R=np.eye(3), u=u, v=v, w=w, nw=np.ones(n, np.float32),
+                    I=(5.0 + noise()).astype(np.complex64), V=noise(), flagfrac=0.0, zero_frac=0.0,
+                    telescope="OVRO-LWA", observer="", field_name="")
+
+    monkeypatch.setattr(hour, "load_all", lambda paths, ra, dec, nproc=8, want_v=True: [snap(i) for i in range(len(paths))])
+    prods = bands.hour_products(["I-Deep-NoTaper-Robust-0", "V-Taper-Deep"])
+    out = str(tmp_path / "23MHz")
+    s = hour.image_hour(["a", "b"], 23, out, phase_centre="02h30m00s 37d12m57.057s", products=prods, qa="none")
+    names = sorted(os.listdir(tmp_path))
+    for suffix in ("image", "residual", "model", "dirty", "psf"):
+        assert f"23MHz-I-Deep-NoTaper-Robust-0-{suffix}.fits" in names
+    assert "23MHz-V-Taper-Deep-image.fits" in names
+    assert not any("-I-image" in n for n in names)
+    assert set(s["products"]) == {"I-Deep-NoTaper-Robust-0", "V-Taper-Deep"}
+    assert "I-Deep-NoTaper-Robust-0: deconvolution (incl. major cycles)" in s["timing"]
+    assert "V-Taper-Deep: dirty V" in s["timing"]
+    assert os.path.exists(f"{out}-summary.json")

@@ -221,28 +221,49 @@ def snapshot_qa(snaps, N, sdeg, params, qa="auto", qa_dir=None, log=None):
     return out
 
 
+def _as_product(p, pols):
+    """HourProduct, or a legacy (tag, n_intervals, CleanParams) tuple."""
+    if isinstance(p, bands.HourProduct):
+        return p
+    tag, nint, params = p
+    return bands.HourProduct(tag, nint, params, v_tag="V" if "V" in pols else None, naming="legacy")
+
+
+def _names(prod, name):
+    """File names of one image of a product (orca = WSClean single-pol names)."""
+    if prod.naming == "orca":
+        return dict(image=f"{name}-image.fits", residual=f"{name}-residual.fits", model=f"{name}-model.fits",
+                    dirty=f"{name}-dirty.fits", psf=f"{name}-psf.fits")
+    return dict(image=f"{name}-I-image.fits", residual=f"{name}-I-residual.fits", model=f"{name}-I-model.fits",
+                dirty=f"{name}-I-dirty.fits", psf=f"{name}-psf.fits", V=f"{name}-V-image.fits")
+
+
 def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, bands.DEEP_I),),
                mode="wsnap", block=6, pols="IV", qa="auto", qa_dir=None, exclude=(), nproc=8,
                beam=None, write_aux=True, verbose=False):
-    """Image one band-hour.  products: (tag, n_intervals, CleanParams) tuples, all made from one
-    load, e.g. (("1h", 1, DEEP_I), ("10min", 6, TENMIN_I)).  Returns the summary dict
-    (also written to <out_prefix>-summary.json)."""
+    """Image one band-hour.  products: HourProduct (bands.hour_products) or legacy
+    (tag, n_intervals, CleanParams) tuples, all made from one load, e.g.
+    bands.hour_products(bands.ORCA_ALL) or (("1h", 1, DEEP_I), ("10min", 6, TENMIN_I)).
+    Returns the summary dict (also written to <out_prefix>-summary.json); summary["timing"]
+    has seconds per step, keyed "<tag>: <step>" and accumulated over intervals."""
     log = (lambda *a: print(*a, flush=True)) if verbose else (lambda *a: None)
     T = {}; t0 = time.perf_counter(); last = [t0]
 
     def lap(k):
         cp.cuda.Device().synchronize(); now = time.perf_counter(); T[k] = T.get(k, 0) + now - last[0]; last[0] = now
 
+    products = [_as_product(p, pols) for p in products]
+    want_v = any(p.v_tag for p in products)
     N, sdeg = bands.geometry(band)
     ra, dec = parse_phase_centre(phase_centre) if phase_centre else middle_zenith(paths)
-    snaps = load_all(list(paths), ra, dec, nproc, want_v="V" in pols)
+    snaps = load_all(list(paths), ra, dec, nproc, want_v=want_v or qa in ("auto", "compute"))
     snaps.sort(key=lambda s: s["time"])
     lap("load + rotation (CPU)")
     nfull = len(snaps)
     for i, s in enumerate(snaps):
         s["tidx"] = i
-    p0 = products[0][2]
-    vr = snapshot_qa(snaps, N, sdeg, p0, qa, qa_dir, log) if qa != "none" else [float("nan")] * nfull
+    # QA always with the orca pilot-snapshot weighting (briggs 0, inner Tukey 30)
+    vr = snapshot_qa(snaps, N, sdeg, bands.SNAPSHOT_CLEAN_I, qa, qa_dir, log) if qa != "none" else [float("nan")] * nfull
     bad, med, sd = qa_reject(vr) if qa != "none" else ([], None, None)
     drop = set(bad) | set(int(x) for x in exclude) | {i for i, s in enumerate(snaps) if len(s["u"]) == 0 or s["zero_frac"] >= 0.999}
     lap("snapshot QA")
@@ -252,12 +273,16 @@ def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, b
                    qa=[dict(stem=s["stem"], time=s["time"], V_rms_box=r, flag_frac=s["flagfrac"], zero_frac=s["zero_frac"])
                        for s, r in zip(snaps, vr)], qa_median=med, qa_mad_std=sd, timing=T, products={})
     snaps = [s for i, s in enumerate(snaps) if i not in drop]
-    for tag, nint, params in products:
+    for prod in products:
+        tag, nint, params = prod.tag, prod.n_intervals, prod.params
+        key = tag if prod.image_i else prod.v_tag
         bnd = [int(math.floor(k * nfull / nint)) for k in range(nint + 1)]   # wsclean -intervals-out
         groups = [[s for s in snaps if bnd[k] <= s["tidx"] < bnd[k + 1]] for k in range(nint)]
         outs = []
         for gi, sn in enumerate(groups):
-            name = f"{out_prefix}-{tag}" + ("" if nint == 1 else f"-t{gi:04d}")
+            tsfx = "" if nint == 1 else f"-t{gi:04d}"
+            name = f"{out_prefix}-{tag}{tsfx}"
+            fn = _names(prod, name)
             if not sn:
                 outs.append(dict(name=name, n_snap=0)); continue
             G = HourGrid(sn, N, sdeg, robust=params.robust, tukey_inner=params.taper_inner_tukey or None,
@@ -267,36 +292,49 @@ def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, b
                 imgfn = W.image
             else:
                 imgfn = G.image
-            lap(f"{tag}: weights + gridder setup")
-            dirty = imgfn("I"); lap(f"{tag}: dirty I")
-            psf = G.image(psf=True); lap(f"{tag}: psf")
-            theo = theoretical_beam_pix(sn, G.sc)
-            restored, R, M, di = deconvolve_multiscale(dirty, psf, sdeg, theo, params,
-                                                       residual_fn=lambda m: imgfn("I", model=m), beam=beam, log=log)
-            lap(f"{tag}: deconvolution (incl. major cycles)")
+            lap(f"{key}: weights + gridder setup")
             s0 = sn[0]
-            h = make_header(N, sdeg, ra, dec, s0["freqs"], s0["chan_width"], min(s["tstart"] for s in sn), beam=di["beam"],
-                            telescope=s0["telescope"], observer=s0["observer"], obj=s0["field_name"],
-                            extra=dict(NSNAP=(len(sn), "snapshots imaged")),
-                            history=[f"ttcalx-image hour ({mode}, block {block}): multiscale={params.multiscale} "
-                                     f"bias {params.multiscale_scale_bias} niter={params.niter} mgain={params.mgain} "
-                                     f"auto-mask={params.auto_mask} auto-threshold={params.auto_threshold} local-rms "
-                                     f"horizon={params.horizon_deg}deg briggs {params.robust} tukey {params.taper_inner_tukey}"])
-            files = [write_image(f"{name}-I-image.fits", restored, h, "I")]
-            if write_aux:
-                files += [write_image(f"{name}-I-residual.fits", R, h, "I"), write_image(f"{name}-I-model.fits", M, h, "I"),
-                          write_image(f"{name}-I-dirty.fits", dirty, h, "I"), write_image(f"{name}-psf.fits", psf, h, "I")]
-            if "V" in pols:
-                v = imgfn("V"); lap(f"{tag}: dirty V")
-                files.append(write_image(f"{name}-V-image.fits", v, h, "V"))
-            lap(f"{tag}: write")
+            hist = (f"ttcalx-image hour ({mode}, block {block}): {key} multiscale={params.multiscale} "
+                    f"bias {params.multiscale_scale_bias} niter={params.niter} mgain={params.mgain} "
+                    f"auto-mask={params.auto_mask} auto-threshold={params.auto_threshold} local-rms "
+                    f"horizon={params.horizon_deg}deg briggs {params.robust} tukey {params.taper_inner_tukey}")
+            hdr = lambda b: make_header(N, sdeg, ra, dec, s0["freqs"], s0["chan_width"], min(s["tstart"] for s in sn),
+                                        beam=b, telescope=s0["telescope"], observer=s0["observer"],
+                                        obj=s0["field_name"], extra=dict(NSNAP=(len(sn), "snapshots imaged")),
+                                        history=[hist])
+            files = []; di = {}; theo = theoretical_beam_pix(sn, G.sc)
+            if prod.image_i:
+                dirty = imgfn("I"); lap(f"{tag}: dirty I")
+                psf = G.image(psf=True); lap(f"{tag}: psf")
+                restored, R, M, di = deconvolve_multiscale(dirty, psf, sdeg, theo, params,
+                                                           residual_fn=lambda m: imgfn("I", model=m), beam=beam, log=log)
+                lap(f"{tag}: deconvolution (incl. major cycles)")
+                h = hdr(di["beam"])
+                files.append(write_image(fn["image"], restored, h, "I"))
+                if write_aux:
+                    files += [write_image(fn["residual"], R, h, "I"), write_image(fn["model"], M, h, "I"),
+                              write_image(fn["dirty"], dirty, h, "I"), write_image(fn["psf"], psf, h, "I")]
+                lap(f"{tag}: write")
+                del dirty, psf, restored, R, M
+            if prod.v_tag:
+                vkey = prod.v_tag if prod.naming == "orca" else tag
+                v = imgfn("V"); lap(f"{vkey}: dirty V")
+                h = hdr(di.get("beam"))
+                vname = fn["V"] if prod.naming == "legacy" else f"{out_prefix}-{prod.v_tag}{tsfx}-image.fits"
+                files.append(write_image(vname, v, h, "V"))
+                lap(f"{vkey}: write")
+                del v
             outs.append(dict(name=name, n_snap=len(sn), npts=G.npts, theo_beam_pix=theo, files=files,
                              K=sorted(set(g.svd.K for g in W.sub)) if mode == "wsnap" else G.svd.K, **di))
-            del G, dirty, psf, restored, R, M
+            del G
             if mode == "wsnap":
                 del W
             cp.get_default_memory_pool().free_all_blocks()
-        summary["products"][tag] = outs
+        summary["products"][key] = outs
+        if prod.image_i and prod.v_tag and prod.naming == "orca":
+            summary["products"][prod.v_tag] = [dict(name=o["name"], n_snap=o["n_snap"],
+                                                    files=[f for f in o.get("files", []) if prod.v_tag in os.path.basename(f)])
+                                               for o in outs]
     T["TOTAL"] = time.perf_counter() - t0
     json.dump(summary, open(f"{out_prefix}-summary.json", "w"), indent=1, default=float)
     return summary

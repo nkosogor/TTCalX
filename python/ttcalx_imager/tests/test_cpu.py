@@ -19,6 +19,35 @@ def test_geometry_tiers():
     assert bands.hour_phase_centre(2) == "02h30m00s 37d12m57.057s"
 
 
+def test_orca_hour_products():
+    P = {p.tag: p for p in bands.hour_products(["orca"])}
+    assert list(P) == list(bands.ORCA_I_PRODUCTS)
+    d = P["I-Deep-Taper-Robust-0"]
+    assert (d.n_intervals, d.params, d.v_tag, d.naming) == (1, bands.DEEP_I, "V-Taper-Deep", "orca")
+    assert P["I-Deep-Taper-Robust-0.75"].params.robust == -0.75
+    assert P["I-Deep-Taper-Robust-0.75"].params.taper_inner_tukey == 30.0
+    for n, r in (("I-Deep-NoTaper-Robust-0.75", -0.75), ("I-Deep-NoTaper-Robust-0", 0.0)):
+        p = P[n].params
+        assert (p.robust, p.taper_inner_tukey, p.niter, p.multiscale, p.mgain) == (r, 0.0, 150000, True, 0.95)
+        assert P[n].v_tag is None
+    t = P["I-Taper-10min"]
+    assert (t.n_intervals, t.params.niter, t.v_tag) == (6, 50000, "V-Taper-10min")
+    assert P["I-Deep-Taper-Robust-0.75"].params.niter == 500000
+
+
+def test_hour_products_v_only_and_legacy():
+    (p,) = bands.hour_products(["V-Taper-Deep"])
+    assert (p.tag, p.image_i, p.v_tag, p.params) == ("I-Deep-Taper-Robust-0", False, "V-Taper-Deep", bands.DEEP_I)
+    (p,) = bands.hour_products(["I-Deep-Taper-Robust-0"])
+    assert p.v_tag is None and p.image_i
+    a, b = bands.hour_products(["1h", "10min"], intervals=3, niter=7, niter_10min=5, pols="I")
+    assert (a.tag, a.naming, a.params.niter, a.v_tag) == ("1h", "legacy", 7, None)
+    assert (b.n_intervals, b.params.niter) == (3, 5)
+    assert bands.hour_products(["1h"])[0].v_tag == "V"
+    with pytest.raises(ValueError):
+        bands.hour_products(["I-Deep-Taper-Robust-1"])
+
+
 # ----------------------------------------------------------------------------- weights
 def _briggs_reference(u, v, nw, N, sc, robust, tukey):
     """Straightforward per-sample implementation of the WSClean 3.4 rules (dict of cells)."""

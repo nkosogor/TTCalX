@@ -52,13 +52,8 @@ def cmd_hour(a):
     from . import bands
     from .hour import image_hour
     paths = _read_list(a.ms)
-    deep = bands.DEEP_I.with_(niter=a.niter or bands.DEEP_I.niter)
-    tenm = bands.TENMIN_I.with_(niter=a.niter_10min or bands.TENMIN_I.niter)
-    prods = []
-    if "1h" in a.products:
-        prods.append(("1h", 1, deep))
-    if "10min" in a.products:
-        prods.append(("10min", a.intervals, tenm))
+    prods = bands.hour_products(a.products, intervals=a.intervals, niter=a.niter,
+                                niter_10min=a.niter_10min, pols=a.pols)
     pc = a.phase_centre or (bands.hour_phase_centre(a.lst_hour) if a.lst_hour is not None else None)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     s = image_hour(paths, a.band, a.out, phase_centre=pc, products=prods, mode=a.mode, block=a.block, pols=a.pols,
@@ -102,13 +97,17 @@ def main(argv=None):
     g = h.add_mutually_exclusive_group()
     g.add_argument("--phase-centre", help="'02h30m00s 37d12m57.057s' (default: zenith of the middle snapshot)")
     g.add_argument("--lst-hour", type=int, help="orca convention: phase centre <LST>h30m00s 37d12m57.057s")
-    h.add_argument("--products", default="1h,10min", help="comma list of 1h, 10min")
-    h.add_argument("--intervals", type=int, default=6, help="number of intervals for the 10min product")
-    h.add_argument("--niter", type=int, default=0, help="1h niter (default 500000)")
-    h.add_argument("--niter-10min", type=int, default=0, help="10min niter (default 50000)")
+    h.add_argument("--products", default="1h,10min",
+                   help="comma list: orca step names (I-Deep-Taper-Robust-0, I-Deep-Taper-Robust-0.75, "
+                        "I-Deep-NoTaper-Robust-0.75, I-Deep-NoTaper-Robust-0, I-Taper-10min, V-Taper-Deep, "
+                        "V-Taper-10min; 'orca' = all, written with WSClean's orca file names) or the legacy "
+                        "tags 1h, 10min. All products are made from one load of the data.")
+    h.add_argument("--intervals", type=int, default=6, help="number of intervals for the legacy 10min product")
+    h.add_argument("--niter", type=int, default=0, help="legacy 1h niter (default 500000)")
+    h.add_argument("--niter-10min", type=int, default=0, help="legacy 10min niter (default 50000)")
     h.add_argument("--mode", default="wsnap", choices=["wsnap", "vis"])
     h.add_argument("--block", type=int, default=6, help="snapshots per w-snapshot block")
-    h.add_argument("--pols", default="IV", choices=["I", "IV"])
+    h.add_argument("--pols", default="IV", choices=["I", "IV"], help="legacy tags: also make V")
     h.add_argument("--qa", default="auto", choices=["auto", "json", "compute", "none"],
                    help="snapshot QA source: json from --qa-dir, compute here, or both (auto)")
     h.add_argument("--qa-dir", help="directory with <stem>-qa.json from 'ttcalx-image snapshot'")

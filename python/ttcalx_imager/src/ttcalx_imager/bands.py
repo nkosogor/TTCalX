@@ -81,6 +81,77 @@ TENMIN_INTERVALS = 6
 
 # Dirty Stokes V (pilot snapshots, V-Taper-Deep, V-Taper-10min): same weighting, -niter 0.
 
+# orca 'I-Deep-Taper-Robust-0.75': as DEEP_I with -weight briggs -0.75
+DEEP_I_R075 = DEEP_I.with_(robust=-0.75)
+# orca 'I-Deep-NoTaper-Robust-0.75' / '-0': no -taper-inner-tukey, -niter 150000
+DEEP_I_NOTAPER_R075 = DEEP_I.with_(robust=-0.75, taper_inner_tukey=0.0, niter=150000)
+DEEP_I_NOTAPER_R0 = DEEP_I.with_(taper_inner_tukey=0.0, niter=150000)
+
+
+@dataclass(frozen=True)
+class HourProduct:
+    """One imaging configuration of ``image_hour``.
+
+    tag: name of the I product (file stem part); n_intervals: 1 (1 h) or e.g. 6 (10 min);
+    params: weighting + CLEAN settings; image_i: make the CLEANed I image; v_tag: also make
+    a dirty V image with the same weighting under this name (None: no V).  naming="orca":
+    files <prefix>-<tag>[-tNNNN]-{image,residual,model,dirty,psf}.fits and
+    <prefix>-<v_tag>[-tNNNN]-image.fits as WSClean writes them for the orca steps;
+    naming="legacy": <prefix>-<tag>[-tNNNN]-{I-image,...,V-image}.fits.
+    """
+    tag: str
+    n_intervals: int
+    params: CleanParams
+    image_i: bool = True
+    v_tag: str = None
+    naming: str = "orca"
+
+
+# orca IMAGING_STEPS (subband_config.py): I name -> (intervals, params); V name -> I config
+# whose weighting it shares (briggs 0, inner Tukey 30).
+ORCA_I_PRODUCTS = {
+    "I-Deep-Taper-Robust-0.75": (1, DEEP_I_R075),
+    "I-Deep-Taper-Robust-0": (1, DEEP_I),
+    "I-Deep-NoTaper-Robust-0.75": (1, DEEP_I_NOTAPER_R075),
+    "I-Deep-NoTaper-Robust-0": (1, DEEP_I_NOTAPER_R0),
+    "I-Taper-10min": (TENMIN_INTERVALS, TENMIN_I),
+}
+ORCA_V_PRODUCTS = {"V-Taper-Deep": "I-Deep-Taper-Robust-0", "V-Taper-10min": "I-Taper-10min"}
+ORCA_ALL = list(ORCA_I_PRODUCTS) + list(ORCA_V_PRODUCTS)
+
+
+def hour_products(names, intervals=TENMIN_INTERVALS, niter=0, niter_10min=0, pols="IV"):
+    """Product names -> [HourProduct].
+
+    Names: orca step names (ORCA_ALL, or 'orca' for all of them), or the legacy tags '1h'
+    (DEEP_I) and '10min' (TENMIN_I, ``intervals``), whose V follows ``pols``.  A V product
+    is made together with the I product of the same weighting; a V product requested
+    without that I product gets a V-only configuration (no CLEAN).  niter / niter_10min
+    override the legacy tags only."""
+    names = [n.strip() for n in names if n.strip()]
+    if "orca" in names:
+        names = [n for n in names if n != "orca"] + [n for n in ORCA_ALL if n not in names]
+    unknown = [n for n in names if n not in ORCA_ALL and n not in ("1h", "10min")]
+    if unknown:
+        raise ValueError(f"unknown hour product(s) {unknown}; known: {ORCA_ALL + ['1h', '10min']}")
+    out = []
+    for n in names:
+        if n == "1h":
+            out.append(HourProduct("1h", 1, DEEP_I.with_(niter=niter or DEEP_I.niter),
+                                   v_tag="V" if "V" in pols else None, naming="legacy"))
+        elif n == "10min":
+            out.append(HourProduct("10min", intervals, TENMIN_I.with_(niter=niter_10min or TENMIN_I.niter),
+                                   v_tag="V" if "V" in pols else None, naming="legacy"))
+        elif n in ORCA_I_PRODUCTS:
+            nint, params = ORCA_I_PRODUCTS[n]
+            v = [vn for vn, i_name in ORCA_V_PRODUCTS.items() if i_name == n and vn in names]
+            out.append(HourProduct(n, nint, params, v_tag=v[0] if v else None))
+    for vn, i_name in ORCA_V_PRODUCTS.items():
+        if vn in names and i_name not in names:
+            nint, params = ORCA_I_PRODUCTS[i_name]
+            out.append(HourProduct(i_name, nint, params, image_i=False, v_tag=vn))
+    return out
+
 
 def hour_phase_centre(lst_hour):
     """orca hour phase centre: '<LST>h30m00s 37d12m57.057s' (OVRO-LWA latitude)."""
