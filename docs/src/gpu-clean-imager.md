@@ -98,7 +98,8 @@ use `-intervals-out 6` boundaries on the original time-step index.
 | `-mgain 0.95` (hour) | minor loop stops at max(threshold, 0.05 peak), then major cycle |
 | `-auto-mask A` | phase 1 to A * sigma; component positions (per scale) become the mask |
 | `-auto-threshold T` | phase 2 inside the mask to T * sigma |
-| `-local-rms` | radler RmsImage: sqrt(Gaussian-smoothed residual^2), FWHM 25 theoretical beams; peak search on residual * min(rms)/rms |
+| `-local-rms` | radler RmsImage: sqrt(Gaussian-smoothed residual^2), FWHM 25 theoretical beams; peak search on residual * min(rms)/rms. Only in the auto-mask phase: in the auto-threshold phase WSClean (radler) uses the plain MAD noise and unweighted peaks (snapshot and multiscale alike) |
+| PSF | image of a unit point source at the phase centre *with* the w-term (WSClean's PSF matches a direct DFT of this to ~1e-5), normalised to 1 at the centre; the hour PSF is w-snapshot gridded like the data |
 | `-horizon-mask 10deg` | components only where elevation > 10 deg |
 | `-multiscale -multiscale-scale-bias 0.8` | scales 0, 4 x theoretical beam, doubling to N/2; tapered-quadratic kernels; bias 0.8^-k |
 | beam fit | port of WSClean's `Fit2DGaussianCentred` (see below) |

@@ -389,14 +389,19 @@ def deconvolve_multiscale(dirty, psf, scale_deg, theo_pix, params, residual_fn=N
     D = MultiScaleClean(psf, N, scale_deg, theo_pix, beam=beam, scale_bias=params.multiscale_scale_bias,
                         gain=params.gain, horizon_deg=params.horizon_deg, multiscale=params.multiscale, log=log)
     sky = D.mask
+    # pixels above the horizon (r < 1), the region of the MAD noise estimate (as clean_snapshot)
+    above = horizon_mask(N, scale_deg, 0.0)
     R = dirty.copy(); M = cp.zeros((N, N), cp.float32)
     nit = 0; phase = 1; masks = None; comp_masks = None; nmajor = 0
     info = dict(majors=[])
     while True:
-        if params.local_rms:
+        # radler applies -local-rms only while auto-masking (phase 1): its logs print "Lowest RMS
+        # in image" for the first deconvolution only, and in the auto-threshold phase (phase 2)
+        # thresholds use the plain MAD noise ("Estimated standard deviation") with unweighted peaks.
+        if params.local_rms and phase == 1:
             fac, sigma = local_rms_factor(R, theo_pix, scale_deg, sky, params.local_rms_window)
         else:
-            fac = cp.ones((N, N), cp.float32); sigma = mad_std(R[sky])
+            fac = cp.ones((N, N), cp.float32); sigma = mad_std(R[above])
         region = sky if (phase == 1 or not masks) else (sky & cp.stack(masks).any(axis=0))
         peak = float(cp.where(region, cp.abs(R) * fac, 0).max())
         thr = (params.auto_mask if phase == 1 else params.auto_threshold) * sigma

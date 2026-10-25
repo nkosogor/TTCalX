@@ -72,7 +72,11 @@ class SnapshotImager:
         lap("gridder setup")
         dirty = to_ws(S.grid(dI)) / sw
         lap("dirty I")
-        psf = to_ws(cp.where(svd.inside, S.grid_psf(), 0)) / sw
+        # PSF = image of unit visibilities WITH the w-term: WSClean's PSF agrees with a direct DFT
+        # of that to ~1e-5, the w-less PSF differs by up to ~1e-3 of the peak at el < 60 deg.
+        # Normalised to 1 at the centre, as WSClean writes it.
+        psf = to_ws(S.grid(cp.ones(S.npts, cp.complex64)))
+        psf = psf / psf[N // 2, N // 2]
         lap("psf")
         sky = to_ws(svd.inside)
 

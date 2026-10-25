@@ -113,3 +113,115 @@ def test_hour_orca_products_naming(tmp_path, monkeypatch):
     assert "I-Deep-NoTaper-Robust-0: deconvolution (incl. major cycles)" in s["timing"]
     assert "V-Taper-Deep: dirty V" in s["timing"]
     assert os.path.exists(f"{out}-summary.json")
+
+
+def test_multiscale_local_rms_only_in_auto_mask_phase():
+    """radler (WSClean 3.4) uses -local-rms only while auto-masking: phase 1 thresholds use the
+    minimum local RMS, phase 2 (auto-threshold) uses the MAD noise of the residual with
+    unweighted peaks (WSClean logs 'Lowest RMS in image' only for the first deconvolution)."""
+    from ttcalx_imager.clean import Convolver, deconvolve_multiscale, local_rms_factor, mad_std, horizon_mask
+    N, sdeg, theo = 256, 0.3, 3.0
+    rng = np.random.default_rng(11)
+    yy, xx = np.mgrid[:N, :N] - N // 2
+    psf = cp.asarray(np.exp(-0.5 * (xx ** 2 + yy ** 2) / (theo / 2.3548) ** 2), dtype=cp.float32)
+    C = Convolver(N, N); K = C.kfft(psf)
+    sky = cp.zeros((N, N), cp.float32); sky[100, 100] = 500.0; sky[180, 60] = 30.0; sky[60, 190] = 12.0
+    dirty = (C(sky, K) + cp.asarray(rng.normal(0, 1.0, (N, N)), dtype=cp.float32)).astype(cp.float32)
+    above = horizon_mask(N, sdeg, 0.0)
+    seen = []
+
+    def residual(M):
+        R = (dirty - C(M, K)).astype(cp.float32)
+        seen.append(mad_std(R[above]))
+        return R
+
+    params = bands.DEEP_I.with_(niter=20000)
+    _, R, M, info = deconvolve_multiscale(dirty, psf, sdeg, theo, params, residual_fn=residual, beam=(0.9, 0.9, 0.0))
+    majors = info["majors"]
+    _, minrms0 = local_rms_factor(dirty, theo, sdeg, horizon_mask(N, sdeg, params.horizon_deg), params.local_rms_window)
+    assert majors[0]["phase"] == 1 and majors[0]["sigma"] == pytest.approx(minrms0, rel=1e-5)
+    p2 = [m for m in majors if m["phase"] == 2]
+    assert p2, "no auto-threshold phase"
+    for m in p2:
+        assert any(m["sigma"] == pytest.approx(s, rel=1e-5) for s in seen)
+    # deconvolved down to the auto-threshold: bright source removed from the residual
+    assert float(cp.abs(R[95:106, 95:106]).max()) < 5.0
+
+
+def test_snapshot_psf_includes_w_term():
+    """The snapshot PSF is the image of unit visibilities with the w-term (as WSClean's PSF):
+    far from the centre it matches a direct DFT with the w-term, not the w-less 2-D FT."""
+    N, sdeg = 128, 0.5                                     # l up to 0.56: strong w-term
+    sc = math.radians(sdeg)
+    u, v, w = _samples(3000, 25.0, 25.0, seed=9)
+    rng = np.random.default_rng(2)
+    vis = (rng.normal(size=u.size) + 1j * rng.normal(size=u.size)).astype(np.complex64)
+    r = SnapshotImager().image_arrays(u, v, w, np.ones(u.size, np.float32), vis, None, N, sdeg,
+                                      bands.SNAPSHOT_CLEAN_I.with_(taper_inner_tukey=0.0))
+    psf = cp.asnumpy(r["psf"])
+    from ttcalx_imager.weights import briggs_weights
+    wt = briggs_weights(u, v, np.ones(u.size), N, sc, 0.0, None, xp=np)
+    ys, xs = np.array([10, 30, 64, 100, 120, 40]), np.array([15, 110, 20, 64, 100, 64])
+    l = (xs - N // 2) * sc; m = (((N - ys) % N) - N // 2) * sc
+    n1 = np.sqrt(1 - l ** 2 - m ** 2) - 1
+    with_w = np.real(np.exp(2j * np.pi * (np.outer(u, l) + np.outer(v, m) - np.outer(w, n1))).T @ wt) / wt.sum()
+    without_w = np.real(np.exp(2j * np.pi * (np.outer(u, l) + np.outer(v, m))).T @ wt) / wt.sum()
+    assert psf[N // 2, N // 2] == 1.0
+    assert np.abs(psf[ys, xs] - with_w).max() < 2e-4
+    assert np.abs(with_w - without_w).max() > 1e-2          # the test is sensitive to the w-term
+
+
+def test_hour_psf_includes_w_term(tmp_path, monkeypatch):
+    """Hour PSF (w-snapshot mode, rotated snapshot frames) = image of a unit point source at the
+    hour phase centre with the w-term, as WSClean: compare with a direct DFT in the hour frame."""
+    from astropy.io import fits
+    from ttcalx_imager import hour
+    from ttcalx_imager.rotate import analytic_rotation
+    from ttcalx_imager.weights import WeightGrid
+    rng = np.random.default_rng(5)
+    ant = rng.normal(0, 70, (64, 3)); ant[:, 2] *= 0.05
+    b = (ant[:, None] - ant[None])[np.triu_indices(64, 1)]
+    freqs = np.array([30.0e6]); lam = 299792458.0 / freqs[0]
+    dec = math.radians(37.2); ra_h = 1.0
+    nsnap = 12; ras = ra_h + (np.arange(nsnap) - nsnap // 2) * math.radians(1.25)   # zenith moves 1.25 deg / 5 min
+
+    def snap(i):
+        u, v, w = (b[:, k] / lam for k in range(3))
+        n = u.size
+        return dict(path=f"s{i}", stem=f"20261024_10{i:02d}03_30MHz", time=100.0 + 300 * i, tstart=95.0 + 300 * i,
+                    freqs=freqs, chan_width=1e5, R=analytic_rotation(ras[i], dec, ra_h, dec),
+                    u=u.astype(np.float32), v=v.astype(np.float32), w=w.astype(np.float32), nw=np.ones(n, np.float32),
+                    I=np.ones(n, np.complex64), V=np.zeros(n, np.complex64), flagfrac=0.0, zero_frac=0.0,
+                    telescope="OVRO-LWA", observer="", field_name="")
+
+    snaps = [snap(i) for i in range(nsnap)]
+    monkeypatch.setattr(hour, "load_all", lambda paths, ra, dec, nproc=8, want_v=True: [dict(s) for s in snaps])
+    N, sdeg = 256, 0.4
+    monkeypatch.setattr(hour.bands, "geometry", lambda band: (N, sdeg))
+    prod = bands.HourProduct("t", 1, bands.DEEP_I.with_(niter=10))
+    out = str(tmp_path / "30MHz")
+    hour.image_hour([s["path"] for s in snaps], 30, out, phase_centre=f"{math.degrees(ra_h)} {math.degrees(dec)}",
+                    products=[prod], qa="none")
+    psf = fits.getdata(f"{out}-t-psf.fits").squeeze().astype(np.float64)
+    sc = math.radians(sdeg)
+    uh, vh, wh, wt = [], [], [], []
+    WG = WeightGrid(N, sc, 0.0, 30.0, xp=np)
+    rot = [s["R"] @ np.stack([s["u"], s["v"], s["w"]]).astype(np.float64) for s in snaps]
+    for r in rot:
+        WG.add(r[0], r[1], np.ones(r.shape[1]))
+    WG.finalize()
+    for r in rot:
+        uh.append(r[0]); vh.append(r[1]); wh.append(r[2]); wt.append(WG.weights(r[0], r[1], np.ones(r.shape[1])))
+    uh, vh, wh, wt = (np.concatenate(a).astype(np.float64) for a in (uh, vh, wh, wt))
+    c = N // 2
+    pts = [(c + 1, c), (c, c + 2), (c - 3, c + 1), (c + 40, c - 70), (c - 90, c + 60), (20, 40), (200, 220), (128, 10)]
+    ys = np.array([p[0] for p in pts]); xs = np.array([p[1] for p in pts])
+    l = (xs - c) * sc; m = (((N - ys) % N) - c) * sc; n1 = np.sqrt(1 - l ** 2 - m ** 2) - 1
+    ref = np.real(np.exp(2j * np.pi * (np.outer(uh, l) + np.outer(vh, m) - np.outer(wh, n1))).T @ wt) / wt.sum()
+    ref_now = np.real(np.exp(2j * np.pi * (np.outer(uh, l) + np.outer(vh, m))).T @ wt) / wt.sum()
+    err = np.abs(psf[ys, xs] - ref)
+    print("hour PSF |err| at core/sidelobe pixels:", np.round(err, 5), " w-term effect:", np.round(np.abs(ref - ref_now), 5))
+    assert psf[c, c] == 1.0
+    assert err[:3].max() < 2e-3                      # core (beam fit region)
+    assert err[3:].max() < 2e-3                      # far sidelobes, where the w-term matters
+    assert np.abs(ref - ref_now)[3:].max() > 1e-2    # the test is sensitive to the w-term

@@ -13,7 +13,8 @@ the concatenation and AOFlagger steps:
   4. w-snapshot gridding (default): blocks of ``block`` consecutive snapshots are gridded in the
      frame of their middle snapshot (small w range, K ~ 6-8 SVD terms instead of ~37 in the hour
      frame) with the global weights, reprojected to the hour SIN grid and summed with weight
-     sum_w(block).  The PSF is gridded directly in the hour frame (no w-term, as WSClean);
+     sum_w(block).  The PSF (unit point source at the phase centre, with the w-term, as WSClean)
+     is imaged the same way;
   5. multiscale CLEAN with WSClean major cycles: the band-limited hour model is reprojected
      into each block frame (times the SIN flux Jacobian n_hour / n_block) and degridded there;
   6. restore with the WSClean beam fit of the hour PSF.
@@ -132,16 +133,30 @@ class HourGrid:
         u, v, w = (cp.concatenate(x) for x in out[:3])
         return u, v, w, (cp.concatenate(out[3]) if vis is not None else None)
 
+    def _psf_vis(self, i):
+        """Stored-frame visibilities of a unit point source at the hour phase centre (column 'PSF'):
+        exp(2 pi i (w_hour - w_stored)), so that the chgcentre re-phasing in _rot turns them into
+        1 in the hour frame (exp(2 pi i (w_hour - w_block)) in a w-snapshot block frame)."""
+        s = self.snaps[i]
+        Rh = s.get("R_hour", s["R"])
+        u, v, w = (cp.asarray(s[k], dtype=cp.float64) for k in ("u", "v", "w"))
+        wh = Rh[2, 0] * u + Rh[2, 1] * v + Rh[2, 2] * w
+        return cp.exp(2j * np.pi * (wh - w)).astype(cp.complex64)
+
     def _chunk(self, ids, col):
         cat = lambda k: np.concatenate([self.snaps[i][k] for i in ids])
-        u, v, w, vis = self._rot(ids, cp.asarray(cat("u")), cp.asarray(cat("v")), cp.asarray(cat("w")),
-                                 cp.asarray(cat(col)) if col else None)
+        if col == "PSF":
+            vis = cp.concatenate([self._psf_vis(i) for i in ids])
+        else:
+            vis = cp.asarray(cat(col)) if col else None
+        u, v, w, vis = self._rot(ids, cp.asarray(cat("u")), cp.asarray(cat("v")), cp.asarray(cat("w")), vis)
         wt = cp.asarray(np.concatenate([self.iw[i] for i in ids]))
         return SampleSet(u, v, w, wt, self.N, self.sc, svd=self.svd, eps=self.eps, precompute=False), vis
 
     def image(self, col="I", model=None, psf=False, ids=None):
         """Weighted dirty (model=None) or residual image / sum of weights, WSClean orientation.
-        psf=True: PSF without w-term and without horizon zeroing (as WSClean)."""
+        col='PSF': image of a unit point source at the phase centre WITH the w-term (WSClean's PSF).
+        psf=True: 2-D PSF without the w-term (not what WSClean writes; kept for comparisons)."""
         acc = cp.zeros((self.N, self.N), cp.float32); sumw = 0.0
         for chunk in (self.chunks if ids is None else self._subchunks(ids)):
             S, vis = self._chunk(chunk, None if psf else col)
@@ -167,7 +182,7 @@ class WSnap:
             Rb = G.snaps[ids[len(ids) // 2]]["R"]
             sn = []
             for i in ids:     # snapshot frame -> block frame: R_b^T R_i (both chgcentre-exact)
-                d = dict(G.snaps[i]); d["R"] = Rb.T @ G.snaps[i]["R"]; sn.append(d)
+                d = dict(G.snaps[i]); d["R"] = Rb.T @ G.snaps[i]["R"]; d["R_hour"] = G.snaps[i]["R"]; sn.append(d)
             self.sub.append(HourGrid(sn, self.N, G.sdeg, rotate=block > 1, weights=[G.iw[i] for i in ids],
                                      eps=G.eps, svd_tol=1e-4))
             self.Rb.append(Rb)
@@ -306,7 +321,8 @@ def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, b
             files = []; di = {}; theo = theoretical_beam_pix(sn, G.sc)
             if prod.image_i:
                 dirty = imgfn("I"); lap(f"{tag}: dirty I")
-                psf = G.image(psf=True); lap(f"{tag}: psf")
+                # PSF with the w-term in the hour frame, as WSClean (w-snapshot gridded like the data)
+                psf = imgfn("PSF"); psf = psf / psf[N // 2, N // 2]; lap(f"{tag}: psf")
                 restored, R, M, di = deconvolve_multiscale(dirty, psf, sdeg, theo, params,
                                                            residual_fn=lambda m: imgfn("I", model=m), beam=beam, log=log)
                 lap(f"{tag}: deconvolution (incl. major cycles)")
