@@ -29,7 +29,7 @@ TTCalX is an extended version of the previous TTCal package by Michael Eastwood 
   - [Batch Processing (Recommended)](#batch-processing-recommended)
 - [Tutorial](docs/TUTORIAL.md)
 - [Source File Format](#source-file-format)
-- [CPU-TTCal-matched zesting (sky + RFI)](#cpu-ttcal-matched-zesting-sky--rfi)
+- [Sky and RFI peeling](#sky-and-rfi-peeling)
 - [Tests](#tests)
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
@@ -219,16 +219,10 @@ julia bin/ttcal_gpu.jl peel sources.json /path/to/*.ms
 The sources file is a JSON array of source objects (see [sources.json](sources.json) in this repo).
 Also included:
 - [sources/sources_7src_tauA.json](sources/sources_7src_tauA.json): Cyg A, Cas A, Tau A, Vir A, Her A, Hya A, Per B
-- [sources/rfi_43.2_ver20251101.json](sources/rfi_43.2_ver20251101.json): the main pipeline's near-field RFI model
+- [sources/rfi_43.2_ver20251101.json](sources/rfi_43.2_ver20251101.json): near-field RFI model
 
-## CPU-TTCal-matched zesting (sky + RFI)
+## Sky and RFI peeling
 
-The library also provides the pieces to zest exactly like the main pipeline's CPU TTCal
-(`ttcal.jl zest`, then `ttcal_dev` for the RFI model), on the GPU or on CPU threads.
-They are opt-in: the existing `ttcal_gpu.jl` and `peel_gpu!`/`zest_gpu!` code paths are not
-changed, except for two fixes in `sources.jl` that affect every caller (see below).
-
-**In short:**
 - Sky + RFI zesting that reproduces CPU TTCal, at a few seconds per snapshot on one GPU
   (about 50x faster than CPU TTCal).
 - Near-field RFI sources, peeled after the sky sources or jointly with them.
@@ -281,7 +275,7 @@ cal = calibration_type(GPUPeelingSource(source), meta.Nant, meta.Nfreq)
 sources = read_gpu_sources("sources_with_rfi.json")
 rfi = first(filter(is_rfi, sources))
 gpu_genvis!(model, meta, rfi, meta.phase_center_ra, meta.phase_center_dec, 0.0)
-# ...then solve/corrupt/subtract as above: after the sky sources (as the main pipeline),
+# ...then solve/corrupt/subtract as above: after the sky sources,
 #    or as one more direction in the same peel loop (joint).
 
 # CPU threads instead of the GPU (run with julia -t 24)
