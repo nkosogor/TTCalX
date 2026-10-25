@@ -234,6 +234,8 @@ changed, except for two fixes in `sources.jl` that affect every caller (see belo
 - Near-field RFI sources, peeled after the sky sources or jointly with them.
 - Optional regularised (Tukey phase-prior) peeling; it stabilises joint RFI solves when Cas A is low.
 - Runs on CPU threads too (`julia -t N`), with the same results as the GPU.
+- Divergence guards: `flag_zero_visibilities!` (all-zero samples) and `guarded_zest!`, CPU TTCal's
+  peel loop that keeps a new solution only if it lowers the residual power.
 - Recommended settings: `solver=:rk4, maxiter=5, tolerance=1e-4, minuvw=5`, exact model,
   `geometric_uvw!`, model flags copied from the data.
 
