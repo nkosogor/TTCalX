@@ -225,3 +225,31 @@ def test_hour_psf_includes_w_term(tmp_path, monkeypatch):
     assert err[:3].max() < 2e-3                      # core (beam fit region)
     assert err[3:].max() < 2e-3                      # far sidelobes, where the w-term matters
     assert np.abs(ref - ref_now)[3:].max() > 1e-2    # the test is sensitive to the w-term
+
+
+def test_hour_date_obs_includes_rejected_first_snapshot(tmp_path, monkeypatch):
+    """orca flags QA-rejected snapshots inside the concatenated MS, so WSClean's DATE-OBS is the
+    first time step of the interval even if that snapshot was rejected."""
+    from astropy.io import fits
+    from astropy.time import Time
+    from ttcalx_imager import hour
+    rng = np.random.default_rng(8)
+    ant = rng.normal(0, 60, (40, 3)); ant[:, 2] *= 0.05
+    b = (ant[:, None] - ant[None])[np.triu_indices(40, 1)]
+    freqs = np.array([50.0e6]); lam = 299792458.0 / freqs[0]
+
+    def snap(i):
+        u, v, w = (b[:, k] / lam for k in range(3))
+        n = u.size
+        return dict(path=f"s{i}", stem=f"s{i}", time=86400.0 * 61337 + 10 * i + 5, tstart=86400.0 * 61337 + 10 * i,
+                    freqs=freqs, chan_width=1e5, R=np.eye(3), u=u.astype(np.float32), v=v.astype(np.float32),
+                    w=w.astype(np.float32), nw=np.ones(n, np.float32), I=np.ones(n, np.complex64),
+                    V=np.zeros(n, np.complex64), flagfrac=0.0, zero_frac=0.0, telescope="OVRO-LWA", observer="", field_name="")
+
+    monkeypatch.setattr(hour, "load_all", lambda paths, ra, dec, nproc=8, want_v=True: [snap(i) for i in range(3)])
+    monkeypatch.setattr(hour.bands, "geometry", lambda band: (128, 0.5))
+    out = str(tmp_path / "50MHz")
+    hour.image_hour(["a", "b", "c"], 50, out, phase_centre="02h30m00s 37d12m57.057s",
+                    products=[bands.HourProduct("t", 1, bands.DEEP_I.with_(niter=5))], qa="none", exclude=[0])
+    want = Time(61337.0, format="mjd", scale="utc").isot[:21]
+    assert fits.getheader(f"{out}-t-image.fits")["DATE-OBS"] == want

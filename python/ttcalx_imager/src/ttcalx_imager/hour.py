@@ -288,12 +288,16 @@ def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, b
                    block=block, n_loaded=nfull, rejected=sorted(drop),
                    qa=[dict(stem=s["stem"], time=s["time"], V_rms_box=r, flag_frac=s["flagfrac"], zero_frac=s["zero_frac"])
                        for s, r in zip(snaps, vr)], qa_median=med, qa_mad_std=sd, timing=T, products={})
+    # interval start times include rejected snapshots: orca flags them in the concatenated MS, so
+    # WSClean's DATE-OBS is the first time step of the interval whether or not it is flagged
+    tstart_all = [s["tstart"] for s in snaps]
     snaps = [s for i, s in enumerate(snaps) if i not in drop]
     for prod in products:
         tag, nint, params = prod.tag, prod.n_intervals, prod.params
         key = tag if prod.image_i else prod.v_tag
         bnd = [int(math.floor(k * nfull / nint)) for k in range(nint + 1)]   # wsclean -intervals-out
         groups = [[s for s in snaps if bnd[k] <= s["tidx"] < bnd[k + 1]] for k in range(nint)]
+        t0s = [min(tstart_all[bnd[k]:bnd[k + 1]], default=None) for k in range(nint)]
         outs = []
         for gi, sn in enumerate(groups):
             tsfx = "" if nint == 1 else f"-t{gi:04d}"
@@ -314,7 +318,7 @@ def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, b
                     f"bias {params.multiscale_scale_bias} niter={params.niter} mgain={params.mgain} "
                     f"auto-mask={params.auto_mask} auto-threshold={params.auto_threshold} local-rms "
                     f"horizon={params.horizon_deg}deg briggs {params.robust} tukey {params.taper_inner_tukey}")
-            hdr = lambda b: make_header(N, sdeg, ra, dec, s0["freqs"], s0["chan_width"], min(s["tstart"] for s in sn),
+            hdr = lambda b: make_header(N, sdeg, ra, dec, s0["freqs"], s0["chan_width"], t0s[gi],
                                         beam=b, telescope=s0["telescope"], observer=s0["observer"],
                                         obj=s0["field_name"], extra=dict(NSNAP=(len(sn), "snapshots imaged")),
                                         history=[hist])
