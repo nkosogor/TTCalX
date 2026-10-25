@@ -34,6 +34,29 @@ ttcalx-image hour @list41.txt --band 41 --out hour41/41MHz --lst-hour 2 --qa-dir
 #      hour41/41MHz-10min-t000N-...fits, hour41/41MHz-summary.json
 ```
 
+All main-pipeline hourly products from one load of the data, with WSClean's file names
+(`<prefix>-I-Deep-Taper-Robust-0-image.fits`, `-residual`, `-model`, `-dirty`, `-psf`,
+`<prefix>-I-Taper-10min-t0000-image.fits`, `<prefix>-V-Taper-Deep-image.fits`, ...):
+
+```bash
+ttcalx-image hour @list41.txt --band 41 --out hour41/41MHz --qa compute \
+    --products I-Deep-Taper-Robust-0,I-Deep-Taper-Robust-0.75,I-Deep-NoTaper-Robust-0.75,I-Deep-NoTaper-Robust-0,I-Taper-10min,V-Taper-Deep,V-Taper-10min
+#   (--products orca = the same list)
+```
+
+| `--products` name | weighting | niter | intervals |
+|---|---|---|---|
+| `I-Deep-Taper-Robust-0` (+ `V-Taper-Deep`) | briggs 0, inner Tukey 30 | 500000 | 1 |
+| `I-Deep-Taper-Robust-0.75` | briggs -0.75, inner Tukey 30 | 500000 | 1 |
+| `I-Deep-NoTaper-Robust-0.75` | briggs -0.75 | 150000 | 1 |
+| `I-Deep-NoTaper-Robust-0` | briggs 0 | 150000 | 1 |
+| `I-Taper-10min` (+ `V-Taper-10min`) | briggs 0, inner Tukey 30 | 50000 | 6 |
+
+All use multiscale (bias 0.8), mgain 0.95, auto-mask 3, auto-threshold 0.5, local RMS and the
+10 deg horizon mask (orca `IMAGING_STEPS`). A V product requested without its I product is made
+without CLEAN. Snapshot QA always uses the pilot weighting (briggs 0, Tukey 30). The summary JSON
+times every step per product (`"<product>: <step>"`).
+
 The geometry follows the orca tiers (`bands.py`): 18-36 MHz 1507 px at 0.0767 deg, 41-59 MHz
 2357 px at 0.049 deg, 64-82 MHz 3122 px at 0.037 deg; as in WSClean, odd sizes are rounded up
 to even (2357 -> 2358).
@@ -197,7 +220,9 @@ because cuFINUFFT spreads with atomic additions.
 * No primary-beam correction and no dewarping; outputs correspond to WSClean `-image` files.
 * Only the orca deep configuration (Briggs 0, inner Tukey 30 lambda, multiscale bias 0.8,
   auto-mask 3 / auto-threshold 0.5, 1 h and 10 min) and the snapshot configuration are
-  validated. Other robust values and `-no-taper` should work but are not validated.
+  validated against WSClean. The robust -0.75 and no-taper presets use the same code paths
+  (the Briggs weights for robust -0.75 and no taper are unit-tested) but are not yet
+  compared with WSClean images.
 * The hour mode does not run AOFlagger on the concatenated hour; inputs are the peeled
   snapshots as they are (in the 2026-10-23 prototype test, skipping AOFlagger changed the
   1-h difference to the main pipeline from 0.111 to 0.114 sigma).
