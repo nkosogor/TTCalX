@@ -223,6 +223,25 @@ Also included:
 
 ## Sky and RFI peeling
 
+> **Different solver from the commands above.** `bin/ttcal_gpu.jl` (Usage section) uses the
+> original damped StefCal, the kernel sky model and the MS UVW, and peels sky sources only.
+> `bin/zest_sky_rfi.jl` below uses RK4 StefCal, the exact sky model, geometric UVW and a
+> divergence guard, and also peels near-field RFI emitters. Results differ between the two.
+
+```bash
+# Sky sources, then the RFI emitter (defaults: rk4, maxiter 5, tol 1e-4, minuvw 5, peeliter 3)
+julia bin/zest_sky_rfi.jl --column=DATA --rfi=sources/rfi_43.2_ver20251101.json sources.json *.ms
+
+# RFI as one more direction with the sky sources; regularised; diagonal Jones; on CPU threads
+julia bin/zest_sky_rfi.jl --rfi=rfi.json --rfi-mode=joint sources.json data.ms
+julia bin/zest_sky_rfi.jl --rfi=rfi.json --reg=0.5,0.5 sources.json data.ms
+julia bin/zest_sky_rfi.jl --peel --solver=damped --maxiter=30 sources.json data.ms
+julia -t 24 bin/zest_sky_rfi.jl --cpu --rfi=rfi.json sources.json data.ms
+```
+
+`--help` lists every option. The same in Julia: `zest_sky_rfi_ms!(ms, sky, rfi; kwargs...)`,
+or `zest_sky_rfi!` on visibilities already in memory. The building blocks:
+
 - Sky + RFI zesting that reproduces CPU TTCal, at a few seconds per snapshot on one GPU
   (about 50x faster than CPU TTCal).
 - Near-field RFI sources, peeled after the sky sources or jointly with them.
