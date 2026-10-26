@@ -29,6 +29,8 @@ TTCalX is an extended version of the previous TTCal package by Michael Eastwood 
   - [Batch Processing (Recommended)](#batch-processing-recommended)
 - [Tutorial](docs/TUTORIAL.md)
 - [Source File Format](#source-file-format)
+- [Sky and RFI peeling](#sky-and-rfi-peeling)
+- [Tests](#tests)
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
   - [CUDA not found](#cuda-not-found)
@@ -215,6 +217,104 @@ julia bin/ttcal_gpu.jl peel sources.json /path/to/*.ms
 ## Source File Format
 
 The sources file is a JSON array of source objects (see [sources.json](sources.json) in this repo).
+Also included:
+- [sources/sources_7src_tauA.json](sources/sources_7src_tauA.json): Cyg A, Cas A, Tau A, Vir A, Her A, Hya A, Per B
+- [sources/rfi_43.2_ver20251101.json](sources/rfi_43.2_ver20251101.json): near-field RFI model
+
+## Sky and RFI peeling
+
+> **Different solver from the commands above.** `bin/ttcal_gpu.jl` (Usage section) uses the
+> original damped StefCal, the kernel sky model and the MS UVW, and peels sky sources only.
+> `bin/zest_sky_rfi.jl` below uses RK4 StefCal, the exact sky model, geometric UVW and a
+> divergence guard, and also peels near-field RFI emitters. Results differ between the two.
+
+```bash
+# Sky sources, then the RFI emitter (defaults: rk4, maxiter 5, tol 1e-4, minuvw 5, peeliter 3)
+julia bin/zest_sky_rfi.jl --column=DATA --rfi=sources/rfi_43.2_ver20251101.json sources.json *.ms
+
+# RFI as one more direction with the sky sources; regularised; diagonal Jones; on CPU threads
+julia bin/zest_sky_rfi.jl --rfi=rfi.json --rfi-mode=joint sources.json data.ms
+julia bin/zest_sky_rfi.jl --rfi=rfi.json --reg=0.5,0.5 sources.json data.ms
+julia bin/zest_sky_rfi.jl --peel --solver=damped --maxiter=30 sources.json data.ms
+julia -t 24 bin/zest_sky_rfi.jl --cpu --rfi=rfi.json sources.json data.ms
+```
+
+`--help` lists every option. The same in Julia: `zest_sky_rfi_ms!(ms, sky, rfi; kwargs...)`,
+or `zest_sky_rfi!` on visibilities already in memory. The building blocks:
+
+- Sky + RFI zesting that reproduces CPU TTCal, at a few seconds per snapshot on one GPU
+  (about 50x faster than CPU TTCal).
+- Near-field RFI sources, peeled after the sky sources or jointly with them.
+- Optional regularised (Tukey phase-prior) peeling; it stabilises joint RFI solves when Cas A is low.
+- Runs on CPU threads too (`julia -t N`), with the same results as the GPU.
+- Divergence guards: `flag_zero_visibilities!` (all-zero samples) and `guarded_zest!`, CPU TTCal's
+  peel loop that keeps a new solution only if it lowers the residual power.
+- Recommended settings: `solver=:rk4, maxiter=5, tolerance=1e-4, minuvw=5`, exact model,
+  `geometric_uvw!`, model flags copied from the data.
+
+| Piece | What it does |
+|---|---|
+| `geometric_uvw!(meta, ms_mjd(ms))` | Replaces the MS UVW (OVRO-LWA: r₁−r₂, unprecessed) with precessed ITRF baselines, so the far-field model follows the apparent sky as in CPU TTCal |
+| `genvis_exact!(vis, meta, source, mjd)` | CPU TTCal's sky model: per-component horizon, 3-D Gaussian projection on the local north/east axes, `xy = U − iV` |
+| `GPURFISource` (JSON entries with `rfi-frequencies`) | Near-field RFI emitter, as ttcal_dev's `RFISource`; model via `gpu_genvis!` |
+| `solve_gains!(cal, data, model, meta; solver=:rk4)` | CPU TTCal's solver (RK4 of the StefCal step, per-channel convergence); `solver=:damped` is `gpu_stefcal!`'s iteration; optional Tukey phase prior `reg=phase_regularization(...)` |
+| Host arrays (`read_ms_to_gpu(ms; gpu=false)`) | The same operations on CPU threads (`julia -t N`), same results as the GPU |
+| `read_ms_fast` / `write_ms_fast!` | Same results as `read_ms_to_gpu` / `write_gpu_to_ms!`, with the row gather/scatter in numpy |
+
+A zest of one source with CPU TTCal's settings:
+
+```julia
+vis, _, meta, bl, nrows = read_ms_fast(ms)
+mjd = ms_mjd(ms)
+geometric_uvw!(meta, mjd)
+model = GPUVisibilities(meta.Nbase, meta.Nfreq)
+genvis_exact!(model, meta, source, mjd)
+model.flags .= vis.flags                       # flagged data out of both sides of the solve
+cal = calibration_type(GPUZestingSource(source), meta.Nant, meta.Nfreq)
+solve_gains!(cal, vis, model, meta; solver=:rk4, maxiter=5, tolerance=1e-4, minuvw=5.0)
+gpu_corrupt!(model, cal, meta)
+gpu_subsrc!(vis, model)
+write_ms_fast!(ms, vis, bl, nrows)
+```
+
+Variations (same steps, change one line):
+
+```julia
+# Damped solver (gpu_stefcal!'s iteration) instead of RK4
+solve_gains!(cal, vis, model, meta; solver=:damped, maxiter=30, tolerance=1e-2, minuvw=5.0)
+
+# Regularised peeling: Tukey phase prior allowing ~0.5 deg position error, tapering over 0.5 deg
+reg = phase_regularization(meta, 0.5, 0.5; lambda=1.0)
+solve_gains!(cal, vis, model, meta; solver=:rk4, maxiter=5, tolerance=1e-4, minuvw=5.0, reg=reg)
+
+# Diagonal gains (peel) instead of full Jones (zest)
+cal = calibration_type(GPUPeelingSource(source), meta.Nant, meta.Nfreq)
+
+# RFI emitter: sources.json entries with "rfi-frequencies" come back as GPURFISource
+sources = read_gpu_sources("sources_with_rfi.json")
+rfi = first(filter(is_rfi, sources))
+gpu_genvis!(model, meta, rfi, meta.phase_center_ra, meta.phase_center_dec, 0.0)
+# ...then solve/corrupt/subtract as above: after the sky sources,
+#    or as one more direction in the same peel loop (joint).
+
+# CPU threads instead of the GPU (run with julia -t 24)
+vis, _, meta, bl, nrows = read_ms_fast(ms; gpu=false)
+model = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=false)
+cal = calibration_type(GPUZestingSource(source), meta.Nant, meta.Nfreq; gpu=false)
+```
+
+**Behaviour changes for all callers** (`sources.jl`):
+- `GPUPowerLaw` uses TTCal's base-10 logs. Natural logs agreed only for single-index
+  spectra, so curved spectra such as Cyg A's were several times too faint.
+- Source JSON entries with `rfi-frequencies` are now read as `GPURFISource` (near-field
+  RFI emitters) instead of failing to parse.
+
+## Tests
+
+```bash
+julia --project=. -t 4 test/runtests.jl     # unit tests (CPU; GPU checks run if CUDA works)
+julia --project=. test/quick_test.jl        # end-to-end smoke test on the example MS
+```
 
 ## Project Structure
 
@@ -229,6 +329,13 @@ TTCalX/
 │       ├── sources.jl            # Source models
 │       ├── peel_gpu.jl           # Peeling implementation
 │       ├── pycall_ms_bridge.jl   # MS I/O via python-casacore
+│       ├── geometry.jl           # Precession/nutation/GAST, geometric UVW
+│       ├── rfi.jl                # Near-field RFI sources
+│       ├── genvis_exact.jl       # CPU-TTCal-exact sky model (GPU kernel + host threads)
+│       ├── regularization.jl     # Tukey phase prior
+│       ├── solver.jl             # solve_gains!: RK4 / damped StefCal, GPU + host
+│       ├── host_backend.jl       # Multithreaded CPU versions of the peel operations
+│       ├── ms_io.jl              # Faster MS read/write, ms_mjd
 │       ├── memory.jl             # Memory utilities
 │       ├── logging.jl            # Progress bars & verbosity
 │       └── kernels/              # CUDA kernels
@@ -236,6 +343,9 @@ TTCalX/
 │           ├── stefcal.jl
 │           ├── corrupt.jl
 │           └── genvis.jl
+├── test/
+│   ├── runtests.jl               # Unit tests
+│   └── quick_test.jl             # Smoke test on the example MS
 ├── examples/
 │   ├── sources.json              # Example sources file
 │   └── 20240524_090003_73MHz_ch0to5.ms  # Test dataset (6 ch, ~22 MB)

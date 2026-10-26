@@ -48,6 +48,18 @@ export Nbase, Nfreq, Nant
 export read_ms_to_gpu, write_gpu_to_ms!
 export init_pycasacore
 
+# CPU-TTCal-matched zesting: geometry, exact sky model, near-field RFI sources,
+# RK4/damped solvers with an optional phase prior, host backend, fast MS I/O
+export SPEED_OF_LIGHT, j2000_to_itrf_matrix, uvw_geometry, geometric_uvw!, ms_mjd
+export GPURFISource, GPURFISpectrum, is_rfi, wgs84_to_itrf
+export genvis_exact!, exact_model_tables
+export PhaseRegularization, phase_regularization, regularized_fraction, antenna_planar_distances
+export tukey_prior, regularize_element
+export mask_short_baselines!, stefcal_steps!, solve_gains!, host_makesquare!
+export read_ms_fast, write_ms_fast!
+export residual_power, flag_zero_visibilities!, max_gain_amplitude, guarded_zest!
+export source_elevation_deg, zest_sky_rfi!, zest_sky_rfi_ms!
+
 # Export logging utilities
 export set_verbosity, get_verbosity, is_quiet, is_verbose, is_normal
 export ProgressBar, update!, finish!
@@ -66,6 +78,15 @@ include("gpu/kernels/genvis.jl")
 include("gpu/sources.jl")
 include("gpu/peel_gpu.jl")
 include("gpu/pycall_ms_bridge.jl")
+include("gpu/geometry.jl")
+include("gpu/rfi.jl")
+include("gpu/genvis_exact.jl")
+include("gpu/regularization.jl")
+include("gpu/host_backend.jl")
+include("gpu/solver.jl")
+include("gpu/ms_io.jl")
+include("gpu/guard.jl")
+include("gpu/sky_rfi.jl")
 
 """
     is_gpu_available()

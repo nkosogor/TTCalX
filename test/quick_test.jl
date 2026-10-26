@@ -46,7 +46,7 @@ Nrows = 0
     include(joinpath(PROJECT_ROOT, "src", "TTCalX.jl"))
     using .TTCalX
 
-    @test !is_gpu_available()  || @info "GPU is available (unexpected in CI, but OK)"
+    is_gpu_available() && @info "GPU is available (unexpected in CI, but OK)"
     backend = get_gpu_backend()
     @test backend in (:cpu, :cuda)
     println("  Backend: $backend")
