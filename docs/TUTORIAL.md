@@ -5,6 +5,7 @@ A detailed walkthrough of using TTCalX for direction-dependent calibration, from
 ## Table of Contents
 
 - [Quick Test (Example Dataset)](#quick-test-example-dataset)
+  - [Sky + RFI peeling (newer solver)](#sky--rfi-peeling-newer-solver)
 - [Full Workflow on Calim (Single MS)](#full-workflow-on-calim-single-ms)
   - [Step 1: Copy data to working directory](#step-1-copy-data-to-working-directory)
   - [Step 2: Apply bandpass and delay calibration](#step-2-apply-bandpass-and-delay-calibration)
@@ -68,6 +69,22 @@ wsclean(
     mem_gb=50,
 )
 ```
+
+### Sky + RFI peeling (newer solver)
+
+`bin/zest_sky_rfi.jl` peels the sky sources and then the RFI emitter with the newer solver
+(RK4 StefCal, exact sky model, divergence guard; see the README's "Sky and RFI peeling"):
+
+```bash
+T=/opt/devel/nkosogor/nkosogor/TTCalX
+cp -r $T/examples/20240524_090003_73MHz_ch0to5.ms test_skyrfi.ms
+julia --project=$T $T/bin/zest_sky_rfi.jl --column=DATA \
+    --rfi=$T/sources/rfi_43.2_ver20251101.json $T/sources.json test_skyrfi.ms
+```
+
+Add `--rfi-mode=joint` to peel the RFI together with the sky sources, `--reg=0.5,0.5` for
+regularised peeling, `--cpu` (with `julia -t 24`) to run without a GPU; `--help` lists all options.
+Image `test_skyrfi.ms` as above.
 
 ---
 

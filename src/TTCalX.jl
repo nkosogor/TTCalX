@@ -57,6 +57,8 @@ export PhaseRegularization, phase_regularization, regularized_fraction, antenna_
 export tukey_prior, regularize_element
 export mask_short_baselines!, stefcal_steps!, solve_gains!, host_makesquare!
 export read_ms_fast, write_ms_fast!
+export residual_power, flag_zero_visibilities!, max_gain_amplitude, guarded_zest!
+export source_elevation_deg, zest_sky_rfi!, zest_sky_rfi_ms!
 
 # Export logging utilities
 export set_verbosity, get_verbosity, is_quiet, is_verbose, is_normal
@@ -83,6 +85,8 @@ include("gpu/regularization.jl")
 include("gpu/host_backend.jl")
 include("gpu/solver.jl")
 include("gpu/ms_io.jl")
+include("gpu/guard.jl")
+include("gpu/sky_rfi.jl")
 
 """
     is_gpu_available()
