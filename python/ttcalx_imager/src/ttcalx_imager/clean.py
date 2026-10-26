@@ -288,13 +288,17 @@ def shape_kernel(N, scale):
 
 class MultiScaleClean:
     """Scales 0 and 4 x theoretical beam, doubling up to N/2 (radler defaults).  Scale choice:
-    argmax_s max|S_s * R| * fac * bias^-s (bias = scale_bias^-index, favours large scales);
-    sub-minor loop = Hogbom on the candidate set of that scale with the twice-convolved PSF
-    S_s * S_s * PSF, then exact FFT update of the full residual with S_s * PSF."""
+    argmax_s max|S_s * R| * fac * bias_s with bias_s = scale_bias^-log2(s / s_1) (radler: 1 for
+    scale 0 and the first non-zero scale s_1, favours large scales); components of scale s stay
+    ceil(s / 2) px from the image edge (radler's scale border); sub-minor loop = Hogbom on the
+    candidate set of that scale with the twice-convolved PSF S_s * S_s * PSF, then exact FFT update
+    of the full residual with S_s * PSF.  A cycle that raises the peak above divergence_limit x the
+    loop's first peak is undone and ends the loop (radler -divergence-limit, default 4)."""
 
     def __init__(self, psf, N, scale_deg, theo_pix, beam=None, scale_bias=0.8, gain=0.1, horizon_deg=10.0,
-                 kmax=60000, max_scale_frac=0.5, multiscale=True, max_scales=0, log=None):
+                 kmax=60000, max_scale_frac=0.5, multiscale=True, max_scales=0, divergence_limit=4.0, log=None):
         self.N = N; self.sdeg = scale_deg; self.gain = gain; self.kmax = kmax
+        self.divergence_limit = divergence_limit; self.diverged = False
         self.log = log or (lambda *a: None)
         self.psf = cp.asarray(psf, dtype=cp.float32)
         self.beam = tuple(beam) if beam is not None else fit_beam(self.psf, scale_deg, theo_pix)
@@ -310,9 +314,11 @@ class MultiScaleClean:
         self.scales = scales
         self.C = Convolver(N, N, extra=2)
         Kpsf = self.C.kfft(self.psf)
-        self.KS, self.KP, self.Pss, self.pss0, self.bias = [], [], [], [], []
+        self.KS, self.KP, self.Pss, self.pss0, self.bias, self.edge = [], [], [], [], [], []
         c = N // 2
         for k, s in enumerate(scales):
+            e = int(math.ceil(0.5 * s)); m = cp.zeros((N, N), bool); m[e:N - e, e:N - e] = True
+            self.edge.append(m)
             KS = self.C.kfft(shape_kernel(N, s))
             KP = KS * Kpsf
             delta = cp.zeros((N, N), cp.float32); delta[c, c] = 1
@@ -321,7 +327,7 @@ class MultiScaleClean:
             self.KS.append(KS); self.KP.append(KP)
             self.pss0.append(float(Pss_img[c, c]))
             self.Pss.append((Pss_img / float(Pss_img[c, c])).astype(cp.float32))
-            self.bias.append((1.0 / scale_bias) ** k)
+            self.bias.append(1.0 if s == 0 else (1.0 / scale_bias) ** math.log2(s / scales[1]))
         self.frac = []          # Clark fraction per scale: peak sidelobe of the normalised P_ss
         for k, s in enumerate(scales):
             q = cp.abs(self.Pss[k]).copy()
@@ -341,14 +347,25 @@ class MultiScaleClean:
         N = self.N; nit = niter_done; ncyc = 0
         if comp_masks is None:
             comp_masks = [cp.zeros((N, N), bool) for _ in self.scales]
-        allow = [self.mask if scale_masks is None else (self.mask & scale_masks[k]) for k in range(len(self.scales))]
+        allow = [(self.mask if scale_masks is None else (self.mask & scale_masks[k])) & self.edge[k]
+                 for k in range(len(self.scales))]
         per_scale = [0] * len(self.scales)
+        first = None
         while nit < maxiter and ncyc < max_cycles:
             Rs = self.scale_images(R)
             absf = [cp.where(allow[k], cp.abs(Rs[k]) * fac, 0) for k in range(len(self.scales))]
             pk = [float(a.max()) for a in absf]
             score = [pk[k] * self.bias[k] for k in range(len(self.scales))]
             k = int(np.argmax(score))
+            if first is None:
+                first = score[k]
+            elif self.divergence_limit and score[k] > self.divergence_limit * first:
+                # the last cycle made things worse: undo it and stop (radler "divergence")
+                M[...] = M_last; R = R_last; self.diverged = True
+                nit -= n_last; per_scale[k_last] -= n_last
+                self.log(f"   minor: diverging (peak {score[k]:.4g} > {self.divergence_limit:g} x {first:.4g}); "
+                         f"last cycle undone")
+                break
             if score[k] < stop:
                 break
             t = max(stop / self.bias[k], pk[k] * self.frac[k])
@@ -361,6 +378,8 @@ class MultiScaleClean:
                                        t / self.pss0[k], maxiter - nit)
             if n == 0:
                 break
+            if self.divergence_limit:
+                M_last, R_last, n_last, k_last = M.copy(), R, n, k
             nit += n; ncyc += 1; per_scale[k] += n
             dm = cp.zeros((N, N), cp.float32); dm[ys, xs] = comp
             comp_masks[k] |= dm != 0
@@ -395,6 +414,7 @@ def deconvolve_multiscale(dirty, psf, scale_deg, theo_pix, params, residual_fn=N
     # pixels above the horizon (r < 1), the region of the MAD noise estimate (as clean_snapshot)
     above = horizon_mask(N, scale_deg, 0.0)
     R = dirty.copy(); M = cp.zeros((N, N), cp.float32)
+    div = getattr(params, "divergence_limit", 4.0); D.divergence_limit = div; raw_prev = None
     # auto_mask = 0: no auto-mask phase (phase 2 from the start, unmasked); the stopping threshold
     # is max(threshold, auto_threshold * sigma) as WSClean's -threshold / -auto-threshold
     nit = 0; phase = 1 if params.auto_mask else 2; masks = None; comp_masks = None; nmajor = 0
@@ -420,6 +440,14 @@ def deconvolve_multiscale(dirty, psf, scale_deg, theo_pix, params, residual_fn=N
         thr = max(params.threshold, (params.auto_mask if phase == 1 else params.auto_threshold) * sigma)
         stop = max(thr, (1 - params.mgain) * peak) if residual_fn is not None else thr
         log(f" major {nmajor}: peak {peak:.4g} sigma {sigma:.4g} phase {phase} stop {stop:.4g}")
+        raw = float(cp.where(sky, cp.abs(R), 0).max())
+        if div and raw_prev is not None and raw > div * raw_prev:
+            # the last major cycle raised the (unweighted) peak: keep the model before it and stop
+            log(f"  diverged in major {nmajor}: peak |R| {raw:.4g} > {div:g} x {raw_prev:.4g}; "
+                f"reverting to the previous model and stopping")
+            M, R = M_prev, R_prev; info["diverged"] = True
+            break
+        raw_prev = raw if raw_prev is None else min(raw_prev, raw)
         info["majors"].append(dict(peak=peak, sigma=sigma, phase=phase, stop=stop, nit=nit))
         if peak < thr and phase == 2:
             break
@@ -438,6 +466,9 @@ def deconvolve_multiscale(dirty, psf, scale_deg, theo_pix, params, residual_fn=N
             # last finite model and stop instead of writing NaN images
             log(f"  diverged in major {nmajor}: reverting to the previous model and stopping")
             M, R = M_prev, R_prev; info["diverged"] = True
+            break
+        if D.diverged:
+            info["diverged"] = True
             break
         if did == 0 and phase == 2:
             break
