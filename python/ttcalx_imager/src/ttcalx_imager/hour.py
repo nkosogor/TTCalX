@@ -38,7 +38,7 @@ from .fits import make_header, write_image
 from .gridder import SampleSet, get_svd, to_ws
 from .msio import load_samples
 from .qa import qa_reject
-from .reproject import Reprojector, fft_upsample
+from .reproject import Reprojector, fft_upsample, prefilter
 from .rotate import rotate_samples
 from .weights import WeightGrid
 
@@ -80,6 +80,7 @@ class HourGrid:
                  chunk_pts=40_000_000, rotate=True, weights=None, need_svd=True, log=None):
         self.snaps = snaps; self.N = N; self.sdeg = scale_deg; self.sc = math.radians(scale_deg)
         self.eps = eps; self.chunk_pts = chunk_pts; self.rotate = rotate
+        self._cache = {}
         log = log or (lambda *a: None)
         t0 = time.perf_counter()
 
@@ -144,14 +145,68 @@ class HourGrid:
         return cp.exp(2j * np.pi * (wh - w)).astype(cp.complex64)
 
     def _chunk(self, ids, col):
-        cat = lambda k: np.concatenate([self.snaps[i][k] for i in ids])
+        """(SampleSet, rotated visibilities of ``col``) of the snapshots ``ids``.
+
+        Chunk cache (env TTCALX_CHUNK_CACHE = auto (default) | device | host | off): the dirty
+        image, the PSF, every major cycle and V of one interval re-use the same samples, so the
+        first call keeps them -- on the GPU (rotated, folded SampleSet + rotated I + unrotated w,
+        ~29 B/sample) if that leaves TTCALX_CACHE_MARGIN_GB (default 5) free, else the host-side
+        concatenations (no repeated np.concatenate, ~1.3 s per call for 60 snapshots at 55 MHz).
+        The arrays and operations are the same as without the cache (bit-identical images)."""
+        mode = os.environ.get("TTCALX_CHUNK_CACHE", "auto")
+        key = tuple(ids)
+        c = self._cache.get(key) if mode != "off" else None
+        if c is not None and "S" in c:                       # device cache
+            S = c["S"]
+            if col in c["vis"]:
+                return S, c["vis"][col]
+            if not col:
+                return S, None
+            if col == "PSF":
+                vis = cp.concatenate([self._psf_vis(i) for i in ids])
+            else:
+                vis = cp.asarray(np.concatenate([self.snaps[i][col] for i in ids]))
+            if self.rotate:      # rotate_samples: vis * exp(2 pi i (w - w')), w' = unfolded S.w
+                wn = cp.where(S.flip, -S.w, S.w)
+                vis = vis * cp.exp(2j * np.pi * (c["w0"] - wn)).astype(vis.dtype)
+            return S, vis
+        if c is not None:                                    # host cache
+            hc = c["host"]
+            cat = lambda k: hc[k] if k in hc else np.concatenate([self.snaps[i][k] for i in ids])
+        else:
+            hc = {}
+            cat = lambda k: hc.setdefault(k, np.concatenate([self.snaps[i][k] for i in ids])) \
+                if k in ("u", "v", "w", "I") else np.concatenate([self.snaps[i][k] for i in ids])
         if col == "PSF":
             vis = cp.concatenate([self._psf_vis(i) for i in ids])
         else:
             vis = cp.asarray(cat(col)) if col else None
-        u, v, w, vis = self._rot(ids, cp.asarray(cat("u")), cp.asarray(cat("v")), cp.asarray(cat("w")), vis)
-        wt = cp.asarray(np.concatenate([self.iw[i] for i in ids]))
-        return SampleSet(u, v, w, wt, self.N, self.sc, svd=self.svd, eps=self.eps, precompute=False), vis
+        w0 = cp.asarray(cat("w"))
+        u, v, w, vis = self._rot(ids, cp.asarray(cat("u")), cp.asarray(cat("v")), w0, vis)
+        if "wt" not in hc:
+            hc["wt"] = np.concatenate([self.iw[i] for i in ids])
+        wt = cp.asarray(hc["wt"])
+        S = SampleSet(u, v, w, wt, self.N, self.sc, svd=self.svd, eps=self.eps, precompute=False)
+        if mode != "off" and c is None:
+            npts = int(S.npts)
+            need = npts * (S.x.itemsize + S.y.itemsize + S.w.itemsize + S.wt.itemsize + 1 + w0.itemsize + 8)
+            pool = cp.get_default_memory_pool()
+            free = cp.cuda.runtime.memGetInfo()[0] + pool.total_bytes() - pool.used_bytes()
+            margin = float(os.environ.get("TTCALX_CACHE_MARGIN_GB", "5")) * 1e9
+            if mode == "device" or (mode == "auto" and free - need > margin):
+                d = dict(S=S, w0=w0, vis={})
+                if col == "I":
+                    d["vis"]["I"] = vis
+                elif "I" in self.snaps[ids[0]]:
+                    vi = cp.asarray(cat("I"))
+                    if self.rotate:
+                        wn = cp.where(S.flip, -S.w, S.w)
+                        vi = vi * cp.exp(2j * np.pi * (w0 - wn)).astype(vi.dtype)
+                    d["vis"]["I"] = vi
+                self._cache[key] = d
+            else:
+                self._cache[key] = dict(host=hc)
+        return S, vis
 
     def image(self, col="I", model=None, psf=False, ids=None):
         """Weighted dirty (model=None) or residual image / sum of weights, WSClean orientation.
@@ -203,12 +258,12 @@ class WSnap:
 
     def image(self, col="I", model=None):
         acc = cp.zeros((self.N, self.N), cp.float32); wsum = 0.0
-        Mb = self._bandlimit(model) if model is not None else None
+        Mb = prefilter(self._bandlimit(model), self.order) if model is not None else None
         for g, R in zip(self.sub, self.Rb):
             ms = None
             if Mb is not None:
                 co = self.P.coords(R.T)                       # block pixel -> hour-frame position
-                ms, _ = self.P(Mb, None, self.order, coords=co, up=self.up)
+                ms, _ = self.P(Mb, None, self.order, coords=co, up=self.up, prefiltered=True)
                 ms = ms * (co[2] / cp.maximum(self.P.n, 1e-6))  # model Jacobian n_hour / n_block
             d = g.image(col, model=ms)
             r, _ = self.P(d, R, self.order)
@@ -269,6 +324,13 @@ def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, b
         cp.cuda.Device().synchronize(); now = time.perf_counter(); T[k] = T.get(k, 0) + now - last[0]; last[0] = now
 
     products = [_as_product(p, pols) for p in products]
+    # cuFFT plans: every interval of every product uses the same few sizes (deconvolution P x P
+    # r2c/c2r, the scale-image size, the 2x model upsampling), and creating one costs ~0.25 s
+    # (~2-3 s per interval).  Keep them across intervals, in an LRU plan cache capped at
+    # TTCALX_FFT_PLAN_CACHE_GB (default 1.5); TTCALX_KEEP_FFT_PLANS=0: clear after every interval.
+    keep_plans = os.environ.get("TTCALX_KEEP_FFT_PLANS", "1") == "1"
+    if keep_plans:
+        cp.fft.config.get_plan_cache().set_memsize(int(float(os.environ.get("TTCALX_FFT_PLAN_CACHE_GB", "1.5")) * 1e9))
     want_v = any(p.v_tag for p in products)
     N, sdeg = bands.geometry(band)
     ra, dec = parse_phase_centre(phase_centre) if phase_centre else middle_zenith(paths)
@@ -353,7 +415,8 @@ def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, b
             if mode == "wsnap":
                 del W
             gc.collect()
-            cp.fft.config.get_plan_cache().clear()
+            if not keep_plans:
+                cp.fft.config.get_plan_cache().clear()
             cp.get_default_memory_pool().free_all_blocks()
         summary["products"][key] = outs
         if prod.image_i and prod.v_tag and prod.naming == "orca":

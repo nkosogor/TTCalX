@@ -31,6 +31,25 @@ def cmd_snapshot(a):
     im = SnapshotImager(eps=a.eps, svd_tol=a.svd_tol, dft_max=a.dft_max, verbose=a.verbose)
     os.makedirs(a.out_dir, exist_ok=True)
     rc = 0
+    if not a.no_pipeline:
+        reqs = []
+        for ms in _read_list(a.ms):
+            prefix = os.path.join(a.out_dir, os.path.basename(ms.rstrip("/")).rsplit(".ms", 1)[0])
+            if a.skip_existing and os.path.exists(f"{prefix}-qa.json"):
+                continue
+            kw = dict(N=a.size, scale_deg=a.scale) if a.size else dict(band=a.band or ms)
+            reqs.append(dict(ms_path=ms, out_prefix=prefix, pols=a.pols, params=params, beam=_beam(a.beam),
+                             write_aux=a.keep_aux, write_dirty=a.write_dirty, write_psf=a.write_psf, **kw))
+        for rq, info in zip(reqs, im.image_many(reqs, free_pool=False)):
+            stem = os.path.basename(rq["out_prefix"])
+            if info["status"] == "error":
+                rc = 1
+                print(json.dumps(dict(stem=stem, status="error", error=info.get("error"))), flush=True)
+            else:
+                print(json.dumps(dict(stem=stem, status=info["status"], beam=info.get("beam"), niter=info.get("niter"),
+                                      V_rms_box=info.get("V_rms_box"), total_s=info["timing"]["TOTAL"]), default=float),
+                      flush=True)
+        return rc
     for ms in _read_list(a.ms):
         stem = os.path.basename(ms.rstrip("/")).rsplit(".ms", 1)[0]
         prefix = os.path.join(a.out_dir, stem)
@@ -84,6 +103,8 @@ def main(argv=None):
     s.add_argument("--write-psf", action="store_true")
     s.add_argument("--beam", help="fixed restoring beam BMAJ,BMIN,BPA [deg] instead of the fit")
     s.add_argument("--skip-existing", action="store_true")
+    s.add_argument("--no-pipeline", action="store_true",
+                   help="image one MS at a time (default: read the next MS / write FITS while the GPU works)")
     s.add_argument("--eps", type=float, default=1e-4, help="cuFINUFFT tolerance")
     s.add_argument("--svd-tol", type=float, default=1e-4, help="w-term factorisation tolerance")
     s.add_argument("--dft-max", type=int, default=8000, help="max model components for DFT predict")

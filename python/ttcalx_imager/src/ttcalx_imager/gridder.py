@@ -40,34 +40,125 @@ def from_ws(img):
     return img[(n - cp.arange(n)) % n, :].T
 
 
-_re_mul = cp.ElementwiseKernel("complex64 f, complex64 b", "float32 o",
-                               "o = f.real() * b.real() - f.imag() * b.imag()", "re_mul")
-
-
 # ----------------------------------------------------------------------------- w-term factorisation
-class SvdWTerm:
-    """exp(-2 pi i w x') ~= sum_k a_k(w) b_k(x'),  w in [0, wmax], x' in [-1/2, 1/2]."""
+# The factorisation is kept compact: per w-range only the 1-D tables a_k(w) (nw points) and
+# b_k(x') (nx points), ~0.2 MB on the host; per image geometry one float32 x'(l, m) image and the
+# horizon mask.  b_k(l, m) = interp(x'(l, m), b_k) is evaluated on the fly inside the gridding
+# kernels (equal to the former cp.interp(...).astype(complex64) tables to float32 rounding), so no K x N x N
+# complex64 table is held (0.6 GB at 82 MHz, K = 8; 37 x N^2 for the hour frame).
+# Both caches survive _SVD_CACHE.clear() (the snapshot daemon clears that every snapshot).
 
-    def __init__(self, N, scale_rad, wmax, tol=1e-4, nw=800, nx=2001, rmax=1.0):
-        wg = np.linspace(0, wmax, nw); xg = np.linspace(-0.5, 0.5, nx)
-        M = np.exp(-2j * np.pi * np.outer(wg, xg))
+_FACTOR_CACHE = {}      # (wmax, tol, nw, nx) -> (K, wg, A [nw, K] complex128, Vh [K, nx] complex128)
+_FACTOR_CACHE_MAX = 512
+_GEOM_CACHE = {}        # (N, scale_rad, rmax, nx) -> (inside, x', cell j int16, fraction t float32)
+_GEOM_CACHE_MAX = 4
+SVD_METHOD = "gram"     # "gram" (top eigenpairs of M M^H, 2-4x faster, same K) or "lapack" (np.linalg.svd)
+
+
+def _svd_factors(wmax, tol, nw, nx, method=None):
+    """Truncated factorisation exp(-2 pi i w x') ~= sum_{k<K} A[:, k](w) Vh[k](x') on the (w, x') grid,
+    K = smallest rank with max |M - A_K Vh_K| < tol (as before).  Cached (compact, host)."""
+    method = method or SVD_METHOD
+    key = (float(wmax), float(tol), int(nw), int(nx), method)
+    hit = _FACTOR_CACHE.get(key)
+    if hit is not None:
+        return hit
+    wg = np.linspace(0, wmax, nw); xg = np.linspace(-0.5, 0.5, nx)
+    M = np.exp(-2j * np.pi * np.outer(wg, xg))
+    res = None
+    if method == "gram":
+        # M M^H = U S^2 U^H; the leading singular triplets from its top eigenpairs.  The singular
+        # values agree with LAPACK's SVD to ~1e-11 S_0 (the w-term needs S_K / S_0 ~ 1e-5).
+        import scipy.linalg as sla
+        kmax = min(nw, 96)
+        G = M @ M.conj().T
+        ev, U = sla.eigh(G, subset_by_index=[nw - kmax, nw - 1], driver="evr")
+        ev = ev[::-1]; U = U[:, ::-1]
+        S = np.sqrt(np.maximum(ev, 0.0))
+        P = U.conj().T @ M                         # = S Vh
+        R = M.copy()
+        for K in range(1, kmax + 1):
+            R -= np.outer(U[:, K - 1], P[K - 1])
+            if np.abs(R).max() < tol:
+                A = U[:, :K] * S[:K]
+                Vh = P[:K] / S[:K, None]
+                res = (K, wg, A, Vh)
+                break
+    if res is None:                                # lapack, or rank above kmax
         U, S, Vh = np.linalg.svd(M, full_matrices=False)
         K = 1
         while K < len(S) and np.abs(M - (U[:, :K] * S[:K]) @ Vh[:K]).max() >= tol:
             K += 1
-        self.K = K; self.wmax = wmax
-        self.wg = cp.asarray(wg, dtype=cp.float32)
-        A = U[:, :K] * S[:K]
-        self.Ar = [cp.asarray(A[:, k].real, dtype=cp.float32) for k in range(K)]
-        self.Ai = [cp.asarray(A[:, k].imag, dtype=cp.float32) for k in range(K)]
+        res = (K, wg, U[:, :K] * S[:K], Vh[:K].copy())
+    if len(_FACTOR_CACHE) >= _FACTOR_CACHE_MAX:
+        _FACTOR_CACHE.pop(next(iter(_FACTOR_CACHE)))
+    _FACTOR_CACHE[key] = res
+    return res
+
+
+def _geometry(N, scale_rad, rmax=1.0, nx=2001):
+    """Per image geometry (raw orientation, cached): inside [N, N] bool, x' = n - 1/2 float32 [N*N], and the
+    linear-interpolation cell j (int16) and fraction t (float32) of x' on the nx-point x' grid of b_k."""
+    key = (int(N), round(float(scale_rad), 15), float(rmax), int(nx))
+    hit = _GEOM_CACHE.get(key)
+    if hit is None:
         j = (cp.arange(N, dtype=cp.float64) - N // 2) * scale_rad
         r2 = j[:, None] ** 2 + j[None, :] ** 2
-        self.inside = r2 < rmax ** 2                       # raw orientation (symmetric anyway)
-        xp = (cp.where(self.inside, cp.sqrt(cp.maximum(1 - r2, 0)) - 1.0, 0.0) + 0.5).astype(cp.float32).ravel()
-        xgd = cp.asarray(xg, dtype=cp.float32)
-        self.b = [(cp.interp(xp, xgd, cp.asarray(Vh[k].real, dtype=cp.float32))
-                   + 1j * cp.interp(xp, xgd, cp.asarray(Vh[k].imag, dtype=cp.float32))).reshape(N, N).astype(cp.complex64)
-                  for k in range(K)]
+        inside = r2 < rmax ** 2                    # raw orientation (symmetric anyway)
+        xp = (cp.where(inside, cp.sqrt(cp.maximum(1 - r2, 0)) - 1.0, 0.0) + 0.5).astype(cp.float32).ravel()
+        del j, r2
+        xgd = cp.asarray(np.linspace(-0.5, 0.5, nx), dtype=cp.float32)
+        jj = cp.clip(cp.searchsorted(xgd, xp, side="right") - 1, 0, nx - 2)
+        t = ((xp.astype(cp.float64) - xgd[jj].astype(cp.float64))
+             / (xgd[jj + 1].astype(cp.float64) - xgd[jj].astype(cp.float64))).astype(cp.float32)
+        if len(_GEOM_CACHE) >= _GEOM_CACHE_MAX:
+            _GEOM_CACHE.pop(next(iter(_GEOM_CACHE)))
+        hit = _GEOM_CACHE[key] = (inside, xp, jj.astype(cp.int16), t)
+    return hit
+
+
+# b_k(l, m) = linear interpolation of the 1-D table b_k(x') at x'(l, m) (as the former cp.interp table,
+# to float32 rounding), evaluated inside the kernels from the cached cell index / fraction.
+_wgrid_acc = cp.ElementwiseKernel(
+    "complex64 f, int16 j, float32 t, raw float32 br, raw float32 bi", "float32 acc",
+    """const float b_re = br[j] + t * (br[j + 1] - br[j]), b_im = bi[j] + t * (bi[j + 1] - bi[j]);
+       const float o = f.real() * b_re - f.imag() * b_im;
+       acc = __fadd_rn(acc, o);""", "wgrid_acc")
+_wdegrid_in = cp.ElementwiseKernel(
+    "float32 m, int16 j, float32 t, raw float32 br, raw float32 bi", "complex64 out",
+    """const complex<float> b(br[j] + t * (br[j + 1] - br[j]), bi[j] + t * (bi[j + 1] - bi[j]));
+       out = complex<float>(m, 0.f) * conj(b);""", "wdegrid_in")
+
+
+class SvdWTerm:
+    """exp(-2 pi i w x') ~= sum_k a_k(w) b_k(x'),  w in [0, wmax], x' in [-1/2, 1/2]."""
+
+    def __init__(self, N, scale_rad, wmax, tol=1e-4, nw=800, nx=2001, rmax=1.0):
+        K, wg, A, Vh = _svd_factors(wmax, tol, nw, nx)
+        self.K = K; self.wmax = wmax; self.N = N; self.nx = nx
+        self.wg = cp.asarray(wg, dtype=cp.float32)
+        self.Ar = [cp.asarray(A[:, k].real, dtype=cp.float32) for k in range(K)]
+        self.Ai = [cp.asarray(A[:, k].imag, dtype=cp.float32) for k in range(K)]
+        self.inside, self.xp, self.jx, self.tx = _geometry(N, scale_rad, rmax, nx)
+        self.xgd = cp.asarray(np.linspace(-0.5, 0.5, nx), dtype=cp.float32)
+        self.Br = [cp.asarray(Vh[k].real, dtype=cp.float32) for k in range(K)]
+        self.Bi = [cp.asarray(Vh[k].imag, dtype=cp.float32) for k in range(K)]
+
+    @property
+    def b(self):
+        """Materialised b_k(l, m) images (compatibility / tests only: K x N x N complex64)."""
+        return [(cp.interp(self.xp, self.xgd, self.Br[k]) + 1j * cp.interp(self.xp, self.xgd, self.Bi[k]))
+                .reshape(self.N, self.N).astype(cp.complex64) for k in range(self.K)]
+
+    def acc_re(self, acc, f, k):
+        """acc += Re(f * b_k) (raw orientation, f complex64 [N, N])."""
+        _wgrid_acc(f.ravel(), self.jx, self.tx, self.Br[k], self.Bi[k], acc.ravel())
+
+    def model_conj_b(self, m, k):
+        """m * conj(b_k) as complex64 [N, N] (m float32 raw orientation)."""
+        out = cp.empty((self.N, self.N), cp.complex64)
+        _wdegrid_in(m.ravel(), self.jx, self.tx, self.Br[k], self.Bi[k], out.ravel())
+        return out
 
     def a(self, k, w):
         return (cp.interp(w, self.wg, self.Ar[k]) + 1j * cp.interp(w, self.wg, self.Ai[k])).astype(cp.complex64)
@@ -100,7 +191,7 @@ def get_plans(N, eps=1e-4):
 
 
 def clear_caches():
-    _SVD_CACHE.clear(); _PLAN_CACHE.clear()
+    _SVD_CACHE.clear(); _PLAN_CACHE.clear(); _FACTOR_CACHE.clear(); _GEOM_CACHE.clear()
 
 
 # ----------------------------------------------------------------------------- sample sets
@@ -110,9 +201,12 @@ class SampleSet:
     u, v, w: per-sample coordinates [lambda], either host float64 (numpy) or device float32
     (cupy); wt: imaging weights (float32, 0 = not used).  ``svd`` = None disables the w-term."""
 
-    def __init__(self, u, v, w, wt, N, scale_rad, svd=None, eps=1e-4, precompute=True):
+    def __init__(self, u, v, w, wt, N, scale_rad, svd=None, eps=1e-4, precompute=True, pre=None):
         self.N = N; self.sc = scale_rad; self.svd = svd
-        if isinstance(u, np.ndarray):
+        if pre is not None:             # host arrays of snapshot.prepare_samples (same values as below)
+            self.flip = cp.asarray(pre["flip"])
+            self.x = cp.asarray(pre["x"]); self.y = cp.asarray(pre["y"]); self.w = cp.asarray(pre["wfold"])
+        elif isinstance(u, np.ndarray):
             flip = w < 0
             s = np.where(flip, -1.0, 1.0)
             u, v, w = u * s, v * s, w * s
@@ -159,7 +253,7 @@ class SampleSet:
         acc = cp.zeros((self.N, self.N), cp.float32)
         for k in range(self.svd.K):
             f = self.plans[0].execute((c * self._ak(k)).astype(cp.complex64))
-            acc += _re_mul(f, self.svd.b[k])
+            self.svd.acc_re(acc, f, k)
         return cp.where(self.svd.inside, acc, 0)
 
     def grid_psf(self):
@@ -170,10 +264,10 @@ class SampleSet:
     def degrid(self, model_ws):
         """Predict (unfolded) visibilities of a WSClean-orientation model image [Jy/pixel]."""
         self._setpts(2)
-        m = cp.ascontiguousarray(from_ws(model_ws).astype(cp.complex64))
+        m = cp.ascontiguousarray(from_ws(model_ws).astype(cp.float32))
         q = cp.zeros(self.npts, cp.complex64)
         for k in range(self.svd.K):
-            q += cp.conj(self._ak(k)) * self.plans[1].execute(cp.ascontiguousarray(m * cp.conj(self.svd.b[k])))
+            q += cp.conj(self._ak(k)) * self.plans[1].execute(self.svd.model_conj_b(m, k))
         q *= cp.conj(self._eph())
         return cp.where(self.flip, cp.conj(q), q)
 

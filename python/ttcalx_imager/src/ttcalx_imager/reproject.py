@@ -44,15 +44,26 @@ class Reprojector:
         ok = self.inside & (ns > 0)
         return cp.stack([ys, xs]).astype(cp.float32), ok, ns
 
-    def __call__(self, img, R, order=3, coords=None, up=1):
-        """Resample source-frame img onto the target grid (zero outside the horizon)."""
+    def __call__(self, img, R, order=3, coords=None, up=1, prefiltered=False):
+        """Resample source-frame img onto the target grid (zero outside the horizon).
+        prefiltered=True: img is already prefilter(img, order) (the same source resampled
+        to several targets is spline-filtered once; identical result)."""
         if coords is None:
             coords = self.coords(R)
         yx, ok, _ = coords
         if up != 1:
             yx = yx * up
-        out = cnd.map_coordinates(img.astype(cp.float32), yx, order=order, mode="constant", cval=0.0)
+        out = cnd.map_coordinates(img.astype(cp.float32), yx, order=order, mode="constant", cval=0.0,
+                                  prefilter=not prefiltered)
         return cp.where(ok, out, 0), ok
+
+
+def prefilter(img, order):
+    """The spline prefilter map_coordinates(mode='constant', prefilter=True) applies to img."""
+    img = img.astype(cp.float32)
+    if order < 2:
+        return cp.ascontiguousarray(img)
+    return cp.ascontiguousarray(cnd.spline_filter(img, order, output=cp.float32, mode="constant"))
 
 
 def fft_upsample(img, up=2, taper=None):

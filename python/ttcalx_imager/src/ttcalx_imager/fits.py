@@ -71,3 +71,8 @@ def write_image(path, arr, header, stokes=None):
         hh["CRVAL4"] = STOKES[stokes]
     fits.writeto(path, np.asarray(arr, np.float32)[None, None], hh, overwrite=True)
     return path
+
+
+def write_images(prods, header):
+    """Write [(path, 2-D host or device array, stokes)] with one header; returns the paths."""
+    return [write_image(path, arr, header, stokes=st) for path, arr, st in prods]

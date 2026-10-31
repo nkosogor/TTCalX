@@ -18,6 +18,8 @@ Local RMS (radler RmsImage::Make): sigma map = sqrt(Gaussian-smoothed residual^2
 = 25 theoretical beams; peaks are compared after scaling by min(rms) / rms(x, y).
 """
 import math
+import os
+import warnings
 
 import numpy as np
 import cupy as cp
@@ -68,16 +70,276 @@ extern "C" __global__ void hogbom_set(const float* __restrict__ psf, const int p
 """
 _hogbom = cp.RawKernel(_HOGBOM_SRC, "hogbom_set")
 
+# Same algorithm and the same float operations as hogbom_set (bit-identical result, including
+# the order in which exactly equal peaks are resolved), but: warp-shuffle argmax (2 __syncthreads per iteration instead of 12), and the PSF
+# subtraction is fused with the next iteration's per-thread peak search (one pass over the set).
+_HOGBOM2_SRC = r"""
+extern "C" __global__ void hogbom_set2(const float* __restrict__ psf, const int pn, const int pc,
+    const int* __restrict__ px, const int* __restrict__ py, float* val, const float* __restrict__ fac,
+    float* comp, const int K, const float gain, const float thresh, const int maxiter,
+    float* out, const float* __restrict__ G)
+{
+    // G (optional, K x K): G[i K + k] = the PSF value hogbom_set reads for candidate k when the
+    // component is at candidate i (a coalesced row read instead of K scattered PSF gathers)
+    __shared__ float wv[32];
+    __shared__ int wi[32];
+    __shared__ float s_peak, s_amp;
+    __shared__ int s_ip;
+    // launched with exactly 1024 threads on candidate arrays permuted by hogbom_on_set: thread
+    // p = 32 w + l (warp w, lane l) holds, at positions p + 1024 j, the candidates j 1024 + t of
+    // hogbom_set's thread t = 32 l + w (NaN-padded).  The intra-warp shuffles then combine bits
+    // 5-9 of t and the cross-warp step bits 0-4, so exact ties are resolved in the same order as
+    // hogbom_set's tree, whose last (deciding) comparison is on bit 0 of t.
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nt = 1024, nw = 32;
+    const int tid = threadIdx.x;
+    float best = -1.f; int bi = -1;
+    for (int k = tid; k < K; k += nt) {
+        const float a = fabsf(val[k]) * fac[k];
+        if (a > best) { best = a; bi = k; }
+    }
+    int it = 0;
+    float peak = 0.f;
+    for (; it < maxiter; ++it) {
+        // argmax over the block; on ties the lower thread wins (as the shared-memory tree)
+        float v = best; int i = bi;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float v2 = __shfl_down_sync(0xffffffffu, v, o);
+            const int i2 = __shfl_down_sync(0xffffffffu, i, o);
+            if (v2 > v) { v = v2; i = i2; }
+        }
+        if (lane == 0) { wv[wid] = v; wi[wid] = i; }
+        __syncthreads();
+        if (wid == 0) {
+            v = lane < nw ? wv[lane] : -2.f; i = lane < nw ? wi[lane] : -1;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float v2 = __shfl_down_sync(0xffffffffu, v, o);
+                const int i2 = __shfl_down_sync(0xffffffffu, i, o);
+                if (v2 > v) { v = v2; i = i2; }
+            }
+            if (lane == 0) {
+                s_peak = v; s_ip = i;
+                if (i >= 0 && !(v < thresh)) { s_amp = gain * val[i]; comp[i] += s_amp; }
+            }
+        }
+        __syncthreads();
+        peak = s_peak;
+        const int ip = s_ip;
+        if (peak < thresh || ip < 0) break;
+        const float amp = s_amp;
+        const int x0 = px[ip], y0 = py[ip];
+        best = -1.f; bi = -1;
+        for (int k = tid; k < K; k += nt) {
+            const int dx = px[k] - x0 + pc, dy = py[k] - y0 + pc;
+            float vk = val[k];
+            if (dx >= 0 && dx < pn && dy >= 0 && dy < pn) {
+                const float p = G ? G[(size_t)ip * K + k] : psf[(size_t)dy * pn + dx];
+                vk -= amp * p; val[k] = vk;
+            }
+            const float a = fabsf(vk) * fac[k];
+            if (a > best) { best = a; bi = k; }
+        }
+    }
+    if (tid == 0) { out[0] = (float)it; out[1] = peak; }
+}
+"""
+_hogbom2 = cp.RawKernel(_HOGBOM2_SRC, "hogbom_set2")
+
+
+# Multi-block (cooperative, one grid barrier per iteration) version for large candidate sets,
+# where the single-block kernels are bound by the latency of the PSF gathers of one SM.  The
+# argmax is a 64-bit atomicMax of (float bits of |val| * fac, ~rank) with rank = the position of
+# the candidate in hogbom_set's tie order (bit-reversed thread index t = k mod 1024, then
+# j = k div 1024), so it selects exactly the component hogbom_set selects; the float operations
+# on val and comp are the same (bit-identical result).
+_HOGBOM_MB_SRC = r"""
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+__device__ __forceinline__ unsigned long long hkey(const float a, const int k, const int J) {
+    if (!(a == a)) return 0ull;                                   // NaN: never selected
+    const unsigned int t = k & 1023, j = k >> 10;
+    const unsigned int rank = (__brev(t) >> 22) * (unsigned int)J + j;
+    return ((unsigned long long)__float_as_uint(a) << 32) | (unsigned long long)(0xffffffffu - rank);
+}
+extern "C" __global__ void hogbom_mb(const float* __restrict__ psf, const int pn, const int pc,
+    const int* __restrict__ px, const int* __restrict__ py, float* val, const float* __restrict__ fac,
+    float* comp, const int K, const int J, const float gain, const float thresh, const int maxiter,
+    unsigned long long* keys, float* cval, float* out)
+{
+    cg::grid_group grid = cg::this_grid();
+    __shared__ unsigned long long sk[32];
+    __shared__ float sv[32];
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x, gn = gridDim.x * blockDim.x;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5, B = gridDim.x;
+    unsigned long long best = 0ull; float bestv = 0.f;
+    for (int k = gtid; k < K; k += gn) {
+        const float vk = val[k];
+        const unsigned long long key = hkey(fabsf(vk) * fac[k], k, J);
+        if (key > best) { best = key; bestv = vk; }
+    }
+    int it = 0;
+    float peak = 0.f;
+    for (; it < maxiter; ++it) {
+        const int slot = it % 3;
+        unsigned long long b = best; float bv = bestv;
+        for (int o = 16; o > 0; o >>= 1) {
+            const unsigned long long b2 = __shfl_down_sync(0xffffffffu, b, o);
+            const float v2 = __shfl_down_sync(0xffffffffu, bv, o);
+            if (b2 > b) { b = b2; bv = v2; }
+        }
+        if (lane == 0) { sk[wid] = b; sv[wid] = bv; }
+        __syncthreads();
+        if (wid == 0) {
+            b = lane < nw ? sk[lane] : 0ull; bv = lane < nw ? sv[lane] : 0.f;
+            for (int o = 16; o > 0; o >>= 1) {
+                const unsigned long long b2 = __shfl_down_sync(0xffffffffu, b, o);
+                const float v2 = __shfl_down_sync(0xffffffffu, bv, o);
+                if (b2 > b) { b = b2; bv = v2; }
+            }
+            if (lane == 0) {
+                cval[slot * B + blockIdx.x] = bv;
+                if (b) atomicMax(&keys[slot], b);
+            }
+        }
+        grid.sync();
+        const unsigned long long g = *((volatile unsigned long long*)&keys[slot]);
+        if (gtid == 0) keys[(it + 2) % 3] = 0ull;
+        if (g == 0ull) { peak = -1.f; break; }
+        peak = __uint_as_float((unsigned int)(g >> 32));
+        if (peak < thresh) break;
+        const unsigned int rank = 0xffffffffu - (unsigned int)(g & 0xffffffffull);
+        const unsigned int t = __brev(rank / (unsigned int)J) >> 22, j = rank % (unsigned int)J;
+        const int ip = (int)(j * 1024u + t);
+        const float amp = gain * *((volatile float*)&cval[slot * B + (ip % gn) / blockDim.x]);
+        const int x0 = px[ip], y0 = py[ip];
+        best = 0ull; bestv = 0.f;
+        for (int k = gtid; k < K; k += gn) {
+            const int dx = px[k] - x0 + pc, dy = py[k] - y0 + pc;
+            float vk = val[k];
+            if (k == ip) comp[k] += amp;
+            if (dx >= 0 && dx < pn && dy >= 0 && dy < pn) { vk -= amp * psf[(size_t)dy * pn + dx]; val[k] = vk; }
+            const unsigned long long key = hkey(fabsf(vk) * fac[k], k, J);
+            if (key > best) { best = key; bestv = vk; }
+        }
+        __syncthreads();
+    }
+    if (gtid == 0) { out[0] = (float)it; out[1] = peak; }
+}
+"""
+_hogbom_mb = None
+HOGBOM_MB_MIN_K = 6144
+HOGBOM_SMALL_K = 512
+
+
+def _hogbom_mb_kernel():
+    global _hogbom_mb
+    if _hogbom_mb is None:
+        _hogbom_mb = cp.RawKernel(_HOGBOM_MB_SRC, "hogbom_mb", enable_cooperative_groups=True)
+    return _hogbom_mb
+
+
+def _hogbom_on_set_mb(psf, ys, xs, vals, fac, gain, thresh, maxiter):
+    K = int(ys.size)
+    ker = _hogbom_mb_kernel()
+    nsm = cp.cuda.Device().attributes["MultiProcessorCount"]
+    nth = 256
+    B = nsm * int(os.environ.get("TTCALX_HOGBOM_MB_BPS", "2"))
+    B = min(B, max(1, -(-K // nth)))
+    comp = cp.zeros(K, cp.float32)
+    keys = cp.zeros(3, cp.uint64); cval = cp.zeros(3 * B, cp.float32); out = cp.zeros(2, cp.float32)
+    vals = cp.ascontiguousarray(vals, dtype=cp.float32)
+    ker((B,), (nth,), (psf, np.int32(psf.shape[0]), np.int32(psf.shape[0] // 2), xs.astype(cp.int32),
+                       ys.astype(cp.int32), vals, cp.ascontiguousarray(fac, dtype=cp.float32), comp, np.int32(K),
+                       np.int32(-(-K // 1024)), np.float32(gain), np.float32(thresh), np.int32(maxiter),
+                       keys, cval, out))
+    o = out.get()
+    return comp, int(o[0]), float(o[1])
+
+
+_MB_BROKEN = [False]
+
 
 def hogbom_on_set(psf, ys, xs, vals, fac, gain, thresh, maxiter):
     """Run the Hogbom kernel; returns (component amplitudes per candidate, n_iter, last peak)."""
     K = int(ys.size)
-    comp = cp.zeros(K, cp.float32)
-    nit = cp.zeros(1, cp.int32); pk = cp.zeros(1, cp.float32)
+    if K >= HOGBOM_MB_MIN_K and not _MB_BROKEN[0]:
+        try:
+            return _hogbom_on_set_mb(psf, ys, xs, vals, fac, gain, thresh, maxiter)
+        except (cp.cuda.driver.CUDADriverError, cp.cuda.runtime.CUDARuntimeError) as e:
+            # cooperative launch refused (grid not co-resident, e.g. MPS SM limit or a too
+            # large TTCALX_HOGBOM_MB_BPS): the single-block kernel gives the same components
+            _MB_BROKEN[0] = True
+            warnings.warn(f"multi-block Hogbom unavailable ({e}); using the single-block kernel")
+    if K <= HOGBOM_SMALL_K:
+        # tiny sets (most multiscale sub-minor cycles): the original kernel, one host sync
+        comp = cp.zeros(K, cp.float32)
+        o = cp.zeros(2, cp.int32)
+        pn = psf.shape[0]
+        _hogbom((1,), (1024,), (psf, np.int32(pn), np.int32(pn // 2), xs.astype(cp.int32), ys.astype(cp.int32),
+                                vals, fac, comp, np.int32(K), np.float32(gain), np.float32(thresh), np.int32(maxiter),
+                                o[0:1], o[1:2]))
+        o = o.get()
+        return comp, int(o[0]), float(o[1:2].view(np.float32)[0])
+    Kp = max(1024, -(-K // 1024) * 1024)
+    pos = _hog_perm(cp.arange(K, dtype=cp.int32))           # candidate k -> permuted position
+    px = cp.full(Kp, -(1 << 28), cp.int32); py = cp.full(Kp, -(1 << 28), cp.int32)
+    pv = cp.full(Kp, np.nan, cp.float32); pf = cp.ones(Kp, cp.float32)
+    px[pos] = xs; py[pos] = ys; pv[pos] = vals; pf[pos] = fac
+    comp = cp.zeros(Kp, cp.float32)
+    out = cp.zeros(2, cp.float32)
     pn = psf.shape[0]
-    _hogbom((1,), (1024,), (psf, np.int32(pn), np.int32(pn // 2), xs.astype(cp.int32), ys.astype(cp.int32),
-                            vals, fac, comp, np.int32(K), np.float32(gain), np.float32(thresh), np.int32(maxiter), nit, pk))
-    return comp, int(nit.get()[0]), float(pk.get()[0])
+    G = None
+    if 1024 < Kp <= HOGBOM_MATRIX_MAX_K:
+        G = cp.empty((Kp, Kp), cp.float32)
+        _hog_matrix(psf, np.int32(pn), np.int32(pn // 2), px[:, None], py[:, None], px[None, :], py[None, :], G)
+    _hogbom2((1,), (1024,), (psf, np.int32(pn), np.int32(pn // 2), px, py, pv, pf, comp, np.int32(Kp),
+                             np.float32(gain), np.float32(thresh), np.int32(maxiter), out,
+                             G if G is not None else np.uintp(0)))
+    o = out.get()
+    return comp[pos], int(o[0]), float(o[1])
+
+
+HOGBOM_MATRIX_MAX_K = int(os.environ.get("TTCALX_HOGBOM_MATRIX_MAX_K", "4096"))
+_hog_matrix = cp.ElementwiseKernel(
+    "raw float32 psf, int32 pn, int32 pc, int32 xi, int32 yi, int32 xk, int32 yk", "float32 g",
+    "const int dx = xk - xi + pc, dy = yk - yi + pc;"
+    "g = (dx >= 0 && dx < pn && dy >= 0 && dy < pn) ? psf[(size_t)dy * pn + dx] : 0.f;", "hog_matrix")
+_hog_perm = cp.ElementwiseKernel("int32 k", "int32 p",
+                                 "const int t = k & 1023; p = (k - t) + ((t & 31) << 5) + (t >> 5);", "hog_perm")
+
+
+_SPARSE_SRC = r"""
+extern "C" __global__ void sparse_conv_sub(const float* __restrict__ R, float* out, const int N,
+    const float* __restrict__ ker, const int kn, const int kc,
+    const int* __restrict__ cy, const int* __restrict__ cx, const float* __restrict__ ca, const int nc)
+{
+    // out[y, x] = R[y, x] - sum_j ca[j] ker[y - cy[j] + kc, x - cx[j] + kc]  (kernel kn x kn, zero outside)
+    __shared__ int sy[64], sx[64];
+    __shared__ float sa[64];
+    const int t = threadIdx.y * blockDim.x + threadIdx.x;
+    if (t < nc) { sy[t] = cy[t]; sx[t] = cx[t]; sa[t] = ca[t]; }
+    __syncthreads();
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= N || y >= N) return;
+    float acc = 0.f;
+    for (int j = 0; j < nc; ++j) {
+        const int dy = y - sy[j] + kc, dx = x - sx[j] + kc;
+        if (dy >= 0 && dy < kn && dx >= 0 && dx < kn) acc += sa[j] * ker[(size_t)dy * kn + dx];
+    }
+    out[(size_t)y * N + x] = R[(size_t)y * N + x] - acc;
+}
+"""
+_sparse = cp.RawKernel(_SPARSE_SRC, "sparse_conv_sub")
+
+
+def sparse_conv_sub(R, ker, kc, cy, cx, ca):
+    """R - sum_j ca_j ker(. - (cy_j, cx_j)) for <= 64 components (new array)."""
+    N = R.shape[0]; kn = ker.shape[0]; nc = int(ca.size)
+    assert nc <= 64
+    R = cp.ascontiguousarray(R, dtype=cp.float32); ker = cp.ascontiguousarray(ker, dtype=cp.float32)
+    out = cp.empty_like(R)
+    _sparse(((N + 31) // 32, (N + 7) // 8), (32, 8), (R, out, np.int32(N), ker, np.int32(kn), np.int32(kc),
+                                                     cy, cx, ca.astype(cp.float32), np.int32(nc)))
+    return out
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -153,10 +415,29 @@ def rms_image(img, beam_fwhm_pix, window=25.0):
     (cyclic FFT smoothing with a unit-sum Gaussian)."""
     N = img.shape[0]
     sig = window * beam_fwhm_pix / (2.0 * math.sqrt(2.0 * math.log(2.0)))
-    f = cp.fft.fftfreq(N).astype(cp.float32)
-    g = cp.exp(-2.0 * (math.pi * sig) ** 2 * (f[:, None] ** 2 + f[None, :] ** 2)).astype(cp.float32)
-    sm = cp.fft.ifft2(cp.fft.fft2(img.astype(cp.float32) ** 2) * g).real
+    # The Gaussian filter is separable, so the 2-D cyclic convolution is A X A^T with A the N x N
+    # circulant matrix of the 1-D kernel ifft(g1): two SGEMMs instead of a complex N x N FFT pair
+    # (N = 2358 = 2 3^2 131 needs a Bluestein cuFFT plan, ~0.5-0.9 s to create after every
+    # plan-cache clear in the hour driver).  Same filter; differences ~1e-6 of the max.
+    A = _circulant_gauss(N, round(sig, 9))
+    x2 = img.astype(cp.float32) ** 2
+    sm = A @ x2 @ A.T
     return cp.sqrt(cp.maximum(sm, 0)).astype(cp.float32)
+
+
+_CIRC_CACHE = {}
+
+
+def _circulant_gauss(N, sig):
+    key = (N, sig)
+    if key not in _CIRC_CACHE:
+        if len(_CIRC_CACHE) >= 4:
+            _CIRC_CACHE.pop(next(iter(_CIRC_CACHE)))       # oldest
+        f = np.fft.fftfreq(N).astype(np.float32).astype(np.float64)
+        a = np.fft.ifft(np.exp(-2.0 * (math.pi * sig) ** 2 * f ** 2)).real
+        idx = (np.arange(N)[:, None] - np.arange(N)[None, :]) % N
+        _CIRC_CACHE[key] = cp.asarray(a[idx], dtype=cp.float32)
+    return _CIRC_CACHE[key]
 
 
 def local_rms_factor(res, theo_pix, scale_deg, horizon, window=25.0):
@@ -168,6 +449,10 @@ def local_rms_factor(res, theo_pix, scale_deg, horizon, window=25.0):
     far = cp.sqrt(jj[None, :] ** 2 + jj[:, None] ** 2) < (1.0 / math.radians(scale_deg) - 3 * window * theo_pix / 2.3548)
     minrms = float(rms[horizon & far].min())
     return (minrms / cp.maximum(rms, 1e-30)).astype(cp.float32), minrms
+
+
+# the same float32 operations as cp.where(m, cp.abs(x) * f, 0), in one kernel
+_masked_absf = cp.ElementwiseKernel("T x, T f, bool m", "T y", "y = m ? abs(x) * f : (T)0", "masked_absf")
 
 
 def mad_std(x):
@@ -299,6 +584,8 @@ class MultiScaleClean:
                  kmax=60000, max_scale_frac=0.5, multiscale=True, max_scales=0, divergence_limit=4.0, log=None):
         self.N = N; self.sdeg = scale_deg; self.gain = gain; self.kmax = kmax
         self.divergence_limit = divergence_limit; self.diverged = False
+        self.sparse_max = min(64, int(os.environ.get("TTCALX_SPARSE_UPDATE_MAX", "64")))   # kernel limit
+        self._small, self._fullps = {}, {}
         self.log = log or (lambda *a: None)
         self.psf = cp.asarray(psf, dtype=cp.float32)
         self.beam = tuple(beam) if beam is not None else fit_beam(self.psf, scale_deg, theo_pix)
@@ -314,6 +601,12 @@ class MultiScaleClean:
         self.scales = scales
         self.C = Convolver(N, N, extra=2)
         Kpsf = self.C.kfft(self.psf)
+        hmax = max(int(math.ceil(0.5 * s)) for s in scales)
+        if os.environ.get("TTCALX_SCALE_FFT", "small") == "small":
+            self.Cs = Convolver(N, 2 * hmax + 1, extra=2)
+            self.KSs = [None if s == 0 else self.Cs.kfft(shape_kernel(N, s)) for s in scales]
+        else:
+            self.Cs = self.C; self.KSs = None
         self.KS, self.KP, self.Pss, self.pss0, self.bias, self.edge = [], [], [], [], [], []
         c = N // 2
         for k, s in enumerate(scales):
@@ -321,10 +614,14 @@ class MultiScaleClean:
             self.edge.append(m)
             KS = self.C.kfft(shape_kernel(N, s))
             KP = KS * Kpsf
+            self.KS.append(KS); self.KP.append(KP)
+        if self.KSs is None:
+            self.KSs = self.KS
+        for k, s in enumerate(scales):
+            KS, KP = self.KS[k], self.KP[k]
             delta = cp.zeros((N, N), cp.float32); delta[c, c] = 1
             Ps_img = self.C(delta, KP)
             Pss_img = self.C(Ps_img, KS)
-            self.KS.append(KS); self.KP.append(KP)
             self.pss0.append(float(Pss_img[c, c]))
             self.Pss.append((Pss_img / float(Pss_img[c, c])).astype(cp.float32))
             self.bias.append(1.0 if s == 0 else (1.0 / scale_bias) ** math.log2(s / scales[1]))
@@ -337,9 +634,31 @@ class MultiScaleClean:
         self.log(f"MultiScaleClean: beam {self.beam[0]*60:.2f}'x{self.beam[1]*60:.2f}' ({b:.1f} px), "
                  f"scales {[round(s, 1) for s in scales]}, clark frac {[round(f, 3) for f in self.frac]}")
 
-    def scale_images(self, R):
-        F = self.C.img_fft(R)
-        return [R if s == 0 else self.C.back(F * self.KS[k]) for k, s in enumerate(self.scales)]
+    def scale_images(self, R, active=None):
+        # the scale kernels have support +-ceil(s/2) px only: linear convolution needs a padded
+        # size of N + hmax (self.Cs), not the N + N/2 of the PSF convolutions (self.C)
+        if active is None:
+            active = [True] * len(self.scales)
+        F = self.Cs.img_fft(R) if any(a and s != 0 for a, s in zip(active, self.scales)) else None
+        return [None if not active[k] else R if s == 0 else self.Cs.back(F * self.KSs[k])
+                for k, s in enumerate(self.scales)]
+
+    def small_shape(self, k):
+        """(kernel, centre) of scale k's shape function cut to its support (2h+1)^2."""
+        if k not in self._small:
+            s = self.scales[k]; h = int(math.ceil(0.5 * s)); c = self.N // 2
+            self._small[k] = (cp.ascontiguousarray(shape_kernel(self.N, s)[c - h:c + h + 1, c - h:c + h + 1]), h)
+        return self._small[k]
+
+    def full_ps(self, k):
+        """(kernel, centre) of S_k * PSF as the FFT update applies it (offsets -N/2-h .. N/2-1+h)."""
+        if k not in self._fullps:
+            h = int(math.ceil(0.5 * self.scales[k])); c = self.N // 2; P = self.C.P
+            img = cp.fft.irfft2(self.KP[k], s=(P, P))
+            n = self.N + 2 * h
+            self._fullps[k] = (cp.ascontiguousarray(cp.roll(img, (c + h, c + h), axis=(0, 1))[:n, :n]
+                                                    .astype(cp.float32)), c + h)
+        return self._fullps[k]
 
     def minor(self, R, M, stop, fac, scale_masks=None, maxiter=500000, niter_done=0, comp_masks=None,
               max_cycles=100000):
@@ -351,10 +670,19 @@ class MultiScaleClean:
                  for k in range(len(self.scales))]
         per_scale = [0] * len(self.scales)
         first = None
+        # a scale whose allowed region is empty (phase 2: no phase-1 components of that scale) has
+        # peak 0 and can never be selected: its scale image is not computed (same result)
+        active = [bool(v) for v in cp.stack([a.any() for a in allow]).get()]
+        nsc = len(self.scales)
         while nit < maxiter and ncyc < max_cycles:
-            Rs = self.scale_images(R)
-            absf = [cp.where(allow[k], cp.abs(Rs[k]) * fac, 0) for k in range(len(self.scales))]
-            pk = [float(a.max()) for a in absf]
+            Rs = self.scale_images(R, active)
+            # fused masked |R_s| * fac (one kernel per scale), one device->host copy for all maxima
+            absf = [_masked_absf(Rs[k], fac, allow[k]) if active[k] else None for k in range(nsc)]
+            act = [k for k in range(nsc) if active[k]]
+            pk = [0.0] * nsc
+            if act:
+                for k, p in zip(act, cp.stack([absf[k].max() for k in act]).get()):
+                    pk[k] = float(p)
             score = [pk[k] * self.bias[k] for k in range(len(self.scales))]
             k = int(np.argmax(score))
             if first is None:
@@ -369,9 +697,12 @@ class MultiScaleClean:
             if score[k] < stop:
                 break
             t = max(stop / self.bias[k], pk[k] * self.frac[k])
-            sel = absf[k] >= t
+            absk = absf[k] if absf[k] is not None else cp.zeros((N, N), cp.float32)
+            if Rs[k] is None:
+                Rs[k] = cp.zeros((N, N), cp.float32)
+            sel = absk >= t
             if int(sel.sum()) > self.kmax:
-                t = float(cp.sort(absf[k][sel])[-self.kmax]); sel = absf[k] >= t
+                t = float(cp.sort(absk[sel])[-self.kmax]); sel = absk >= t
             ys, xs = cp.nonzero(sel)
             vals = (Rs[k][ys, xs] / self.pss0[k]).astype(cp.float32)
             comp, n, _ = hogbom_on_set(self.Pss[k], ys, xs, vals, fac[ys, xs].astype(cp.float32), self.gain,
@@ -383,9 +714,23 @@ class MultiScaleClean:
             nit += n; ncyc += 1; per_scale[k] += n
             dm = cp.zeros((N, N), cp.float32); dm[ys, xs] = comp
             comp_masks[k] |= dm != 0
-            Fd = self.C.img_fft(dm)
-            M += dm if self.scales[k] == 0 else self.C.back(Fd * self.KS[k])
-            R = R - self.C.back(Fd * self.KP[k])
+            nz = cp.nonzero(comp)[0] if self.sparse_max else None
+            if nz is not None and int(nz.size) <= self.sparse_max:
+                # few components (most cycles of the deep phase-2 loops): direct sums of the
+                # shifted kernels instead of a P x P FFT pair (the same linear convolution)
+                cy, cx, ca = ys[nz].astype(cp.int32), xs[nz].astype(cp.int32), comp[nz]
+                if self.scales[k] == 0:
+                    M += dm
+                    R = sparse_conv_sub(R, self.psf, N // 2, cy, cx, ca)
+                else:
+                    kS, hS = self.small_shape(k)
+                    M -= sparse_conv_sub(cp.zeros_like(M), kS, hS, cy, cx, ca)
+                    kP, cP = self.full_ps(k)
+                    R = sparse_conv_sub(R, kP, cP, cy, cx, ca)
+            else:
+                Fd = self.C.img_fft(dm)
+                M += dm if self.scales[k] == 0 else self.C.back(Fd * self.KS[k])
+                R = R - self.C.back(Fd * self.KP[k])
         self.log(f"   minor: {nit - niter_done} iters, {ncyc} cycles, stop {stop:.4g}, per scale {per_scale}")
         return R, M, nit, comp_masks
 
