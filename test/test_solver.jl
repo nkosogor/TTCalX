@@ -163,6 +163,81 @@ identity_gains(meta; diagonal=false) = GPUCalibration(meta.Nant, meta.Nfreq; dia
         @test fit_residual(bad, m, cal, meta) < 1e-6        # residual over unflagged data only
     end
 
+    @testset "smooth_flux: per-channel gains tied to a band gain" begin
+        chans = collect(range(50e6, 52e6; length=6))
+        meta, model, _, _ = synthetic_problem(channels=chans)        # ~1000 Jy source
+        truth = random_gains(meta.Nant, meta.Nfreq; seed=14)
+        measured = deepcopy_gpu(model); gpu_corrupt!(measured, truth, meta)
+        spread(c) = maximum(abs, c.xx .- sum(c.xx; dims=2) ./ size(c.xx, 2))
+        for diagonal in (false, true), solver in (:rk4, :damped)
+            fit(; kw...) = (c = identity_gains(meta; diagonal=diagonal);
+                            solve_gains!(c, measured, model, meta; solver=solver,
+                                         maxiter=solver == :rk4 ? 60 : 400, tolerance=1e-12, kw...); c)
+            r(c) = fit_residual(measured, model, c, meta)
+            free = fit()
+            off = fit(smooth_flux=0.0)
+            @test off.xx == free.xx && off.yy == free.yy                    # 0 = off
+            weak = fit(smooth_flux=1e-3)                                    # ρ ≪ D: per channel
+            @test abs(r(weak) - r(free)) < 1e-3 * r(free) + 1e-9
+            strong = fit(smooth_flux=1e5)                                   # ρ ≫ D: one band gain
+            @test spread(strong) < 1e-3 * spread(free)
+            mid = fit(smooth_flux=300.0)
+            @test r(free) < r(mid) < r(strong) && spread(mid) < spread(free)
+        end
+        # ρ → ∞ is the one-gain-per-band fit (relative singularity test: no freeze at huge ρ)
+        band = identity_gains(meta); solve_gains!(band, measured, model, meta; maxiter=60, tolerance=1e-12,
+                                                  smooth_flux=1e9)
+        @test spread(band) < 1e-6 && maximum(abs, band.xx .- 1) > 1e-3
+    end
+
+    @testset "smooth_flux: flagged channel and antenna without data" begin
+        chans = collect(range(50e6, 52e6; length=6))
+        meta, model, _, _ = synthetic_problem(channels=chans)
+        truth = random_gains(meta.Nant, meta.Nfreq; seed=15)
+        measured = deepcopy_gpu(model); gpu_corrupt!(measured, truth, meta)
+        measured.flags[:, 3] .= true                                  # channel 3 fully flagged
+        bl = meta.baselines
+        measured.flags[(bl[1, :] .== 5) .| (bl[2, :] .== 5), :] .= true   # antenna 5 has no data
+        m = deepcopy_gpu(model); m.flags .= measured.flags
+        for diagonal in (false, true)
+            c = identity_gains(meta; diagonal=diagonal)
+            solve_gains!(c, measured, m, meta; maxiter=30, tolerance=1e-10, smooth_flux=300.0)
+            @test all(isfinite, c.xx) && all(isfinite, c.yy)
+            @test all(c.xx[5, :] .== 1) && all(c.yy[5, :] .== 1)      # untouched
+            # the flagged channel carries the band gain: between its neighbours' values
+            @test abs(c.xx[1, 3] - sum(c.xx[1, [1, 2, 4, 5, 6]]) / 5) < 0.5 * maximum(abs, c.xx[1, :] .- c.xx[1, 3]) + 1e-12
+        end
+    end
+
+    @testset "precision=:mixed: single-precision normal equations" begin
+        meta, model, measured, _ = synthetic_problem(noise=1.0)
+        for diagonal in (false, true), smooth in (0.0, 300.0)
+            d = identity_gains(meta; diagonal=diagonal); s = identity_gains(meta; diagonal=diagonal)
+            solve_gains!(d, measured, model, meta; maxiter=20, tolerance=1e-8, smooth_flux=smooth)
+            solve_gains!(s, measured, model, meta; maxiter=20, tolerance=1e-8, smooth_flux=smooth, precision=:mixed)
+            @test maximum(abs, s.xx .- d.xx) < 1e-4 * maximum(abs, d.xx)
+            @test fit_residual(measured, model, s, meta) < 1.0001 * fit_residual(measured, model, d, meta)
+        end
+        @test_throws ArgumentError solve_gains!(identity_gains(meta), measured, model, meta; precision=:half)
+        # tight tolerances are floored at 1e-6: mixed still converges
+        c = identity_gains(meta)
+        converged, _, _ = solve_gains!(c, measured, model, meta; maxiter=60, tolerance=1e-10, precision=:mixed)
+        @test converged
+    end
+
+    @testset "active mask: frozen channels give bitwise the same result" begin
+        meta, model, measured, _ = synthetic_problem(noise=1.0)
+        g = identity_gains(meta)
+        sqm = GPUSquareVisibilities(meta.Nant, meta.Nfreq; gpu=false); host_makesquare!(sqm, measured, meta)
+        sqo = GPUSquareVisibilities(meta.Nant, meta.Nfreq; gpu=false); host_makesquare!(sqo, model, meta)
+        k_all = ntuple(_ -> zeros(ComplexF64, meta.Nant, meta.Nfreq), 4); k_act = deepcopy(k_all)
+        gg = (g.xx, g.xy, g.yx, g.yy)
+        stefcal_steps!(k_all, gg, false, sqm, sqo, meta.Nant)
+        active = trues(meta.Nfreq); active[2] = false
+        stefcal_steps!(k_act, gg, false, sqm, sqo, meta.Nant; active=active)
+        @test all(k_act[1][:, 2] .== 0) && k_act[1][:, active] == k_all[1][:, active]
+    end
+
     @testset "invalid arguments" begin
         meta, model, measured, _ = synthetic_problem()
         @test_throws ArgumentError solve_gains!(identity_gains(meta), measured, model, meta; solver=:newton)
@@ -174,6 +249,10 @@ identity_gains(meta; diagonal=false) = GPUCalibration(meta.Nant, meta.Nfreq; dia
         sq1 = GPUSquareVisibilities(meta.Nant, 1; gpu=false)
         @test_throws DimensionMismatch host_makesquare!(sq1, measured, meta)
         @test solve_gains!(identity_gains(meta), measured, model, meta; minuvw=5, tolerance=1)[2] >= 1
+        @test_throws ArgumentError solve_gains!(identity_gains(meta), measured, model, meta; smooth_flux=-1)
+        prior = phase_regularization(meta, 1, 1; gpu=false)
+        @test_throws ArgumentError solve_gains!(identity_gains(meta), measured, model, meta;
+                                                smooth_flux=100, reg=prior)
     end
 
     if is_gpu_available()
@@ -197,6 +276,21 @@ identity_gains(meta; diagonal=false) = GPUCalibration(meta.Nant, meta.Nfreq; dia
             solve_gains!(hd, measured, model, meta; maxiter=10)
             solve_gains!(gd, up(measured), up(model), gmeta; maxiter=10)
             @test maximum(abs, Array(gd.xx) .- hd.xx) < 1e-9 && maximum(abs, Array(gd.yy) .- hd.yy) < 1e-9
+            for prec in (:double, :mixed)                                  # mixed precision on the GPU
+                h = identity_gains(meta); g = GPUCalibration(meta.Nant, meta.Nfreq; diagonal=false, gpu=true)
+                solve_gains!(h, measured, model, meta; maxiter=10, minuvw=2.0, precision=prec)
+                solve_gains!(g, up(measured), up(model), gmeta; maxiter=10, minuvw=2.0, precision=prec)
+                @test maximum(abs, Array(g.xx) .- h.xx) < (prec == :double ? 1e-9 : 1e-4)
+            end
+            for diagonal in (false, true), solver in (:rk4, :damped)      # consensus step
+                h = identity_gains(meta; diagonal=diagonal)
+                g = GPUCalibration(meta.Nant, meta.Nfreq; diagonal=diagonal, gpu=true)
+                solve_gains!(h, measured, model, meta; solver=solver, maxiter=10, minuvw=2.0, smooth_flux=30.0)
+                solve_gains!(g, up(measured), up(model), gmeta; solver=solver, maxiter=10, minuvw=2.0, smooth_flux=30.0)
+                for f in (diagonal ? (:xx, :yy) : (:xx, :xy, :yx, :yy))
+                    @test maximum(abs, Array(getfield(g, f)) .- getfield(h, f)) < 1e-9
+                end
+            end
             # The GPU makesquare kernel and the host loop give the same matrices.
             hs = GPUSquareVisibilities(meta.Nant, meta.Nfreq; gpu=false)
             gs = GPUSquareVisibilities(meta.Nant, meta.Nfreq; gpu=true)

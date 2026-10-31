@@ -113,6 +113,17 @@ function gpu_genvis!(vis::GPUVisibilities, meta::GPUMetadata, source::GPURFISour
     s0 = s0 === nothing ? uvw_geometry(meta)[1] : SVector{3}(s0)
     path = [norm(P - SVector(positions[1, i], positions[2, i], positions[3, i])) +
             (s0[1] * positions[1, i] + s0[2] * positions[2, i] + s0[3] * positions[3, i]) for i in 1:Na]
+    if _is_gpu(vis) && RFI_GENVIS_KERNEL[]          # fringes on the device: no host loop, no transfers
+        flux = Matrix{ComplexF64}(undef, 4, Nf)
+        for β in 1:Nf
+            I, Q, U, V = source.spectrum(channels[β])
+            flux[:, β] .= (complex(I + Q), complex(U, -V), complex(U, V), complex(I - Q))
+        end
+        blocks, threads = kernel_config_1d(Nb * Nf)
+        @cuda blocks=blocks threads=threads rfi_genvis_kernel!(vis.xx, vis.xy, vis.yx, vis.yy,
+            CuArray(path), CuArray(flux), meta.baselines, meta.channels, Nb, Nf)
+        return vis
+    end
     hxx = zeros(ComplexF64, Nb, Nf); hxy = zeros(ComplexF64, Nb, Nf)
     hyx = zeros(ComplexF64, Nb, Nf); hyy = zeros(ComplexF64, Nb, Nf)
     @inbounds for β in 1:Nf
@@ -133,6 +144,22 @@ function gpu_genvis!(vis::GPUVisibilities, meta::GPUMetadata, source::GPURFISour
         vis.xx .+= hxx; vis.xy .+= hxy; vis.yx .+= hyx; vis.yy .+= hyy
     end
     vis
+end
+
+const RFI_GENVIS_KERNEL = Ref(true)
+
+function rfi_genvis_kernel!(xx, xy, yx, yy, path, flux, baselines, channels, Nb, Nf)
+    idx = thread_index_1d()
+    if idx <= Nb * Nf
+        α = ((idx - 1) % Nb) + 1
+        β = ((idx - 1) ÷ Nb) + 1
+        a1 = baselines[1, α]; a2 = baselines[2, α]
+        k = 2π * channels[β] / SPEED_OF_LIGHT
+        fringe = cis(k * (path[a2] - path[a1]))
+        xx[α, β] += flux[1, β] * fringe; xy[α, β] += flux[2, β] * fringe
+        yx[α, β] += flux[3, β] * fringe; yy[α, β] += flux[4, β] * fringe
+    end
+    return nothing
 end
 
 cpu_genvis!(vis::GPUVisibilities, meta::GPUMetadata, source::GPURFISource,

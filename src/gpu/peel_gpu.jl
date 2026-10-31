@@ -239,10 +239,9 @@ function gpu_makesquare!(sq::GPUSquareVisibilities, vis::GPUVisibilities, meta::
     Nf_sq = size(sq.xx, 3)
     
     # Zero out the output
-    fill!(sq.xx, zero(ComplexF64))
-    fill!(sq.xy, zero(ComplexF64))
-    fill!(sq.yx, zero(ComplexF64))
-    fill!(sq.yy, zero(ComplexF64))
+    for a in (sq.xx, sq.xy, sq.yx, sq.yy)
+        fill!(a, zero(eltype(a)))
+    end
     
     blocks, threads = kernel_config_1d(Nb * Nf)
     
@@ -418,10 +417,9 @@ function cpu_makesquare!(sq::GPUSquareVisibilities, vis::GPUVisibilities, meta::
     Nf_sq = size(sq.xx, 3)
     
     # Zero out the output
-    fill!(sq.xx, zero(ComplexF64))
-    fill!(sq.xy, zero(ComplexF64))
-    fill!(sq.yx, zero(ComplexF64))
-    fill!(sq.yy, zero(ComplexF64))
+    for a in (sq.xx, sq.xy, sq.yx, sq.yy)
+        fill!(a, zero(eltype(a)))
+    end
     
     wideband = Nf_sq == 1 && Nf > 1
     

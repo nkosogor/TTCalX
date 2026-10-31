@@ -286,27 +286,27 @@ Adapt.adapt_structure(to, x::GPUMetadata) =
 Square antenna-antenna visibility matrix for calibration.
 Shape: (Nant, Nant, Nfreq) for each component.
 """
-struct GPUSquareVisibilities{T<:AbstractArray{ComplexF64}}
+struct GPUSquareVisibilities{T<:AbstractArray{<:Complex}}
     xx::T  # 3D array (Nant, Nant, Nfreq)
     xy::T
     yx::T
     yy::T
 end
 
-function GPUSquareVisibilities(Nant::Int, Nfreq::Int; gpu::Bool=true)
+function GPUSquareVisibilities(Nant::Int, Nfreq::Int; gpu::Bool=true, T::Type=ComplexF64)
     if gpu && CUDA.functional()
         GPUSquareVisibilities(
-            CUDA.zeros(ComplexF64, Nant, Nant, Nfreq),
-            CUDA.zeros(ComplexF64, Nant, Nant, Nfreq),
-            CUDA.zeros(ComplexF64, Nant, Nant, Nfreq),
-            CUDA.zeros(ComplexF64, Nant, Nant, Nfreq)
+            CUDA.zeros(T, Nant, Nant, Nfreq),
+            CUDA.zeros(T, Nant, Nant, Nfreq),
+            CUDA.zeros(T, Nant, Nant, Nfreq),
+            CUDA.zeros(T, Nant, Nant, Nfreq)
         )
     else
         GPUSquareVisibilities(
-            zeros(ComplexF64, Nant, Nant, Nfreq),
-            zeros(ComplexF64, Nant, Nant, Nfreq),
-            zeros(ComplexF64, Nant, Nant, Nfreq),
-            zeros(ComplexF64, Nant, Nant, Nfreq)
+            zeros(T, Nant, Nant, Nfreq),
+            zeros(T, Nant, Nant, Nfreq),
+            zeros(T, Nant, Nant, Nfreq),
+            zeros(T, Nant, Nant, Nfreq)
         )
     end
 end

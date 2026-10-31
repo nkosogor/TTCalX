@@ -237,7 +237,28 @@ julia bin/zest_sky_rfi.jl --rfi=rfi.json --rfi-mode=joint sources.json data.ms
 julia bin/zest_sky_rfi.jl --rfi=rfi.json --reg=0.5,0.5 sources.json data.ms
 julia bin/zest_sky_rfi.jl --peel --solver=damped --maxiter=30 sources.json data.ms
 julia -t 24 bin/zest_sky_rfi.jl --cpu --rfi=rfi.json sources.json data.ms
+
+# Do not peel sources that are not in the model (see below)
+julia bin/zest_sky_rfi.jl --rfi=rfi.json --smooth-flux=1000 \
+      --restore=jupiter.json --restore-below-mhz=41 --restore-offset=0.5 sources.json *.ms
 ```
+
+**Keeping unmodelled sources.** With a free gain per antenna and channel, a direction whose own
+signal is weak (a faint or low source, the RFI emitter outside its model band) bends its gains
+into the fringe of another bright source and subtracts that too. `--smooth-flux=S` ties each
+direction's per-channel gains to one gain per band with weight ρ = N_ant (S/2)², solved exactly
+in every StefCal step (`consensus_steps!`): directions much brighter than S Jy keep per-channel
+gains, much fainter ones get the band gain, which still fits their own model but cannot follow a
+fringe across channels (2024-12 tests: 3C134 kept 0.81-0.92 instead of 0.45-0.64 at 08h, peeled
+residuals within ~20 %, same speed). Jupiter is absorbed by the bright per-channel directions;
+`--restore=FILE` (point sources at their ephemeris positions; the name must not be exactly
+"Jupiter", which the parser treats as a placeholder; the CLI refuses it) fits what peeling took
+from them, jointly with the peeled models, and adds it back. `--rfi-smooth-flux` sets the RFI
+directions' value separately and `--smooth-exempt-flux=1e4` keeps per-channel gains for sources
+with that catalog flux (Cas A, Cyg A). For speed, `--precision=mixed` and `--warm-start`
+(consecutive snapshots of one band) cut the GPU zest from ~4 s to ~1 s per snapshot. `--restore-offset=0.5` first finds the source's position
+in the data on Stokes V (Jupiter's decametric emission is strongly circularly polarised); use 0 for
+unpolarised sources.
 
 `--help` lists every option. The same in Julia: `zest_sky_rfi_ms!(ms, sky, rfi; kwargs...)`,
 or `zest_sky_rfi!` on visibilities already in memory. The building blocks:
@@ -258,6 +279,8 @@ or `zest_sky_rfi!` on visibilities already in memory. The building blocks:
 | `genvis_exact!(vis, meta, source, mjd)` | CPU TTCal's sky model: per-component horizon, 3-D Gaussian projection on the local north/east axes, `xy = U − iV` |
 | `GPURFISource` (JSON entries with `rfi-frequencies`) | Near-field RFI emitter, as ttcal_dev's `RFISource`; model via `gpu_genvis!` |
 | `solve_gains!(cal, data, model, meta; solver=:rk4)` | CPU TTCal's solver (RK4 of the StefCal step, per-channel convergence); `solver=:damped` is `gpu_stefcal!`'s iteration; optional Tukey phase prior `reg=phase_regularization(...)` |
+| `solve_gains!(...; smooth_flux=S)` | Per-channel gains tied to one band gain with weight N_ant (S/2)² (`consensus_steps!`) |
+| `restore_point_sources!(vis, before, meta, mjd, sources; others, offset_deg)` | Gives back what peeling took from known point sources (e.g. Jupiter) |
 | Host arrays (`read_ms_to_gpu(ms; gpu=false)`) | The same operations on CPU threads (`julia -t N`), same results as the GPU |
 | `read_ms_fast` / `write_ms_fast!` | Same results as `read_ms_to_gpu` / `write_gpu_to_ms!`, with the row gather/scatter in numpy |
 
@@ -302,6 +325,19 @@ vis, _, meta, bl, nrows = read_ms_fast(ms; gpu=false)
 model = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=false)
 cal = calibration_type(GPUZestingSource(source), meta.Nant, meta.Nfreq; gpu=false)
 ```
+
+**New in 0.3.0** (all off by default; default results are unchanged):
+- `smooth_flux` / `rfi_smooth_flux` / `smooth_exempt_flux` (`solve_gains!`, `zest_sky_rfi!`,
+  CLI `--smooth-flux` ...): per-channel gains tied to a band gain for faint directions.
+- `restore` / `restore_below_mhz` / `restore_offset_deg` and `restore_point_sources!`
+  (CLI `--restore` ...): give back what peeling took from known point sources such as Jupiter.
+- `precision = :mixed` (CLI `--precision=mixed`): normal equations in single precision,
+  the zest ~3-4x faster on GPUs with slow FP64; gains agree with double to ~1e-7.
+- `initial_gains` and the result's `gains` (CLI `--warm-start`): start from the previous
+  snapshot's gains (same channels, ≤ 60 s apart).
+- `zest_sky_rfi!` returns `restored` and `gains` as well; `zest_sky_rfi_ms!` logs read/zest/write
+  times at verbose level; `stefcal_steps!` takes `active` (channels to step);
+  `GPUSquareVisibilities` may hold ComplexF32.
 
 **Behaviour changes for all callers** (`sources.jl`):
 - `GPUPowerLaw` uses TTCal's base-10 logs. Natural logs agreed only for single-index

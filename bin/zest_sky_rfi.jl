@@ -41,6 +41,21 @@ OPTIONS:
   --max-gain=G        Reject solutions with |g| above G [default: 100]
   --min-elevation=E   Skip sky sources below E degrees [default: 0]
   --reg=O,T[,L]       Tukey phase prior: max offset O deg, taper T deg, weight L [default: off]
+  --smooth-flux=S     Tie per-channel gains to a band gain for directions fainter than ~S Jy,
+                      so they cannot absorb other sources [default: 0 = off; suggested 1000];
+                      --rfi-smooth-flux and --smooth-exempt-flux only matter when it is on
+  --rfi-smooth-flux=S The same for the RFI emitters [default: --smooth-flux]
+  --smooth-exempt-flux=F  Sky sources with catalog flux >= F Jy keep per-channel gains
+                      [default: none exempt; suggested 1e4 (Cas A, Cyg A)]
+  --restore=FILE      Point sources (JSON, e.g. Jupiter at its ephemeris position) given back
+                      after peeling: what peeling took from them is fitted and added back
+  --restore-below-mhz=F  Restore only when the band starts below F MHz [default: always]
+  --restore-offset=D  Search radius (deg) for the restored source's position on Stokes V
+                      [default: 0; 0.5 for Jupiter]
+  --precision=P       double | mixed (normal equations in single precision; ~3-4x faster on
+                      GPUs with slow FP64; tolerance floored at 1e-6) [default: double]
+  --warm-start        Start each MS from the previous MS's gains when both have the same channels
+                      and are <= 60 s apart (consecutive snapshots of one band)
   --peel              Diagonal Jones (peel) instead of full Jones (zest)
   --keep-zeros        Do not flag exactly-zero visibilities
   --cpu               Run on CPU threads (start julia with -t N)
@@ -53,6 +68,8 @@ EXAMPLES:
   julia bin/zest_sky_rfi.jl --column=DATA sources.json data.ms
   julia bin/zest_sky_rfi.jl --rfi=rfi.json --rfi-mode=joint --column=DATA sources.json *.ms
   julia -t 24 bin/zest_sky_rfi.jl --cpu --reg=0.5,0.5 sources.json data.ms
+  julia bin/zest_sky_rfi.jl --rfi=rfi.json --smooth-flux=1000 --smooth-exempt-flux=1e4 \\
+        --restore=jupiter.json --restore-below-mhz=41 --restore-offset=0.5 sources.json *.ms
 """)
 end
 
@@ -63,6 +80,9 @@ function parse_args(args)
         "min_elevation" => 0.0, "reg" => nothing, "diagonal" => false,
         "flag_zeros" => true, "gpu" => true, "column" => "CORRECTED_DATA",
         "verbosity" => :normal,
+        "smooth_flux" => 0.0, "rfi_smooth_flux" => nothing, "smooth_exempt_flux" => Inf,
+        "restore" => "", "restore_below_mhz" => Inf, "restore_offset" => 0.0,
+        "precision" => :double, "warm_start" => false,
     )
     value(arg) = String(split(arg, "="; limit=2)[2])
     positional = String[]
@@ -87,6 +107,14 @@ function parse_args(args)
             opts["reg"] = Tuple(parse.(Float64, split(value(arg), ",")))
             length(opts["reg"]) in (2, 3) || (println("--reg needs O,T or O,T,L"); exit(1))
         elseif startswith(arg, "--column=");        opts["column"] = value(arg)
+        elseif arg == "--warm-start";  opts["warm_start"] = true
+        elseif startswith(arg, "--precision=");     opts["precision"] = Symbol(value(arg))
+        elseif startswith(arg, "--smooth-flux=");   opts["smooth_flux"] = parse(Float64, value(arg))
+        elseif startswith(arg, "--rfi-smooth-flux="); opts["rfi_smooth_flux"] = parse(Float64, value(arg))
+        elseif startswith(arg, "--smooth-exempt-flux="); opts["smooth_exempt_flux"] = parse(Float64, value(arg))
+        elseif startswith(arg, "--restore=");       opts["restore"] = value(arg)
+        elseif startswith(arg, "--restore-below-mhz="); opts["restore_below_mhz"] = parse(Float64, value(arg))
+        elseif startswith(arg, "--restore-offset="); opts["restore_offset"] = parse(Float64, value(arg))
         elseif startswith(arg, "--")
             println("Unknown option: $arg"); exit(1)
         else
@@ -95,6 +123,13 @@ function parse_args(args)
     end
     opts["rfi_mode"] in (:after, :joint) || (println("--rfi-mode must be after or joint"); exit(1))
     opts["solver"] in (:rk4, :damped) || (println("--solver must be rk4 or damped"); exit(1))
+    opts["precision"] in (:double, :mixed) || (println("--precision must be double or mixed"); exit(1))
+    opts["rfi_smooth_flux"] = something(opts["rfi_smooth_flux"], opts["smooth_flux"])
+    min(opts["smooth_flux"], opts["rfi_smooth_flux"], opts["restore_offset"]) >= 0 ||
+        (println("--smooth-flux, --rfi-smooth-flux and --restore-offset must be >= 0"); exit(1))
+    opts["smooth_exempt_flux"] > 0 || (println("--smooth-exempt-flux must be > 0"); exit(1))
+    opts["smooth_flux"] + opts["rfi_smooth_flux"] > 0 && opts["reg"] !== nothing &&
+        (println("--smooth-flux cannot be combined with --reg"); exit(1))
     if length(positional) < 2
         println("Error: Need at least <sources.json> <ms_file>")
         println("Use --help for usage information")
@@ -120,7 +155,13 @@ function main()
         "Min UVW" => "$(opts["minuvw"]) λ",
         "Peel iter" => opts["peeliter"],
         "Regularisation" => opts["reg"] === nothing ? "off" : string(opts["reg"]),
+        "Smooth flux" => opts["smooth_flux"] + opts["rfi_smooth_flux"] == 0 ? "off" :
+            "sky $(opts["smooth_flux"]) Jy, RFI $(opts["rfi_smooth_flux"]) Jy, exempt " *
+            (isinf(opts["smooth_exempt_flux"]) ? "none" : "≥ $(opts["smooth_exempt_flux"]) Jy"),
+        "Restore" => isempty(opts["restore"]) ? "none" :
+            "$(opts["restore"]) (below $(opts["restore_below_mhz"]) MHz, offset ≤ $(opts["restore_offset"])°)",
         "Device" => opts["gpu"] ? "GPU" : "CPU ($(Threads.nthreads()) threads)",
+        "Precision" => "$(opts["precision"])$(opts["warm_start"] ? ", warm start" : "")",
         "Column" => opts["column"],
         "MS files" => length(opts["ms_files"]),
     )
@@ -128,7 +169,12 @@ function main()
     init_pycasacore() || (log_error("python-casacore not available"); exit(1))
     sky = read_gpu_sources(opts["sources"])
     rfi = isempty(opts["rfi"]) ? GPUSource[] : read_gpu_sources(opts["rfi"])
-    log_substep("Loaded $(length(sky)) sky sources, $(length(rfi)) RFI sources")
+    restore = isempty(opts["restore"]) ? GPUSource[] : read_gpu_sources(opts["restore"])
+    for s in restore            # the JSON reader turns these names into a placeholder at (0, 0)
+        get_name(s) in ("Sun", "Moon", "Jupiter") &&
+            (log_error("--restore: name \"$(get_name(s))\" is read as a placeholder; rename it (e.g. \"$(get_name(s)) (ephemeris)\")"); exit(1))
+    end
+    log_substep("Loaded $(length(sky)) sky sources, $(length(rfi)) RFI sources, $(length(restore)) to restore")
 
     report = opts["verbosity"] == :verbose ?
         (name, it; action, p_with, p_new, kw...) ->
@@ -136,6 +182,7 @@ function main()
         nothing
 
     ms_files = opts["ms_files"]
+    gains = nothing
     for (i, ms) in enumerate(ms_files)
         log_section("[$i/$(length(ms_files))] $(basename(ms))")
         t = @elapsed r = zest_sky_rfi_ms!(ms, sky, rfi;
@@ -143,7 +190,12 @@ function main()
             solver=opts["solver"], maxiter=opts["maxiter"], tolerance=opts["tolerance"],
             minuvw=opts["minuvw"], peeliter=opts["peeliter"], max_gain=opts["max_gain"],
             min_elevation=opts["min_elevation"], diagonal=opts["diagonal"], reg=opts["reg"],
-            flag_zeros=opts["flag_zeros"], report=report)
+            flag_zeros=opts["flag_zeros"], report=report,
+            smooth_flux=opts["smooth_flux"], rfi_smooth_flux=opts["rfi_smooth_flux"],
+            smooth_exempt_flux=opts["smooth_exempt_flux"], restore=restore,
+            restore_below_mhz=opts["restore_below_mhz"], restore_offset_deg=opts["restore_offset"],
+            precision=opts["precision"], initial_gains=gains)
+        gains = opts["warm_start"] ? r.gains : nothing
         log_substep("Peeled: $(isempty(r.peeled) ? "none" : join(r.peeled, ", "))")
         isempty(r.skipped) || log_substep("Below min elevation: $(join(r.skipped, ", "))")
         r.flagged_zeros > 0 && log_substep("Flagged $(r.flagged_zeros) zero samples")
