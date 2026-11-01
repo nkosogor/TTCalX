@@ -73,19 +73,57 @@ def _stems(spec):
     return tuple(x.strip() for x in (_read_list([spec]) if spec.startswith("@") else spec.split(",")) if x.strip())
 
 
-def cmd_hour(a):
-    import time
+def hour_setup(a):
+    """(products, phase centre string or None, image_hour_snaps keyword arguments) of parsed
+    ``hour`` arguments -- shared by the CLI and :func:`run_hour_snaps`."""
     from . import bands
-    from .hour import image_hour, image_hour_snaps, _want_v
-    if bool(a.ms) == bool(a.archive):
-        raise SystemExit("ttcalx-image hour: give snapshot MSes or --archive, not both / neither")
     prods = bands.hour_products(a.products, intervals=a.intervals, niter=a.niter,
                                 niter_10min=a.niter_10min, pols=a.pols)
     pc = a.phase_centre or (bands.hour_phase_centre(a.lst_hour) if a.lst_hour is not None else None)
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     kw = dict(products=prods, mode=a.mode, block=a.block, pols=a.pols, qa=a.qa, qa_dir=a.qa_dir,
               exclude=[int(x) for x in a.exclude.split(",")] if a.exclude else (),
               exclude_stems=_stems(a.exclude_stems), beam=_beam(a.beam), write_aux=not a.no_aux, verbose=a.verbose)
+    return prods, pc, kw
+
+
+def parse_hour(argv):
+    """Parsed ``ttcalx-image hour`` arguments (``argv`` without the 'hour' word)."""
+    a = build_parser().parse_args(["hour"] + list(argv))
+    a.products = [p.strip() for p in a.products.split(",") if p.strip()]
+    return a
+
+
+def run_hour_snaps(argv, get_snaps, timing=None, t0=None):
+    """``ttcalx-image hour <argv>`` on snapshots that are already in memory (gsi v3 hour store):
+    the same products, phase centre and options as the CLI, with ``get_snaps(ra, dec, want_v)``
+    -> list of LazySnap / load_samples mappings in place of the MS / archive load.  argv must
+    not name MSes or --archive.  Returns the summary dict (as the CLI writes it)."""
+    import time
+    from .hour import image_hour_snaps, _want_v
+    from .rotate import parse_phase_centre
+    a = parse_hour(argv)
+    if a.ms or a.archive:
+        raise ValueError("run_hour_snaps: the snapshots come from get_snaps, not from MSes / --archive")
+    prods, pc, kw = hour_setup(a)
+    if not pc:
+        raise ValueError("run_hour_snaps needs --phase-centre or --lst-hour")
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    os.environ.setdefault("TTCALX_CHUNK_CACHE", "store")      # as --archive: no host-side u, v, w copies
+    t0 = time.perf_counter() if t0 is None else t0
+    ra, dec = parse_phase_centre(pc)
+    snaps = get_snaps(ra, dec, _want_v(prods, a.pols, a.qa))
+    T = {} if timing is None else timing
+    T.setdefault("load + rotation (CPU)", time.perf_counter() - t0)
+    return image_hour_snaps(snaps, a.band, a.out, ra, dec, timing=T, t0=t0, **kw)
+
+
+def cmd_hour(a):
+    import time
+    from .hour import image_hour, image_hour_snaps, _want_v
+    if bool(a.ms) == bool(a.archive):
+        raise SystemExit("ttcalx-image hour: give snapshot MSes or --archive, not both / neither")
+    prods, pc, kw = hour_setup(a)
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     if a.archive:
         from .gsiv import archive_phase_centre, load_archive
         # archive snapshots: device chunk cache when it fits, else rebuilt on the GPU from the
@@ -110,7 +148,7 @@ def cmd_hour(a):
     return 0
 
 
-def main(argv=None):
+def build_parser():
     ap = argparse.ArgumentParser(prog="ttcalx-image", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -169,8 +207,11 @@ def main(argv=None):
     h.add_argument("--no-aux", action="store_true", help="do not write residual/model/dirty/psf")
     h.add_argument("-v", "--verbose", action="store_true")
     h.set_defaults(fn=cmd_hour)
+    return ap
 
-    a = ap.parse_args(argv)
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
     if a.cmd == "hour":
         a.products = [p.strip() for p in a.products.split(",") if p.strip()]
     return a.fn(a)

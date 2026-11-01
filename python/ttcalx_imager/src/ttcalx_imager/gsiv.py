@@ -852,6 +852,36 @@ def archive_phase_centre(paths) -> Tuple[float, float]:
     return float(meta["pd"][0]), float(meta["pd"][1])
 
 
+def lazy_snaps(records, ra=None, dec=None, want_v=True, log=None) -> List[LazySnap]:
+    """:class:`LazySnap` mappings of (meta, arrays, source) records, in time order -- one per
+    record, so the caller resolves duplicate stems (load_archive: newest wins).  A record's R
+    is used when it was computed for (ra, dec) (its ``pd_new``) or when ra is None; otherwise it
+    is recomputed with rotate.snapshot_rotation from the record's uvw, a1, a2, ant_pos and time,
+    as load_samples would.  (gsi v3: the hour store of the engine images its in-memory records
+    through this, the archive reader through load_archive.)"""
+    log = log or (lambda *a: None)
+    snaps = []
+    nrot = 0
+    for meta, arrays, source in records:
+        pd_rec = meta.get("pd_new")
+        if ra is None:
+            R, pd_new = arrays["R"], pd_rec
+        elif pd_rec is not None and float(pd_rec[0]) == float(ra) and float(pd_rec[1]) == float(dec):
+            R, pd_new = arrays["R"], (ra, dec)
+        else:
+            from .rotate import snapshot_rotation
+            R = snapshot_rotation(arrays["uvw"], arrays["a1"], arrays["a2"], arrays["ant_pos"], meta["time"],
+                                  ra, dec).astype(np.float64)
+            pd_new = (ra, dec); nrot += 1
+        if not want_v:
+            arrays = {k: v for k, v in arrays.items() if k != "V"}
+        snaps.append(LazySnap(meta, arrays, R, pd_new, source=str(source)))
+    if nrot:
+        log(f"lazy_snaps: R recomputed for {nrot} record(s) (phase centre differs from the record's)")
+    snaps.sort(key=lambda s: s["time"])
+    return snaps
+
+
 def load_archive(paths, ra=None, dec=None, want_v=True, backend="ram", verify=True, strict=True, workers=8,
                  log=None, band=None, report=None) -> List[LazySnap]:
     """Snapshots of one or more GSIV files (list, comma-separated string or @listfile) as
@@ -902,28 +932,9 @@ def load_archive(paths, ra=None, dec=None, want_v=True, backend="ram", verify=Tr
     best, superseded = newest(per_file)
     if superseded:
         log(f"load_archive: {len(superseded)} older record(s) superseded: {superseded[:5]}")
-    snaps = []
-    nbytes = 0
-    nrot = 0
-    for stem in sorted(best):
-        p, (meta, arrays, e) = best[stem]
-        pd_rec = meta.get("pd_new")
-        if ra is None:
-            R, pd_new = arrays["R"], pd_rec
-        elif pd_rec is not None and float(pd_rec[0]) == float(ra) and float(pd_rec[1]) == float(dec):
-            R, pd_new = arrays["R"], (ra, dec)
-        else:
-            from .rotate import snapshot_rotation
-            R = snapshot_rotation(arrays["uvw"], arrays["a1"], arrays["a2"], arrays["ant_pos"], meta["time"],
-                                  ra, dec).astype(np.float64)
-            pd_new = (ra, dec); nrot += 1
-        if not want_v:
-            arrays = {k: v for k, v in arrays.items() if k != "V"}
-        snaps.append(LazySnap(meta, arrays, R, pd_new, source=p))
-        nbytes += sum(a.nbytes for a in arrays.values())
-    if nrot:
-        log(f"load_archive: R recomputed for {nrot} record(s) (phase centre differs from the archive's)")
-    snaps.sort(key=lambda s: s["time"])
+    snaps = lazy_snaps([(meta, arrays, p) for stem, (p, (meta, arrays, e)) in sorted(best.items())],
+                       ra, dec, want_v=want_v, log=log)
+    nbytes = sum(s.nbytes() for s in snaps)
     if report is not None:
         report.update(problems=problems, files=[p for p, _ in per_file], stems=[s["stem"] for s in snaps],
                       superseded=superseded)
