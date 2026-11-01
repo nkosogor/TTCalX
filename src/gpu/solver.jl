@@ -605,12 +605,18 @@ is raised to at least 1e-6.  Wideband calibrations always use double.
 
 Works on GPU arrays and, per channel only, on host arrays (one channel per
 thread).  `converged` is true when every channel converged.
+
+`workspace = nothing` or a `PeelWorkspace`: the solver's scratch (steps, normal
+equations, consensus terms, and the square data / model when not passed) is taken
+from it instead of allocated; the result is bitwise the same.
 """
 function solve_gains!(calibration::GPUCalibration, measured::GPUVisibilities,
                       model::GPUVisibilities, meta::GPUMetadata;
                       solver::Symbol=:rk4, maxiter::Integer=5, tolerance::Real=1e-4,
                       minuvw::Real=0.0, reg=nothing, smooth_flux::Real=0.0,
-                      precision::Symbol=:double, model_sq=nothing, meas_sq=nothing)
+                      precision::Symbol=:double, model_sq=nothing, meas_sq=nothing,
+                      workspace::Union{Nothing,PeelWorkspace}=nothing)
+    ws = workspace
     solver in (:rk4, :damped) || throw(ArgumentError("unknown solver $solver (use :rk4 or :damped)"))
     tolerance, minuvw = Float64(tolerance), Float64(minuvw)
     use_gpu = _is_gpu(measured)
@@ -633,32 +639,44 @@ function solve_gains!(calibration::GPUCalibration, measured::GPUVisibilities,
     nsq = wideband ? 1 : Nfreq(measured)
     # `meas_sq`: optional reused scratch; `model_sq`: optional precomputed square model
     # (square_model(model, meta; minuvw, precision), constant across peel passes)
+    # fresh (zero) square matrices, or the workspace's zeroed ones
+    new_sq(tag) = ws === nothing ? GPUSquareVisibilities(Na, nsq, gpu=use_gpu, T=Tsq) :
+                                   _ws_square!(ws, tag, Na, nsq, Tsq, use_gpu)
     meas_sq = meas_sq !== nothing && eltype(meas_sq.xx) == Tsq && size(meas_sq.xx, 3) == nsq &&
-              _is_gpu(meas_sq.xx) == use_gpu ? meas_sq : GPUSquareVisibilities(Na, nsq, gpu=use_gpu, T=Tsq)
+              _is_gpu(meas_sq.xx) == use_gpu ? meas_sq : new_sq(:solve_meas_sq)
     if use_gpu
         square_visibilities!(meas_sq, measured, meta, minuvw)
         model_sq = model_sq !== nothing ? model_sq :
-            square_visibilities!(GPUSquareVisibilities(Na, nsq, gpu=true, T=Tsq), model, meta, minuvw)
+            square_visibilities!(new_sq(:solve_model_sq), model, meta, minuvw)
     else
         host_makesquare!(meas_sq, measured, meta)
         mask_short_baselines!(meas_sq, meta, minuvw)
         if model_sq === nothing
-            model_sq = GPUSquareVisibilities(Na, nsq, gpu=false, T=Tsq)
+            model_sq = new_sq(:solve_model_sq)
             host_makesquare!(model_sq, model, meta)
             mask_short_baselines!(model_sq, meta, minuvw)
         end
     end
     eltype(model_sq.xx) == Tsq && size(model_sq.xx, 3) == nsq ||
         throw(ArgumentError("model_sq does not match precision / channels of this solve"))
-    ne = use_gpu && !calibration.is_diagonal ? ne_scratch(Tsq, Na, nsq) : nothing
+    ne = !use_gpu || calibration.is_diagonal ? nothing :
+         ws === nothing ? ne_scratch(Tsq, Na, nsq) :
+         _ws_buf!(ws, :ne, Tsq, (Na, 8, cld(Na, _NE_TILE), nsq), true)
 
     Nf = Nfreq(calibration)
-    zero_like() = ntuple(_ -> use_gpu ? CUDA.zeros(ComplexF64, Na, Nf) : zeros(ComplexF64, Na, Nf), 4)
+    nbuf = Ref(0)                         # workspace: distinct Na×Nf buffers per solve
+    zero_na() = ws === nothing ? (use_gpu ? CUDA.zeros(ComplexF64, Na, Nf) : zeros(ComplexF64, Na, Nf)) :
+                                 _ws_buf!(ws, :solve, ComplexF64, (Na, Nf), use_gpu, nbuf[] += 1)
+    zero_like() = ntuple(_ -> zero_na(), 4)
     g = (calibration.xx, calibration.xy, calibration.yx, calibration.yy)
     diag = calibration.is_diagonal
     comps = diag ? (1, 4) : (1, 2, 3, 4)
     rho = Na * (Float64(smooth_flux) / 2)^2
-    w = rho > 0 ? ntuple(_ -> use_gpu ? CUDA.zeros(ComplexF64, Na, Nf) : zeros(ComplexF64, Na, Nf), 12) : nothing
+    w = rho > 0 ? ntuple(_ -> zero_na(), 12) : nothing
+    # ‖·‖² per channel of each component; with a workspace, the Na×Nf |·|² goes into a reused buffer
+    t_abs2 = ws === nothing ? nothing : _ws_buf!(ws, :solve_abs2, Float64, (Na, Nf), use_gpu; zero=false)
+    colsum_abs2!(x) = (t_abs2 .= abs2.(x); sum(t_abs2; dims=1))
+    colsum_abs2!(a, b) = (t_abs2 .= abs2.(a .- b); sum(t_abs2; dims=1))
     act = Ref{Any}(nothing)               # RK4: channels still iterating (GPU or host Bool vector)
     steps!(k, x) = rho > 0 ? consensus_steps!(k, x, diag, meas_sq, model_sq, Na, rho, w; ne=ne) :
         stefcal_steps!(k, x, diag, meas_sq, model_sq, Na; reg=reg, active=act[], ne=ne)
@@ -699,8 +717,13 @@ function solve_gains!(calibration::GPUCalibration, measured::GPUVisibilities,
             gnew[c] .= g[c] .+ (k1[c] .+ 2 .* k2[c] .+ 2 .* k3[c] .+ k4[c]) ./ 6
         end
         # ‖ΔG‖² and ‖G‖² per channel, summed on the device: one transfer per iteration
-        dg = sum(sum(abs2.(gnew[c] .- g[c]); dims=1) for c in comps)
-        gg = sum(sum(abs2.(g[c]); dims=1) for c in comps)
+        if ws === nothing
+            dg = sum(sum(abs2.(gnew[c] .- g[c]); dims=1) for c in comps)
+            gg = sum(sum(abs2.(g[c]); dims=1) for c in comps)
+        else
+            dg = sum(colsum_abs2!(gnew[c], g[c]) for c in comps)
+            gg = sum(colsum_abs2!(g[c]) for c in comps)
+        end
         both = Array(vcat(dg, gg))
         dn = both[1, :]; gn = both[2, :]
         mask = use_gpu ? CuArray(reshape(active, 1, Nf)) : reshape(active, 1, Nf)
@@ -723,8 +746,19 @@ function square_model(model::GPUVisibilities, meta::GPUMetadata; minuvw::Real=0.
                       precision::Symbol=:double, wideband::Bool=false)
     use_gpu = _is_gpu(model)
     T = precision == :mixed && !wideband ? ComplexF32 : ComplexF64
-    sq = GPUSquareVisibilities(meta.Nant, wideband ? 1 : Nfreq(model), gpu=use_gpu, T=T)
-    if use_gpu
+    square_model!(GPUSquareVisibilities(meta.Nant, wideband ? 1 : Nfreq(model), gpu=use_gpu, T=T),
+                  model, meta; minuvw=minuvw)
+end
+
+"""
+    square_model!(sq, model, meta; minuvw=0.0) -> sq
+
+`square_model` into the zero-filled square visibilities `sq` (element type and
+channel count give the precision and wideband choice).
+"""
+function square_model!(sq::GPUSquareVisibilities, model::GPUVisibilities, meta::GPUMetadata;
+                       minuvw::Real=0.0)
+    if _is_gpu(model)
         square_visibilities!(sq, model, meta, minuvw)
     else
         host_makesquare!(sq, model, meta); mask_short_baselines!(sq, meta, minuvw)

@@ -339,6 +339,16 @@ cal = calibration_type(GPUZestingSource(source), meta.Nant, meta.Nfreq; gpu=fals
   times at verbose level; `stefcal_steps!` takes `active` (channels to step);
   `GPUSquareVisibilities` may hold ComplexF32.
 
+**Reusing buffers across calls** (off by default): a process that peels snapshot after
+snapshot can pass one `ws = PeelWorkspace()` as `zest_sky_rfi!(...; workspace=ws)`.  The models,
+square matrices, solver scratch, residual and restore buffers are then kept and reused while
+(Nant, Nbase, Nfreq, precision, device) stay the same, so a warm call allocates ~20 MB of device
+memory instead of ~10 GB (OVRO-LWA, 352 antennas, 48 channels, Jupiter restore) and CUDA.jl does
+not collect inside the solve under `JULIA_CUDA_SOFT_MEMORY_LIMIT`.  Results are bitwise identical
+to calls without it.  `workspace_bytes(ws)` is its size (~2.4 GB for 4 sky sources + 1 RFI
+emitter + restore; `cache_model_sq=false` keeps one square model instead of one per direction,
+~180 MB each); `free_workspace!(ws)` releases it.
+
 **Behaviour changes for all callers** (`sources.jl`):
 - `GPUPowerLaw` uses TTCal's base-10 logs. Natural logs agreed only for single-index
   spectra, so curved spectra such as Cyg A's were several times too faint.

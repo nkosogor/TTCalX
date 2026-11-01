@@ -28,6 +28,14 @@
 residual_power(vis::GPUVisibilities) =
     Float64(sum(abs2, vis.xx .* .!vis.flags) + sum(abs2, vis.yy .* .!vis.flags))
 
+"""`residual_power(vis)` with the masked visibilities in `buf` (Nbase×Nfreq ComplexF64) instead of new arrays."""
+function residual_power!(buf, vis::GPUVisibilities)
+    buf .= vis.xx .* .!vis.flags
+    pxx = sum(abs2, buf)
+    buf .= vis.yy .* .!vis.flags
+    Float64(pxx + sum(abs2, buf))
+end
+
 """
     flag_zero_visibilities!(vis) -> n
 
@@ -43,7 +51,26 @@ function flag_zero_visibilities!(vis::GPUVisibilities)
     n
 end
 
+"""`flag_zero_visibilities!(vis)` with its two masks in buffers of `ws`."""
+function flag_zero_visibilities!(vis::GPUVisibilities, ws::PeelWorkspace)
+    gpu = _is_gpu(vis.xx)
+    zero = _ws_buf!(ws, :zero_mask, Bool, size(vis.xx), gpu, 1; zero=false)
+    new = _ws_buf!(ws, :zero_mask, Bool, size(vis.xx), gpu, 2; zero=false)
+    zero .= (vis.xx .== 0) .& (vis.yy .== 0)
+    new .= zero .& .!vis.flags
+    n = Int(sum(new))
+    vis.flags .|= zero
+    n
+end
+
 _save_gains(cal) = (copy(cal.xx), copy(cal.xy), copy(cal.yx), copy(cal.yy), copy(cal.flags))
+
+function _save_gains!(ws::PeelWorkspace, cal)
+    gpu = _is_gpu(cal.xx)
+    c(q, f) = copyto!(_ws_buf!(ws, :saved_gains, ComplexF64, size(cal.xx), gpu, q; zero=false), getfield(cal, f))
+    (c(1, :xx), c(2, :xy), c(3, :yx), c(4, :yy),
+     copyto!(_ws_buf!(ws, :saved_flags, Bool, size(cal.flags), gpu; zero=false), cal.flags))
+end
 
 function _restore_gains!(cal, saved)
     cal.xx .= saved[1]; cal.xy .= saved[2]; cal.yx .= saved[3]; cal.yy .= saved[4]
@@ -133,7 +160,7 @@ _add!(vis, coherency, cal, meta) = _add!(vis, coherency, cal, meta, _scratch(vis
 """
     guarded_zest!(vis, meta, coherencies, calibrations, solve;
                   peeliter=3, max_gain=Inf, require_convergence=false,
-                  report=nothing) -> subtracted::BitVector
+                  report=nothing, workspace=nothing) -> subtracted::BitVector
 
 Peel/zest loop of CPU TTCal (`peel!`: subtract every source with its
 starting gains, then `peeliter` passes of add back → solve → subtract), with
@@ -152,16 +179,23 @@ in, or left in the data (the residual never grows from a source update).
 `report(index, iteration; converged, niters, finite, max_gain, p_with, p_old,
 p_new, action)` is called after every update (`action` is :accept,
 :keep_previous or :leave_in).  Returns which sources end up subtracted;
-`calibrations` hold the gains that were used.
+`calibrations` hold the gains that were used.  With a `PeelWorkspace` the residual
+powers, saved gains and the host corruption scratch use its buffers (same results).
 """
 function guarded_zest!(vis::GPUVisibilities, meta::GPUMetadata,
                        coherencies::AbstractVector, calibrations::AbstractVector, solve;
                        peeliter::Integer=3, max_gain::Real=Inf,
-                       require_convergence::Bool=false, report=nothing)
+                       require_convergence::Bool=false, report=nothing,
+                       workspace::Union{Nothing,PeelWorkspace}=nothing)
+    ws = workspace
     N = length(coherencies)
     all(c -> size(c.xx) == size(vis.xx), coherencies) ||
         throw(DimensionMismatch("every coherency must have the visibilities' size"))
-    buf = N == 0 || _fused(vis, calibrations[1]) ? nothing : deepcopy_gpu(coherencies[1])
+    buf = N == 0 || _fused(vis, calibrations[1]) ? nothing :
+          ws === nothing ? deepcopy_gpu(coherencies[1]) : _ws_copy!(ws, :corrupt, coherencies[1])
+    rbuf = ws === nothing ? nothing :
+           _ws_buf!(ws, :residual, ComplexF64, size(vis.xx), _is_gpu(vis.xx); zero=false)
+    power() = rbuf === nothing ? residual_power(vis) : residual_power!(rbuf, vis)
     length(calibrations) == N || throw(ArgumentError("one calibration per coherency"))
     subtracted = trues(N)
     for s in 1:N
@@ -169,16 +203,16 @@ function guarded_zest!(vis::GPUVisibilities, meta::GPUMetadata,
     end
     for iteration in 1:peeliter, s in 1:N
         coherency, cal = coherencies[s], calibrations[s]
-        p_old = subtracted[s] ? residual_power(vis) : Inf
+        p_old = subtracted[s] ? power() : Inf
         subtracted[s] && _add!(vis, coherency, cal, meta, buf)
-        p_with = residual_power(vis)
-        saved = _save_gains(cal)
+        p_with = power()
+        saved = ws === nothing ? _save_gains(cal) : _save_gains!(ws, cal)
         converged, niters = solve(cal, vis, coherency)
         finite, gmax = max_gain_amplitude(cal)
         p_new = Inf
         if finite && gmax <= max_gain && (converged || !require_convergence)
             _subtract!(vis, coherency, cal, meta, buf)
-            p_new = residual_power(vis)
+            p_new = power()
             if p_new < p_with && p_new <= p_old
                 subtracted[s] = true
                 report === nothing || report(s, iteration; converged, niters, finite,

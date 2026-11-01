@@ -35,6 +35,7 @@ end
 
 """Unit-modulus fringe K = M/|M| of a point-source model (0 where M = 0)."""
 _unit_fringe(m) = ifelse.(abs.(m) .> 0, m ./ max.(abs.(m), floatmin(Float64)), zero(ComplexF64))
+_unit_fringe!(K, m) = (K .= ifelse.(abs.(m) .> 0, m ./ max.(abs.(m), floatmin(Float64)), zero(ComplexF64)))
 
 """
     _shift_to_peak(K, S, w, meta, max_offset_deg) -> (K', (δl, δm))
@@ -50,20 +51,47 @@ function _shift_to_peak(K, S, w, meta, max_offset_deg)
     P = ifelse.(w, conj.(K) .* S, zero(ComplexF64))
     sub = 1:4:size(K, 2)
     coarse = (P[:, sub], u[:, sub], v[:, sub])
-    score(P, u, v, d) = abs(sum(Broadcast.instantiate(
-        Broadcast.broadcasted((p, a, b) -> p * cis(-(a * d[1] + b * d[2])), P, u, v))))
+    best = _peak_offset(coarse, (P, u, v), max_offset_deg)
+    K .* cis.(u .* best[1] .+ v .* best[2]), best
+end
+
+"""`_shift_to_peak` with every array in buffers of `ws`; K is shifted in place."""
+function _shift_to_peak!(K, S, w, meta, max_offset_deg, ws::PeelWorkspace)
+    gpu = _is_gpu(K)
+    buf(tag, T, dims) = _ws_buf!(ws, tag, T, dims, gpu; zero=false)
+    nu = reshape(meta.channels[1:size(K, 2)], 1, :)
+    u = buf(:shift_u, Float64, size(K)); v = buf(:shift_v, Float64, size(K))
+    u .= reshape(meta.uvw[1, :], :, 1) .* (2π / SPEED_OF_LIGHT) .* nu
+    v .= reshape(meta.uvw[2, :], :, 1) .* (2π / SPEED_OF_LIGHT) .* nu
+    P = buf(:residual, ComplexF64, size(K))
+    P .= ifelse.(w, conj.(K) .* S, zero(ComplexF64))
+    sub = 1:4:size(K, 2)
+    dc = (size(K, 1), length(sub))
+    coarse = (buf(:shift_Pc, ComplexF64, dc) .= view(P, :, sub), buf(:shift_uc, Float64, dc) .= view(u, :, sub),
+              buf(:shift_vc, Float64, dc) .= view(v, :, sub))
+    best = _peak_offset(coarse, (P, u, v), max_offset_deg)
+    K .= K .* cis.(u .* best[1] .+ v .* best[2])
+    K, best
+end
+
+"""|Σ p e^{-i(a δl + b δm)}| over the samples, for the offset d = (δl, δm)."""
+_peak_score(P, u, v, d) = abs(sum(Broadcast.instantiate(
+    Broadcast.broadcasted((p, a, b) -> p * cis(-(a * d[1] + b * d[2])), P, u, v))))
+
+"""Offset within `max_offset_deg` maximising `_peak_score`: coarse grid, then a 5× finer one."""
+function _peak_offset(coarse, full, max_offset_deg)
     r = deg2rad(max_offset_deg)
     best = (0.0, 0.0)
-    for (step, n, args) in ((r / 10, 10, coarse), (r / 50, 5, (P, u, v)))
+    for (step, n, args) in ((r / 10, 10, coarse), (r / 50, 5, full))
         c = best; bs = -1.0
         for i in -n:n, j in -n:n
             d = (c[1] + i * step, c[2] + j * step)
             hypot(d...) <= r * (1 + 1e-9) || continue
-            sc = score(args..., d)
+            sc = _peak_score(args..., d)
             sc > bs && (bs = sc; best = d)
         end
     end
-    K .* cis.(u .* best[1] .+ v .* best[2]), best
+    best
 end
 
 """
@@ -82,19 +110,30 @@ coherencies (xx, xy, yx, yy) in Jy.
 where the original data's Stokes V (xy - yx) peaks: for a strongly circularly
 polarised source such as Jupiter's decametric emission, whose position in the
 data can differ from the model's by 10-25'.  Leave it 0 for other sources.
+
+`workspace = nothing` or a `PeelWorkspace` for the visibility-sized scratch (same result).
 """
 function restore_point_sources!(vis::GPUVisibilities, before::GPUVisibilities, meta::GPUMetadata,
                                 mjd::Float64, sources::AbstractVector; others=[],
-                                minuvw::Real=5.0, offset_deg::Real=0.0)
+                                minuvw::Real=5.0, offset_deg::Real=0.0,
+                                workspace::Union{Nothing,PeelWorkspace}=nothing)
+    ws = workspace
     gpu = _is_gpu(vis.xx)
+    buf(tag, i=1) = _ws_buf!(ws, tag, ComplexF64, size(vis.xx), gpu, i; zero=false)
     w = _uv_weights(meta, vis.flags, minuvw)
     offsets = Tuple{Float64,Float64}[]
-    fr = map(sources) do s
-        coh = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=gpu)
+    fr = map(enumerate(sources)) do (i, s)
+        coh = ws === nothing ? GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=gpu) :
+                               _ws_vis!(ws, :restore_model, meta.Nbase, meta.Nfreq, gpu)
         genvis_exact!(coh, meta, s, mjd)
-        K = _unit_fringe(coh.xx)
+        K = ws === nothing ? _unit_fringe(coh.xx) : _unit_fringe!(buf(:restore_fringe, i), coh.xx)
         if offset_deg > 0
-            K, d = _shift_to_peak(K, before.xy .- before.yx, w, meta, offset_deg)
+            if ws === nothing
+                K, d = _shift_to_peak(K, before.xy .- before.yx, w, meta, offset_deg)
+            else
+                K, d = _shift_to_peak!(K, buf(:restore_diff) .= before.xy .- before.yx, w, meta,
+                                       offset_deg, ws)
+            end
             push!(offsets, d)
         else
             push!(offsets, (0.0, 0.0))
@@ -104,14 +143,19 @@ function restore_point_sources!(vis::GPUVisibilities, before::GPUVisibilities, m
     basis = vcat(fr, collect(others))
     nsrc, nk, Nf = length(fr), length(basis), size(vis.xx, 2)
     masked(x) = vec(Array(sum(ifelse.(w, x, zero(ComplexF64)); dims=1)))
+    # Σ over the samples w of conj(a) b per channel; with a workspace the products and the
+    # mask go into one reused buffer (the same two broadcasts)
+    masked!(x) = (x .= ifelse.(w, x, zero(ComplexF64)); vec(Array(sum(x; dims=1))))
+    inner(a, b) = ws === nothing ? masked(conj.(a) .* b) : masked!(buf(:residual) .= conj.(a) .* b)
     G = zeros(ComplexF64, nk, nk, Nf)                    # normal equations, built on the device
     for k in 1:nk, l in k:nk
-        G[k, l, :] .= masked(conj.(basis[k]) .* basis[l]); G[l, k, :] .= conj.(G[k, l, :])
+        G[k, l, :] .= inner(basis[k], basis[l]); G[l, k, :] .= conj.(G[k, l, :])
     end
     C = [ntuple(_ -> zeros(ComplexF64, Nf), 4) for _ in 1:nsrc]
     for (q, f) in enumerate((:xx, :xy, :yx, :yy))
-        sub = getfield(before, f) .- getfield(vis, f)
-        rhs = reduce(hcat, [masked(conj.(b) .* sub) for b in basis])          # Nf × nk
+        sub = ws === nothing ? getfield(before, f) .- getfield(vis, f) :
+                               (buf(:restore_diff) .= getfield(before, f) .- getfield(vis, f))
+        rhs = reduce(hcat, [inner(b, sub) for b in basis])          # Nf × nk
         for c in 1:Nf
             d = sqrt.(max.(real.([G[k, k, c] for k in 1:nk]), 0.0))           # column norms
             any(>(0), d) || continue                                           # no data
@@ -186,6 +230,10 @@ Keywords:
   the same shape (otherwise identity, with a log line saying why)
 - `cache_model_sq = (precision == :mixed)`: build each direction's square model once per pass
   instead of per solve (faster; ~190 MB per direction in :mixed, 380 MB in :double)
+- `workspace = nothing` or a `PeelWorkspace`: take the models, square matrices, solver
+  scratch, residual and restore buffers from it, so that repeated calls with the same shapes
+  allocate almost no device memory (a long-lived process with a CUDA soft memory limit then
+  does not collect inside the solve).  Results are bitwise the same as without it.
 
 Returns `(peeled, skipped, flagged_zeros, restored, gains)`: names of the subtracted sources,
 names of the sky sources below `min_elevation`, newly flagged zero samples,
@@ -203,7 +251,8 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
                        smooth_exempt_flux::Real=Inf, restore::AbstractVector=GPUSource[],
                        restore_below_mhz::Real=Inf, restore_offset_deg::Real=0.0,
                        precision::Symbol=:double, initial_gains=nothing, warm_max_age_s::Real=60.0,
-                       cache_model_sq::Bool=(precision == :mixed))
+                       cache_model_sq::Bool=(precision == :mixed),
+                       workspace::Union{Nothing,PeelWorkspace}=nothing)
     rfi_mode in (:after, :joint) || throw(ArgumentError("rfi_mode must be :after or :joint"))
     precision in (:double, :mixed) || throw(ArgumentError("precision must be :double or :mixed"))
     smooth_exempt_flux > 0 || throw(ArgumentError("smooth_exempt_flux must be > 0 (Inf: none exempt)"))
@@ -212,7 +261,9 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
         throw(ArgumentError("smooth_flux cannot be combined with reg"))
     restore_offset_deg >= 0 || throw(ArgumentError("restore_offset_deg must be ≥ 0"))
     gpu = _is_gpu(vis.xx)
-    nzero = flag_zeros ? flag_zero_visibilities!(vis) : 0
+    ws = workspace
+    ws === nothing || _ws_prepare!(ws, (meta.Nant, meta.Nbase, meta.Nfreq, precision, gpu))
+    nzero = !flag_zeros ? 0 : ws === nothing ? flag_zero_visibilities!(vis) : flag_zero_visibilities!(vis, ws)
     prior = reg === nothing ? nothing :
         phase_regularization(meta, reg[1], reg[2]; lambda=length(reg) > 2 ? reg[3] : 1.0, gpu=gpu)
     nu0 = _mean(Array(meta.channels))
@@ -222,13 +273,15 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
     up = [source_elevation_deg(s, meta) >= min_elevation for s in sky]
     restored = _band_above(meta, restore_below_mhz) ? GPUSource[] :
         [s for s in restore if source_elevation_deg(s, meta) >= min_elevation]
-    before = isempty(restored) ? nothing : deepcopy_gpu(vis)
+    before = isempty(restored) ? nothing : ws === nothing ? deepcopy_gpu(vis) : _ws_copy!(ws, :before, vis)
     peeled_models = []                     # xx models of the subtracted directions (restore basis)
     warm = _warm_usable(initial_gains, meta, mjd, warm_max_age_s)
     solved = Pair{String,GPUCalibration}[]  # final gains of every solved direction
     passes = rfi_mode == :joint ? [vcat(sky[up], rfi)] : [sky[up], rfi]
     wrap = diagonal ? GPUPeelingSource : GPUZestingSource
     peeled = String[]
+    Tsq = precision == :mixed ? ComplexF32 : ComplexF64
+    nmodel = 0                             # workspace models used so far (kept over the passes)
     for sources in passes
         isempty(sources) && continue
         cals = [calibration_type(wrap(s), meta.Nant, meta.Nfreq; gpu=gpu) for s in sources]
@@ -237,7 +290,8 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
         end
         append!(solved, get_name.(sources) .=> cals)
         cohs = map(sources) do s
-            c = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=gpu)
+            c = ws === nothing ? GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=gpu) :
+                                 _ws_vis!(ws, :model, meta.Nbase, meta.Nfreq, gpu, nmodel += 1)
             if is_rfi(s)
                 gpu_genvis!(c, meta, s, meta.phase_center_ra, meta.phase_center_dec, 0.0)
             else
@@ -252,26 +306,29 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
         # the square models are constant over the peel passes: built once per direction
         # (Nant² Nfreq × 4 per direction: 190 MB at 352 antennas, 48 channels, :mixed)
         sqcache = IdDict{Any,Any}()
-        meas_sq = GPUSquareVisibilities(meta.Nant, meta.Nfreq; gpu=gpu,
-                                        T=precision == :mixed ? ComplexF32 : ComplexF64)
+        meas_sq = ws === nothing ? GPUSquareVisibilities(meta.Nant, meta.Nfreq; gpu=gpu, T=Tsq) :
+                                   _ws_square!(ws, :meas_sq, meta.Nant, meta.Nfreq, Tsq, gpu)
+        # workspace: square models numbered within the pass (the passes reuse them)
+        new_model_sq(coh) = ws === nothing ? square_model(coh, meta; minuvw=minuvw, precision=precision) :
+            square_model!(_ws_square!(ws, :model_sq, meta.Nant, meta.Nfreq, Tsq, gpu, length(sqcache) + 1),
+                          coh, meta; minuvw=minuvw)
         solve = (cal, v, coh) -> begin
-            msq = cache_model_sq ?
-                get!(() -> square_model(coh, meta; minuvw=minuvw, precision=precision), sqcache, coh) :
-                nothing
+            msq = cache_model_sq ? get!(() -> new_model_sq(coh), sqcache, coh) : nothing
             converged, niters, _ = solve_gains!(cal, v, coh, meta; solver=solver, maxiter=maxiter,
                                                 tolerance=tolerance, minuvw=minuvw, reg=prior,
                                                 smooth_flux=sflux[findfirst(c -> c === cal, cals)],
-                                                precision=precision, model_sq=msq, meas_sq=meas_sq)
+                                                precision=precision, model_sq=msq, meas_sq=meas_sq,
+                                                workspace=ws)
             converged, niters
         end
         sub = guarded_zest!(vis, meta, cohs, cals, solve; peeliter=peeliter,
-                            max_gain=max_gain, report=rep)
+                            max_gain=max_gain, report=rep, workspace=ws)
         append!(peeled, get_name.(sources[sub]))
         before === nothing || append!(peeled_models, [c.xx for c in cohs[sub]])
     end
     res = isempty(restored) ? [] :
         restore_point_sources!(vis, before, meta, mjd, restored; others=peeled_models,
-                               minuvw=minuvw, offset_deg=restore_offset_deg)
+                               minuvw=minuvw, offset_deg=restore_offset_deg, workspace=ws)
     for (s, (C, d)) in zip(restored, res)
         log_detail(@sprintf("%s: restored %.1f Jy (band-mean Stokes I), offset %.1f', %.1f'",
                             get_name(s), real(_mean(C[1]) + _mean(C[4])),
