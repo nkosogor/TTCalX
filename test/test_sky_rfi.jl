@@ -65,6 +65,12 @@ const TIGHT = (maxiter=30, tolerance=1e-8)
         zest_sky_rfi!(c, meta, TEST_MJD, [src]; smooth_flux=1e5, smooth_exempt_flux=100.0, TIGHT...)
         @test a.xx != b.xx                    # smoothed: a different (band-gain) fit
         @test a.xx == c.xx && a.yy == c.yy    # catalog flux ≥ 100 Jy: exempt, per channel as before
+        d = deepcopy_gpu(measured)            # exempt by name: the same as the flux exemption
+        zest_sky_rfi!(d, meta, TEST_MJD, [src]; smooth_flux=1e5, smooth_exempt_names=["src"], TIGHT...)
+        @test a.xx == d.xx && a.yy == d.yy
+        e = deepcopy_gpu(measured)            # an unknown name changes nothing
+        zest_sky_rfi!(e, meta, TEST_MJD, [src]; smooth_flux=1e5, smooth_exempt_names=Set(["other"]), TIGHT...)
+        @test b.xx == e.xx && b.yy == e.yy
         @test_throws ArgumentError zest_sky_rfi!(deepcopy_gpu(measured), meta, TEST_MJD, [src]; smooth_flux=-1)
         @test_throws ArgumentError zest_sky_rfi!(deepcopy_gpu(measured), meta, TEST_MJD, [src];
                                                  smooth_flux=10, reg=(0.5, 0.5))
