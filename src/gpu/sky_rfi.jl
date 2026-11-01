@@ -219,7 +219,9 @@ Keywords:
 - `smooth_flux = 0.0` (Jy, off): tie each sky direction's per-channel gains to one band
   gain (`solve_gains!`): directions fainter than this cannot absorb other sources.
   `rfi_smooth_flux = smooth_flux` the same for the RFI emitters; sky sources with catalog
-  flux ≥ `smooth_exempt_flux = Inf` (e.g. 1e4 for Cas A, Cyg A) always keep per-channel gains
+  flux ≥ `smooth_exempt_flux = Inf` (e.g. 1e4 for Cas A, Cyg A) always keep per-channel gains,
+  and so do the sky sources named in `smooth_exempt_names` (a collection of source names, e.g.
+  chosen per snapshot by elevation or apparent flux; names that are not in `sky` are ignored)
 - `restore = GPUSource[]`: point sources (e.g. Jupiter at its ephemeris position) given back
   after peeling (`restore_point_sources!`), only when the band starts below
   `restore_below_mhz = Inf`; `restore_offset_deg = 0.0` position search radius on Stokes V
@@ -248,7 +250,8 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
                        max_gain::Real=100.0, min_elevation::Real=0.0, diagonal::Bool=false,
                        reg=nothing, flag_zeros::Bool=true, report=nothing,
                        smooth_flux::Real=0.0, rfi_smooth_flux::Real=smooth_flux,
-                       smooth_exempt_flux::Real=Inf, restore::AbstractVector=GPUSource[],
+                       smooth_exempt_flux::Real=Inf, smooth_exempt_names=(),
+                       restore::AbstractVector=GPUSource[],
                        restore_below_mhz::Real=Inf, restore_offset_deg::Real=0.0,
                        precision::Symbol=:double, initial_gains=nothing, warm_max_age_s::Real=60.0,
                        cache_model_sq::Bool=(precision == :mixed),
@@ -267,8 +270,9 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
     prior = reg === nothing ? nothing :
         phase_regularization(meta, reg[1], reg[2]; lambda=length(reg) > 2 ? reg[3] : 1.0, gpu=gpu)
     nu0 = _mean(Array(meta.channels))
+    exempt_names = Set{String}(String.(collect(smooth_exempt_names)))
     smooth_of(s) = is_rfi(s) ? rfi_smooth_flux :
-        _intrinsic_flux(s, nu0) >= smooth_exempt_flux ? 0.0 : smooth_flux
+        (get_name(s) in exempt_names || _intrinsic_flux(s, nu0) >= smooth_exempt_flux) ? 0.0 : smooth_flux
 
     up = [source_elevation_deg(s, meta) >= min_elevation for s in sky]
     restored = _band_above(meta, restore_below_mhz) ? GPUSource[] :
