@@ -37,8 +37,11 @@ ttcalx-image hour @list41.txt --band 41 --out hour41/41MHz --lst-hour 2 --qa-dir
 The same band-hour from a GSIV archive (gsi v3: one record file per band-hour instead of ~358
 MSes, written by gpu-subband-imaging `v3/hourstore.py`; `ttcalx_imager.gsiv`). The records hold
 I and V per kept sample and uvw / natural weight / kept mask per row, and `load_archive`
-rebuilds u, v, w, nw with the `msio.load_samples` expressions, so the sample arrays and the
-products are those of the MS run. QA rejections can be given by stem:
+rebuilds u, v, w, nw with the `msio.load_samples` expressions, so u, v, w, nw, I and V are those of
+the MS run bit for bit. R is the writer's `load_samples` R: casacore's measures caching makes it depend
+on the call order in a process (~1e-10), as between two process-pool loads of the MSes. Loading is
+strict: a torn, partial, corrupt or mixed-band archive raises `GSIVError`, and the newest record of a
+stem wins. QA rejections can be given by stem:
 
 ```bash
 ttcalx-image hour --archive a.gsiv[,b.gsiv] --band 41 --out hour41/41MHz --lst-hour 2 \
