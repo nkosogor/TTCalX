@@ -12,6 +12,7 @@ reproduces the main-pipeline WSClean products for our settings:
 pip install -e 'python/ttcalx_imager[gpu,test]'
 ttcalx-image snapshot /data/20261023_080003_41MHz.ms --out-dir out/
 ttcalx-image hour @list41.txt --band 41 --out out/41MHz --lst-hour 2
+ttcalx-image hour --archive 41MHz-2026-10-31-02h-peeled-b000.gsiv --band 41 --out out/41MHz --lst-hour 2
 pytest python/ttcalx_imager/tests        # GPU tests are skipped without CuPy/CUDA
 ```
 
@@ -23,7 +24,7 @@ All are optional; the defaults are what the regression tests use.
 
 | variable | default | meaning |
 |---|---|---|
-| `TTCALX_CHUNK_CACHE` | `auto` | hour job: keep loaded chunks on the GPU (`auto`, if free memory allows), on the host (`host`) or not at all (`off`). Use `host`/`off` on a GPU shared with other daemons. |
+| `TTCALX_CHUNK_CACHE` | `auto` (`store` with `--archive`) | hour job: keep loaded chunks on the GPU (`auto`, if free memory allows), on the host (`host`) or not at all (`off`). Use `host`/`off` on a GPU shared with other daemons. `store`: on the GPU if it fits, else rebuilt per use from the archive records (u, v, w expanded on the GPU; no host copies). |
 | `TTCALX_CACHE_MARGIN_GB` | `5` | `auto` chunk cache: free GPU memory to leave. |
 | `TTCALX_KEEP_FFT_PLANS` / `TTCALX_FFT_PLAN_CACHE_GB` | `1` / `1.5` | hour job: keep cuFFT plans across intervals in a plan cache of this size (set process wide, not restored). |
 | `TTCALX_HOGBOM_MB_BPS` | `2` | blocks per SM of the cooperative Hogbom kernel (falls back to the single-block kernel if the launch is refused). |

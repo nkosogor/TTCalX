@@ -34,6 +34,17 @@ ttcalx-image hour @list41.txt --band 41 --out hour41/41MHz --lst-hour 2 --qa-dir
 #      hour41/41MHz-10min-t000N-...fits, hour41/41MHz-summary.json
 ```
 
+The same band-hour from a GSIV archive (gsi v3: one record file per band-hour instead of ~358
+MSes, written by gpu-subband-imaging `v3/hourstore.py`; `ttcalx_imager.gsiv`). The records hold
+I and V per kept sample and uvw / natural weight / kept mask per row, and `load_archive`
+rebuilds u, v, w, nw with the `msio.load_samples` expressions, so the sample arrays and the
+products are those of the MS run. QA rejections can be given by stem:
+
+```bash
+ttcalx-image hour --archive a.gsiv[,b.gsiv] --band 41 --out hour41/41MHz --lst-hour 2 \
+    --products orca --qa none --exclude-stems @rejected-stems.txt
+```
+
 All main-pipeline hourly products from one load of the data, with WSClean's file names
 (`<prefix>-I-Deep-Taper-Robust-0-image.fits`, `-residual`, `-model`, `-dirty`, `-psf`,
 `<prefix>-I-Taper-10min-t0000-image.fits`, `<prefix>-V-Taper-Deep-image.fits`, ...):
