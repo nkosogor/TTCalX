@@ -34,6 +34,37 @@ SIGMA_TO_FWHM = 2.0 * math.sqrt(2.0 * math.log(2.0))
 WRAP = True    # emulate the unsigned index arithmetic of the C++ fitter (see _fit_box)
 
 
+class DegeneratePSFError(ValueError):
+    """The snapshot's PSF / restoring beam is unusable: the unflagged uv coverage is too small for
+    the WSClean-equivalent clean (e.g. a snapshot whose data are almost all exactly zero, flagged by
+    the peel's flag_zero, leaving a few short baselines).  A property of the input data, so a
+    retry gives the same result: callers treat it as a permanent input failure (skip the snapshot)."""
+    permanent_input_failure = True
+
+
+def local_rms_radius(scale_deg, theo_pix, window=25.0):
+    """Radius [px] inside which local_rms_factor takes the minimum RMS: the horizon (r = 1) less
+    1.5 RMS-window widths (3 sigma of the window Gaussian, FWHM = window * theo_pix)."""
+    return 1.0 / math.radians(scale_deg) - 3 * window * theo_pix / 2.3548
+
+
+def check_psf_support(scale_deg, theo_pix, window=25.0, npts=None):
+    """Raise DegeneratePSFError when the theoretical beam (1 / max|uvw|) is so wide that the
+    local-RMS window covers the whole sky: local_rms_factor would have no pixel to take its minimum
+    over (local_rms_radius <= 0; the centre pixel is always inside the horizon, so the selection is
+    empty exactly then), and the restoring-beam fit runs on a PSF wider than its fitting box.
+    Snapshots that pass are imaged exactly as before."""
+    R = local_rms_radius(scale_deg, theo_pix, window)
+    if not R > 0:
+        sc = math.radians(scale_deg)
+        maxuvw = 1.0 / (theo_pix * sc) if theo_pix and math.isfinite(theo_pix) else float("nan")
+        raise DegeneratePSFError(
+            f"degenerate PSF: max|uvw| = {maxuvw:.4g} lambda{'' if npts is None else f' over {npts} samples'} "
+            f"gives a theoretical beam of {theo_pix:.4g} px ({theo_pix * scale_deg:.3g} deg); the local-RMS "
+            f"window ({window:g} beams) covers the whole sky (radius {R:.4g} px <= 0): too few / too short "
+            f"unflagged baselines (e.g. a snapshot whose data are almost all exactly zero)")
+
+
 def _gauss(x, y, sx, sy, beta):
     return np.exp(-x * x / (2.0 * sx * sx) + beta * x * y / (sx * sy) - y * y / (2.0 * sy * sy))
 
@@ -137,5 +168,10 @@ def fit_beam(psf, scale_deg, theoretical_beam_px, wrap=WRAP):
     c = psf[H // 2, W // 2]
     if c != 0:
         psf = psf / c
+    if not (c != 0 and math.isfinite(float(c))):
+        raise DegeneratePSFError(f"degenerate PSF: centre pixel is {float(c)!r} (no usable uv samples)")
     maj, mnr, pa = fit_psf_wsclean(psf, max(float(theoretical_beam_px), 1.0), wrap=wrap)
+    if not (math.isfinite(maj) and math.isfinite(mnr) and math.isfinite(pa) and maj > 0 and mnr > 0):
+        raise DegeneratePSFError(f"degenerate restoring beam: fit gave major {maj!r} px, minor {mnr!r} px, "
+                                 f"PA {pa!r} rad (theoretical beam {float(theoretical_beam_px):.3g} px)")
     return maj * scale_deg, mnr * scale_deg, math.degrees(pa)

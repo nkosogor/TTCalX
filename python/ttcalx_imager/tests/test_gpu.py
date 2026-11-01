@@ -80,6 +80,28 @@ def test_point_source_snapshot_clean():
     assert 0 < bmin <= bmaj < 20 * sdeg
 
 
+def test_degenerate_psf_snapshot_raises_specific_error():
+    """20261031_101739_32MHz-like: only 28 short baselines (max|uvw| 21.7 lambda) at the 32 MHz
+    geometry -> DegeneratePSFError before gridding (was: overflow in exp in the beam fit, then
+    'zero-size array to reduction operation' in local_rms_factor)."""
+    import warnings
+    from ttcalx_imager.beam import DegeneratePSFError
+    from ttcalx_imager.clean import horizon_mask, local_rms_factor
+    N, sdeg = bands.geometry(32)
+    rng = np.random.default_rng(3)
+    t = rng.uniform(0, 2 * np.pi, 28); r = rng.uniform(1.2, 21.7, 28); r[0] = 21.7
+    u = np.repeat(r * np.cos(t), 24); v = np.repeat(r * np.sin(t), 24); w = rng.uniform(-2, 2, u.size)
+    vis = (rng.normal(size=u.size) + 1j * rng.normal(size=u.size)).astype(np.complex64)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(DegeneratePSFError, match="degenerate PSF"):
+            SnapshotImager().image_arrays(u, v, w, np.ones(u.size, np.float32), vis, None, N, sdeg,
+                                          bands.SNAPSHOT_CLEAN_I)
+    theo = 1.0 / 21.7 / math.radians(sdeg)
+    with pytest.raises(DegeneratePSFError, match="local-RMS"):
+        local_rms_factor(cp.ones((N, N), cp.float32), theo, sdeg, horizon_mask(N, sdeg))
+
+
 def test_hour_orca_products_naming(tmp_path, monkeypatch):
     """image_hour with orca products: one load, WSClean/orca file names, V-only product."""
     import os

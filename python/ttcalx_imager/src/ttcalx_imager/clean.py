@@ -24,7 +24,7 @@ import warnings
 import numpy as np
 import cupy as cp
 
-from .beam import fit_beam
+from .beam import DegeneratePSFError, check_psf_support, fit_beam
 
 _HOGBOM_SRC = r"""
 extern "C" __global__ void hogbom_set(const float* __restrict__ psf, const int pn, const int pc,
@@ -447,7 +447,12 @@ def local_rms_factor(res, theo_pix, scale_deg, horizon, window=25.0):
     rms = rms_image(res, theo_pix, window)
     jj = cp.arange(N, dtype=cp.float32) - N // 2
     far = cp.sqrt(jj[None, :] ** 2 + jj[:, None] ** 2) < (1.0 / math.radians(scale_deg) - 3 * window * theo_pix / 2.3548)
-    minrms = float(rms[horizon & far].min())
+    sel = rms[horizon & far]
+    if sel.size == 0:
+        check_psf_support(scale_deg, theo_pix, window)       # raises with the numbers
+        raise DegeneratePSFError(f"degenerate PSF: no pixel for the local-RMS minimum (theoretical beam "
+                                 f"{theo_pix:.4g} px, window {window:g})")
+    minrms = float(sel.min())
     return (minrms / cp.maximum(rms, 1e-30)).astype(cp.float32), minrms
 
 
@@ -535,6 +540,7 @@ def clean_snapshot(dirty, psf, residual_fn, scale_deg, theo_pix, sky, params, be
     residual_fn(model) -> residual image.  sky: pixels inside the horizon (r < 1) for the MAD.
     Returns (restored, residual, model, info)."""
     N = dirty.shape[0]
+    check_psf_support(scale_deg, theo_pix, params.local_rms_window)    # before the beam fit
     D = SnapshotClean(psf, N, scale_deg, theo_pix, beam=beam, gain=params.gain, horizon_deg=params.horizon_deg, log=log)
     model = cp.zeros((N, N), cp.float32)
     res = dirty.copy()

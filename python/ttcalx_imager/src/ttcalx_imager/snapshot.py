@@ -24,7 +24,7 @@ import numpy as np
 import cupy as cp
 
 from . import bands, gridder
-from .clean import clean_snapshot, mad_std
+from .clean import check_psf_support, clean_snapshot, mad_std
 from .fits import make_header, write_image, write_images
 from .gridder import SampleSet, dft_predict, get_svd, to_ws
 from .msio import C, is_empty, read_ms
@@ -144,6 +144,7 @@ class SnapshotImager:
             S = SampleSet(None, None, None, iw, N, sc, svd=svd, eps=self.eps, pre=pre)
             u32 = cp.asarray(pre["u32"]); v32 = cp.asarray(pre["v32"]); w32 = cp.asarray(pre["w32"])
             theo_pix = pre["theo_pix"]
+        check_psf_support(scale_deg, theo_pix, params.local_rms_window, S.npts)   # no gridding for a degenerate PSF
         dI = cp.asarray(visI)
         lap("gridder setup")
         dirty = to_ws(S.grid(dI)) / sw
