@@ -100,6 +100,17 @@ def gpu_select(small, raw, scale_deg, pols="IV", zero_limit=0.999):
     return L
 
 
+def rephase(data, w_old, w_new, freqs, xp=cp):
+    """chgcentre's re-phasing of every correlation of a snapshot, on the GPU (or numpy, xp=np):
+    data (nrow, nchan, ncorr) * exp(2 pi i (w_old - w_new) f / c), in complex128, stored as
+    complex64 like the DATA column chgcentre writes.  w_old / w_new: per-row w [m] before / after
+    the phase-centre change (rotate.chgcentre_uvw); freqs (nchan,) Hz.  (gsi v3 images a peeled
+    snapshot from shared memory at the LST-hour centre without the chgcentre MS copy.)"""
+    lamf = xp.asarray(np.asarray(freqs, np.float64) / C)
+    ph = xp.exp(2j * np.pi * (xp.asarray(w_old, xp.float64) - xp.asarray(w_new, xp.float64))[:, None] * lamf[None])
+    return (xp.asarray(data).astype(xp.complex128) * ph[:, :, None]).astype(xp.complex64)
+
+
 class SnapshotImager:
     def __init__(self, eps=1e-4, svd_tol=1e-4, dft_max=8000, verbose=False):
         self.eps = eps; self.svd_tol = svd_tol; self.dft_max = dft_max
@@ -181,6 +192,21 @@ class SnapshotImager:
         if prods:
             prods = [(p, a.get(), st) for p, a, st in prods]
         return self._finish(info, prods, t0)
+
+    def compute(self, L, N, scale_deg, out_prefix=None, pols="IV", params=bands.SNAPSHOT_CLEAN_I, beam=None):
+        """GPU part of ``image`` for a selected snapshot (``gpu_select`` / ``load_snapshot`` dict):
+        (info, products with host arrays); ``write(info, prods, t0)`` writes the FITS + qa.json
+        (thread-safe, host only), as ``image_many`` splits the two."""
+        info, prods = self._compute(L, N, scale_deg, out_prefix, pols, params, beam, False, False, False)
+        if prods:
+            t1 = time.perf_counter()
+            prods = [(p, a.get(), st) for p, a, st in prods]
+            info["timing"]["D2H"] = time.perf_counter() - t1
+        return info, prods
+
+    @staticmethod
+    def write(info, prods, t0):
+        return SnapshotImager._finish(info, prods, t0)
 
     def _compute(self, L, N, scale_deg, out_prefix, pols, params, beam, write_aux, write_dirty, write_psf):
         ms = L["ms"]; T = dict(L["timing"])
