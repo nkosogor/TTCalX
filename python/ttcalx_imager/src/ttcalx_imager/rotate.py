@@ -38,6 +38,40 @@ def measures_uvw(ant_pos, time_s, ra, dec):
     return np.array(me.to_uvw(b)["xyz"].get_value()).reshape(-1, 3)
 
 
+def parse_phase_centre_chgcentre(pc):
+    """(ra, dec) rad of '05h30m00s 37d12m57.057s' as the PHASE_DIR chgcentre writes, bit for bit.
+
+    It can differ from :func:`parse_phase_centre` in the last bit (05h30m00s: 1 ulp in RA), so a
+    snapshot rotated in memory gets chgcentre's image header.  Matched against /opt/bin/chgcentre
+    for all 24 LST-hour centres (gpu-subband-imaging scripts/v3_engine/chgcentre_check.py
+    --phase-dirs): RA = (h/24 + m/1440 + s/86400) 2 pi and Dec = (d/360 + m/21600 + s/1296000) 2 pi
+    in x87 long double (aocommon RaDecCoord), rounded to double, then through casacore's
+    direction cosines: ra = atan2(y, x) (wrapped to (-pi, pi]), dec = asin(z).  Where long double
+    is plain double (aarch64 macOS) a result can be 1 ulp off.  Only the 'XXhYYmZZs [+-]XXdYYmZZs'
+    form."""
+    import math
+    import re
+    a, b = pc.split()
+    m = re.fullmatch(r"(\d+)h(\d+)m([\d.]+)s", a)
+    n = re.fullmatch(r"([+-]?)(\d+)d(\d+)m([\d.]+)s", b)
+    if not m or not n:
+        raise ValueError(f"not a chgcentre phase centre: {pc!r}")
+    ld = np.longdouble
+    two_pi = ld("6.28318530717958647692528676655900577")
+    ra = float((ld(m[1]) / 24 + ld(m[2]) / (24 * 60) + ld(float(m[3])) / (24 * 3600)) * two_pi)
+    dec = float((ld(n[2]) / 360 + ld(n[3]) / (360 * 60) + ld(float(n[4])) / (360 * 3600)) * two_pi)
+    dec = -dec if n[1] == "-" else dec
+    x, y, z = math.cos(ra) * math.cos(dec), math.sin(ra) * math.cos(dec), math.sin(dec)
+    return math.atan2(y, x), math.asin(z)
+
+
+def chgcentre_uvw(ant_pos, a1, a2, time_s, ra, dec):
+    """The UVW chgcentre writes for a snapshot: A[a1] - A[a2] with the per-antenna J2000 uvw of
+    :func:`measures_uvw` at the snapshot's TIME (all rows, autocorrelations 0)."""
+    A = measures_uvw(ant_pos, time_s, ra, dec)
+    return A[a1] - A[a2]
+
+
 def rotation_from_uvw(uvw_stored, uvw_new):
     """Least-squares R (3x3) with uvw_new ~= R @ uvw_stored (rows are baselines)."""
     return np.linalg.lstsq(uvw_stored, uvw_new, rcond=None)[0].T
