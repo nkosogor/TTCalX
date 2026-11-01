@@ -26,6 +26,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 
@@ -83,6 +84,67 @@ def _uvmax(s):
     return float(np.sqrt(s["u"] ** 2 + s["v"] ** 2 + s["w"] ** 2).max())
 
 
+# ----------------------------------------------------------------------------- chunk cache control
+class CacheCtl:
+    """Device chunk-cache policy of one hour interval, shared by its HourGrid and the w-snapshot
+    block grids.  device=False: no chunk is kept on the GPU (the mode's host / store behaviour as
+    when a chunk does not fit); reserve: bytes to leave free besides TTCALX_CACHE_MARGIN_GB (the
+    larger of the two counts); dev_bytes: what this interval has cached on the GPU."""
+
+    def __init__(self, device=True, reserve=0.0):
+        self.device = device; self.reserve = float(reserve); self.dev_bytes = 0
+
+
+def deconv_reserve_bytes(N, theo_pix, params):
+    """Upper estimate [bytes] of the GPU memory the multiscale CLEAN of an N x N interval needs on
+    top of the gridding (clean.MultiScaleClean + the major cycles): the P x P real-FFT kernels of
+    every scale (S_s and S_s * PSF, P = fast_len(1.5 N + 2)) and of the scale images, the per-scale
+    N x N images and masks of the minor loop, the 2x band-limited model of the major cycle, the
+    padded FFT temporaries and the cuFFT plan cache (TTCALX_FFT_PLAN_CACHE_GB).  At 3122 px
+    (64-82 MHz, 7-8 scales): 7.1-7.6 GB (the 5 GB default margin ran out at 64 / 69 MHz)."""
+    from .clean import fast_len
+    scales = [0]
+    if params.multiscale:
+        s = 4 * theo_pix
+        while s < N * 0.5:
+            scales.append(s); s *= 2
+    if params.multiscale_max_scales:
+        scales = scales[:params.multiscale_max_scales]
+    nsc = len(scales)
+    P = fast_len(N + N // 2 + 2); F = P * (P // 2 + 1) * 8
+    hmax = max(int(math.ceil(0.5 * s)) for s in scales)
+    Ps = fast_len(N + (2 * hmax + 1) // 2 + 2); Fs = Ps * (Ps // 2 + 1) * 8
+    I = N * N * 4
+    kernels = (2 * nsc + 1) * F + max(nsc - 1, 0) * Fs                  # KS, KP, Kpsf; KSs
+    minor = nsc * (3 * I + 3 * N * N) + nsc * int(2.25 * I) + 10 * I     # Pss, R_s, |R_s|, masks; full_ps; R, M, ...
+    fft_tmp = 2 * P * P * 4 + 2 * F
+    major = 40 * I                                                       # fft_upsample (2N)^2 complex, prefilter, coords
+    plans = float(os.environ.get("TTCALX_FFT_PLAN_CACHE_GB", "1.5")) * 1e9
+    return kernels + minor + fft_tmp + major + plans
+
+
+def _reserve(N, sn, sc, params):
+    """TTCALX_CACHE_RESERVE: unset / 0 (default: the margin only), 'auto' (deconv_reserve_bytes)
+    or GB."""
+    v = os.environ.get("TTCALX_CACHE_RESERVE", "0").strip().lower()
+    if v in ("", "0", "none", "off"):
+        return 0.0
+    if v == "auto":
+        return float(deconv_reserve_bytes(N, theoretical_beam_pix(sn, sc), params))
+    return float(v) * 1e9
+
+
+def _is_gpu_oom(e):
+    """A GPU allocation failure (CuPy pool, cuFFT plan / workspace, cuFINUFFT plan) -- not a CUDA
+    fatal error, which a retry in the same process cannot help."""
+    oom = getattr(getattr(getattr(cp, "cuda", None), "memory", None), "OutOfMemoryError", None)
+    if oom is not None and isinstance(e, oom):
+        return True
+    m = str(e)
+    return ("CUFFT_ALLOC_FAILED" in m or "cudaErrorMemoryAllocation" in m or "out of memory" in m.lower()) and \
+        "illegal" not in m.lower()
+
+
 # ----------------------------------------------------------------------------- gridding
 class HourGrid:
     """Samples of many snapshots (kept on the host) gridded in chunks into one image.
@@ -91,10 +153,11 @@ class HourGrid:
     dict 'R') on the fly.  weights=None: one global Briggs grid over all snapshots."""
 
     def __init__(self, snaps, N, scale_deg, robust=0.0, tukey_inner=None, eps=1e-4, svd_tol=1e-4,
-                 chunk_pts=40_000_000, rotate=True, weights=None, need_svd=True, log=None):
+                 chunk_pts=40_000_000, rotate=True, weights=None, need_svd=True, log=None, ctl=None):
         self.snaps = snaps; self.N = N; self.sdeg = scale_deg; self.sc = math.radians(scale_deg)
         self.eps = eps; self.chunk_pts = chunk_pts; self.rotate = rotate
         self._cache = {}
+        self.ctl = CacheCtl() if ctl is None else ctl
         log = log or (lambda *a: None)
         t0 = time.perf_counter()
 
@@ -185,7 +248,9 @@ class HourGrid:
         55 MHz).  store (gsi v3 archive / hour store snapshots): the device cache as auto, but no
         host cache -- a chunk that is not cached on the GPU is rebuilt per call from the store,
         u, v, w expanded on the GPU from the per-row uvw (no ~24 B/sample host duplicate).
-        The arrays and operations are the same as without the cache (bit-identical images)."""
+        The arrays and operations are the same as without the cache (bit-identical images).
+        self.ctl (CacheCtl): device=False keeps nothing on the GPU (OOM fallback of
+        image_hour_snaps); the free memory to leave is max(margin, ctl.reserve)."""
         mode = os.environ.get("TTCALX_CHUNK_CACHE", "auto")
         store = mode == "store"
         key = tuple(ids)
@@ -235,8 +300,9 @@ class HourGrid:
             need = npts * (S.x.itemsize + S.y.itemsize + S.w.itemsize + S.wt.itemsize + 1 + w0.itemsize + 8)
             pool = cp.get_default_memory_pool()
             free = cp.cuda.runtime.memGetInfo()[0] + pool.total_bytes() - pool.used_bytes()
-            margin = float(os.environ.get("TTCALX_CACHE_MARGIN_GB", "5")) * 1e9
-            if mode == "device" or (mode in ("auto", "store") and free - need > margin):
+            margin = max(float(os.environ.get("TTCALX_CACHE_MARGIN_GB", "5")) * 1e9, self.ctl.reserve)
+            if self.ctl.device and (mode == "device" or (mode in ("auto", "store") and free - need > margin)):
+                self.ctl.dev_bytes += need
                 d = dict(S=S, w0=w0, vis={})
                 if col == "I":
                     d["vis"]["I"] = vis
@@ -282,7 +348,7 @@ class WSnap:
             for i in ids:     # snapshot frame -> block frame: R_b^T R_i (both chgcentre-exact)
                 sn.append(_with(G.snaps[i], R=Rb.T @ G.snaps[i]["R"], R_hour=G.snaps[i]["R"]))
             self.sub.append(HourGrid(sn, self.N, G.sdeg, rotate=block > 1, weights=[G.iw[i] for i in ids],
-                                     eps=G.eps, svd_tol=1e-4))
+                                     eps=G.eps, svd_tol=1e-4, ctl=G.ctl))
             self.Rb.append(Rb)
         self._T = None
         (log or (lambda *a: None))(f"WSnap: {len(self.sub)} blocks of {block}, K = {sorted(set(g.svd.K for g in self.sub))}")
@@ -399,6 +465,9 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
     # (~2-3 s per interval).  Keep them across intervals, in an LRU plan cache capped at
     # TTCALX_FFT_PLAN_CACHE_GB (default 1.5); TTCALX_KEEP_FFT_PLANS=0: clear after every interval.
     keep_plans = os.environ.get("TTCALX_KEEP_FFT_PLANS", "1") == "1"
+    # GPU OOM in an interval whose chunks were partly kept on the GPU: once more without the device
+    # chunk cache (TTCALX_CACHE_OOM_FALLBACK=0: raise, as before)
+    oom_fallback = os.environ.get("TTCALX_CACHE_OOM_FALLBACK", "1") == "1"
     if keep_plans:
         cp.fft.config.get_plan_cache().set_memsize(int(float(os.environ.get("TTCALX_FFT_PLAN_CACHE_GB", "1.5")) * 1e9))
     N, sdeg = bands.geometry(band)
@@ -429,14 +498,11 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
         groups = [[s for s in snaps if bnd[k] <= s["tidx"] < bnd[k + 1]] for k in range(nint)]
         t0s = [min(tstart_all[bnd[k]:bnd[k + 1]], default=None) for k in range(nint)]
         outs = []
-        for gi, sn in enumerate(groups):
-            tsfx = "" if nint == 1 else f"-t{gi:04d}"
-            name = f"{out_prefix}-{tag}{tsfx}"
-            fn = _names(prod, name)
-            if not sn:
-                outs.append(dict(name=name, n_snap=0)); continue
+        dev_ok = True        # device chunk cache allowed (off for the rest of the product after an OOM fallback)
+
+        def interval(gi, sn, name, fn, tsfx, ctl):
             G = HourGrid(sn, N, sdeg, robust=params.robust, tukey_inner=params.taper_inner_tukey or None,
-                         need_svd=(mode != "wsnap"), log=log)
+                         need_svd=(mode != "wsnap"), log=log, ctl=ctl)
             if mode == "wsnap":
                 W = WSnap(G, block=block, log=log)
                 imgfn = W.image
@@ -475,8 +541,8 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
                 files.append(write_image(vname, v, h, "V"))
                 lap(f"{vkey}: write")
                 del v
-            outs.append(dict(name=name, n_snap=len(sn), npts=G.npts, theo_beam_pix=theo, files=files,
-                             K=sorted(set(g.svd.K for g in W.sub)) if mode == "wsnap" else G.svd.K, **di))
+            out = dict(name=name, n_snap=len(sn), npts=G.npts, theo_beam_pix=theo, files=files,
+                       K=sorted(set(g.svd.K for g in W.sub)) if mode == "wsnap" else G.svd.K, **di)
             # imgfn (a bound method of W / G) and the residual closure keep the gridders alive:
             # drop every reference before the next interval allocates its own (82 MHz 10-min OOM)
             del G, imgfn
@@ -486,6 +552,42 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
             if not keep_plans:
                 cp.fft.config.get_plan_cache().clear()
             cp.get_default_memory_pool().free_all_blocks()
+            return out
+
+        for gi, sn in enumerate(groups):
+            tsfx = "" if nint == 1 else f"-t{gi:04d}"
+            name = f"{out_prefix}-{tag}{tsfx}"
+            fn = _names(prod, name)
+            if not sn:
+                outs.append(dict(name=name, n_snap=0)); continue
+            reserve = _reserve(N, sn, math.radians(sdeg), params) if prod.image_i else 0.0
+            while True:
+                ctl = CacheCtl(device=dev_ok, reserve=reserve)
+                T0 = dict(T); err = None
+                try:
+                    outs.append(interval(gi, sn, name, fn, tsfx, ctl))
+                except Exception as e:      # noqa: BLE001 (re-raised unless a GPU OOM with a device cache)
+                    if not (oom_fallback and ctl.device and ctl.dev_bytes and _is_gpu_oom(e)):
+                        raise
+                    err = f"{type(e).__name__}: {e}"
+                if err is None:
+                    break
+                # outside the except clause: the failed attempt's frames (gridders, device cache) are gone.
+                # Again with no chunk on the GPU (host cache, or rebuilt per use from the store): the gridder
+                # gets the same arrays (bit-identical inputs), only slower; the failed attempt's time is
+                # booked under "<key>: OOM fallback" instead of its steps
+                dev_ok = False
+                gc.collect()
+                cp.fft.config.get_plan_cache().clear()
+                cp.get_default_memory_pool().free_all_blocks()
+                spent = sum(T.get(k, 0) - T0.get(k, 0) for k in T)
+                T.clear(); T.update(T0); lap(f"{key}: OOM fallback")
+                T[f"{key}: OOM fallback"] += spent
+                msg = (f"hour {os.path.basename(name)}: GPU out of memory with {ctl.dev_bytes / 1e9:.2f} GB of device "
+                       f"chunk cache ({err}); again without the device chunk cache")
+                print(f"WARNING: {msg}", file=sys.stderr, flush=True); log(msg)
+                summary.setdefault("cache_fallback", []).append(dict(name=name, error=err,
+                                                                     device_cache_GB=ctl.dev_bytes / 1e9))
         summary["products"][key] = outs
         if prod.image_i and prod.v_tag and prod.naming == "orca":
             summary["products"][prod.v_tag] = [dict(name=o["name"], n_snap=o["n_snap"],

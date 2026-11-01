@@ -20,6 +20,10 @@ from types import SimpleNamespace
 import numpy as np
 
 
+class FakeOOM(MemoryError):
+    """Stands in for cupy.cuda.memory.OutOfMemoryError on the CPU."""
+
+
 def _np_cupy(free_bytes):
     m = types.ModuleType("np_cupy")
     m.__getattr__ = lambda k: getattr(np, k)          # module-level __getattr__ (PEP 562)
@@ -27,7 +31,8 @@ def _np_cupy(free_bytes):
     m.asnumpy = lambda a, *x, **k: np.asarray(a)
     m.ndarray = np.ndarray
     m.cuda = SimpleNamespace(Device=lambda *a: SimpleNamespace(synchronize=lambda: None),
-                             runtime=SimpleNamespace(memGetInfo=lambda: (free_bytes[0], 16e9)))
+                             runtime=SimpleNamespace(memGetInfo=lambda: (free_bytes[0], 16e9)),
+                             memory=SimpleNamespace(OutOfMemoryError=FakeOOM))
     m.get_default_memory_pool = lambda: SimpleNamespace(total_bytes=lambda: 0, used_bytes=lambda: 0,
                                                         free_all_blocks=lambda: None)
     m.fft = SimpleNamespace(config=SimpleNamespace(get_plan_cache=lambda: SimpleNamespace(
@@ -69,9 +74,20 @@ def _h(*arrays):
 
 
 class Recorder:
-    def __init__(self):
+    def __init__(self, oom=None):
         self.calls = []
         self.images = {}
+        self.oom = oom or {}          # {"deconv" | "grid": call numbers that raise a GPU OOM}
+        self.count = {}
+
+
+def _oom(rec, what):
+    """Raise the OOM error of the cupy in use at the rec.oom[what] call numbers (0-based)."""
+    n = rec.count.get(what, 0); rec.count[what] = n + 1
+    if n in rec.oom.get(what, ()):
+        rec.calls.append(("OOM", what, n))
+        import ttcalx_imager.hour as hour
+        raise hour.cp.cuda.memory.OutOfMemoryError(f"Out of memory allocating 88,548,352 bytes ({what} {n})")
 
 
 def _fake_sampleset(rec, xp):
@@ -95,6 +111,7 @@ def _fake_sampleset(rec, xp):
             rec.calls.append(("SampleSet", self.npts, _h(self.x, self.y, self.w, self.wt, self.flip)))
 
         def grid(self, vis):
+            _oom(rec, "grid")
             c = np.where(self.flip, np.conj(vis), vis) * self.wt
             rec.calls.append(("grid", _h(vis)))
             re = np.bincount(self._idx, c.real.astype(np.float64), minlength=self.N * self.N)
@@ -114,14 +131,15 @@ def _fake_sampleset(rec, xp):
 
 
 @contextlib.contextmanager
-def cpu_hour(cache="auto", free_gb=1000.0, N=None):
+def cpu_hour(cache="auto", free_gb=1000.0, N=None, oom=None):
     """Context in which ttcalx_imager.hour (image_hour, image_hour_snaps, the CLI) runs on the
     CPU; yields the Recorder.  cache: the TTCALX_CHUNK_CACHE mode; free_gb: the 'free GPU memory'
-    the chunk-cache decision sees; N: image size override (default: the band's)."""
+    the chunk-cache decision sees; N: image size override (default: the band's); oom: GPU OOM
+    injection, {"deconv" | "grid": call numbers (0-based, over the run) that raise}."""
     import os
     hour = import_hour()
     from ttcalx_imager import weights
-    rec = Recorder()
+    rec = Recorder(oom)
     fcp = _np_cupy([free_gb * 1e9])
     saved = {k: getattr(hour, k) for k in ("cp", "SampleSet", "get_svd", "to_ws", "deconvolve_multiscale",
                                            "write_image", "WeightGrid")}
@@ -129,6 +147,7 @@ def cpu_hour(cache="auto", free_gb=1000.0, N=None):
     old_env = os.environ.get("TTCALX_CHUNK_CACHE")
 
     def deconv(dirty, psf, sdeg, theo, params, residual_fn=None, beam=None, log=None):
+        _oom(rec, "deconv")
         m = (dirty * np.float32(0.5)).astype(np.float32)
         r = residual_fn(m)
         return dirty, r, m, dict(beam=(0.1, 0.1, 0.0), nit=1, nmajor=1)
@@ -159,9 +178,10 @@ def cpu_hour(cache="auto", free_gb=1000.0, N=None):
             os.environ["TTCALX_CHUNK_CACHE"] = old_env
 
 
-def run(snaps, band, out_prefix, ra, dec, products, cache="auto", free_gb=1000.0, mode="vis", N=None, **kw):
+def run(snaps, band, out_prefix, ra, dec, products, cache="auto", free_gb=1000.0, mode="vis", N=None, oom=None,
+        **kw):
     """image_hour_snaps(snaps, ...) on the CPU; returns (summary, Recorder)."""
-    with cpu_hour(cache, free_gb, N) as rec:
+    with cpu_hour(cache, free_gb, N, oom) as rec:
         s = import_hour().image_hour_snaps(snaps, band, out_prefix, ra, dec, products=products, mode=mode, **kw)
     return s, rec
 
@@ -169,4 +189,5 @@ def run(snaps, band, out_prefix, ra, dec, products, cache="auto", free_gb=1000.0
 def comparable(summary):
     """The summary without timings, as JSON text (NaN == NaN)."""
     import json
-    return json.dumps({k: v for k, v in summary.items() if k != "timing"}, sort_keys=True, default=float)
+    return json.dumps({k: v for k, v in summary.items() if k not in ("timing", "cache_fallback")}, sort_keys=True,
+                      default=float)

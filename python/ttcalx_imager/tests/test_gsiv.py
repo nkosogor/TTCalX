@@ -337,3 +337,113 @@ def test_cli_archive_no_verify_warns_and_checks_band(tmp_path, monkeypatch, caps
     os.environ.pop("TTCALX_CHUNK_CACHE")
     with pytest.raises(gsiv.GSIVError, match="band"):
         cli.main(["hour", "--archive", str(p), "--band", "82", "--out", str(tmp_path / "o" / "82MHz"), "--qa", "none"])
+
+
+# ----------------------------------------------------------------------------- GPU OOM fallback (CPU)
+_PRODS = ["I-Deep-Taper-Robust-0", "V-Taper-Deep", "I-Taper-10min", "V-Taper-10min"]
+_GRIDK = ("grid", "degrid", "grid_psf")
+
+
+def _run_hour(tmp_path, snaps, cache, free_gb=1000, oom=None, prefix="o"):
+    hour_cpu = pytest.importorskip("hour_cpu")
+    return hour_cpu.run(snaps, "41MHz", str(tmp_path / prefix), 1.3, 0.65, bands.hour_products(_PRODS),
+                        cache=cache, free_gb=free_gb, oom=oom, N=64, qa="none")
+
+
+@pytest.mark.parametrize("cache", ["store", "auto", "device"])
+@pytest.mark.parametrize("oom", [{"deconv": {0}}, {"deconv": {2}}, {"grid": "last"}])
+def test_oom_fallback_equals_no_cache(tmp_path, monkeypatch, cache, oom):
+    """A GPU OOM in an interval with a device chunk cache: the interval is imaged again without the
+    device cache, and the products are bit for bit those of a run without any cache."""
+    monkeypatch.delenv("TTCALX_CACHE_OOM_FALLBACK", raising=False)
+    monkeypatch.delenv("TTCALX_CACHE_RESERVE", raising=False)
+    dicts, p = _hour_snaps(tmp_path)
+    ref_s, ref = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "off", 0, prefix="ref")
+    ngrid = sum(c[0] == "grid" for c in ref.calls)
+    if oom.get("grid") == "last":                  # the last dirty V of the last 10-min interval (its I is written)
+        oom = {"grid": {ngrid - 1}}
+    s, got = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), cache, 1000, oom, prefix="ref")
+    hour_cpu = pytest.importorskip("hour_cpu")
+    assert hour_cpu.comparable(s) == hour_cpu.comparable(ref_s)
+    assert sorted(got.images) == sorted(ref.images) and len(ref.images) > 0
+    for k in ref.images:
+        assert same(got.images[k], ref.images[k]), k
+    fb = s["cache_fallback"]
+    assert len(fb) == 1 and fb[0]["device_cache_GB"] > 0 and "Out of memory" in fb[0]["error"]
+    assert any(k.endswith(": OOM fallback") for k in s["timing"])
+    # the gridder saw the reference inputs: the calls after the OOM are the reference's from the
+    # failed interval's start on, and the calls before the failed interval are the reference's
+    g = [c for c in got.calls if c[0] in _GRIDK + ("OOM",)]
+    r = [c for c in ref.calls if c[0] in _GRIDK]
+    i = next(k for k, c in enumerate(g) if c[0] == "OOM")
+    tail = g[i + 1:]
+    assert tail == r[len(r) - len(tail):]
+    assert g[:len(r) - len(tail)] == r[:len(r) - len(tail)]
+
+
+def test_oom_fallback_is_per_product(tmp_path, monkeypatch):
+    """After a fallback the rest of that product runs without the device cache; the next product
+    caches again."""
+    monkeypatch.delenv("TTCALX_CACHE_RESERVE", raising=False)
+    dicts, p = _hour_snaps(tmp_path)
+    s0, c0 = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "store", 1000, prefix="a")
+    s1, c1 = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "store", 1000, {"deconv": {1}}, prefix="a")
+    s2, c2 = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "store", 0, prefix="a")
+    n = lambda c: sum(x[0] == "SampleSet" for x in c.calls)
+    assert n(c0) < n(c1) < n(c2)                       # cached < partly rebuilt < always rebuilt
+    assert [x["name"].rsplit("-", 1)[-1] for x in s1["cache_fallback"]] == ["t0000"]
+
+
+@pytest.mark.parametrize("cache,free_gb,env", [("off", 0, {}), ("store", 0, {}), ("auto", 0, {}),
+                                               ("store", 1000, {"TTCALX_CACHE_OOM_FALLBACK": "0"})])
+def test_oom_without_device_cache_raises(tmp_path, monkeypatch, cache, free_gb, env):
+    """No device cache to give up (or the fallback switched off): the OOM is raised, as before."""
+    hour_cpu = pytest.importorskip("hour_cpu")
+    monkeypatch.delenv("TTCALX_CACHE_RESERVE", raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    dicts, p = _hour_snaps(tmp_path)
+    with pytest.raises(hour_cpu.FakeOOM):
+        _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), cache, free_gb, {"deconv": {0}})
+
+
+def test_second_oom_raises(tmp_path, monkeypatch):
+    hour_cpu = pytest.importorskip("hour_cpu")
+    monkeypatch.delenv("TTCALX_CACHE_RESERVE", raising=False)
+    dicts, p = _hour_snaps(tmp_path)
+    with pytest.raises(hour_cpu.FakeOOM):
+        _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "store", 1000, {"deconv": {0, 1}})
+
+
+def test_is_gpu_oom():
+    hour_cpu = pytest.importorskip("hour_cpu")
+    hour = hour_cpu.import_hour()
+    with hour_cpu.cpu_hour():
+        assert hour._is_gpu_oom(hour.cp.cuda.memory.OutOfMemoryError("x"))
+        assert hour._is_gpu_oom(RuntimeError("cuFFT error: CUFFT_ALLOC_FAILED"))
+        assert hour._is_gpu_oom(RuntimeError("cudaErrorMemoryAllocation: out of memory"))
+        assert not hour._is_gpu_oom(RuntimeError("cudaErrorIllegalAddress: an illegal memory access was encountered"))
+        assert not hour._is_gpu_oom(ValueError("degenerate PSF"))
+
+
+def test_cache_reserve(tmp_path, monkeypatch):
+    """TTCALX_CACHE_RESERVE: free memory the device cache leaves for the deconvolution; the
+    products do not depend on it."""
+    hour_cpu = pytest.importorskip("hour_cpu")
+    hour = hour_cpu.import_hour()
+    b = hour.deconv_reserve_bytes(3122, 3.0, bands.DEEP_I)
+    assert 6e9 < b < 11e9                                        # 64 / 69 MHz: more than the 5 GB margin
+    assert hour.deconv_reserve_bytes(1024, 3.0, bands.DEEP_I) < 2.5e9
+    dicts, p = _hour_snaps(tmp_path)
+    monkeypatch.delenv("TTCALX_CACHE_RESERVE", raising=False)
+    s0, c0 = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "store", 20, prefix="r")
+    s2, c2 = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "store", 0, prefix="r")
+    monkeypatch.setenv("TTCALX_CACHE_RESERVE", "auto")              # N = 64: a small reserve, still cached
+    s1, c1 = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "store", 20, prefix="r")
+    monkeypatch.setenv("TTCALX_CACHE_RESERVE", "30")                # more than the 20 GB 'free': no device cache
+    s3, c3 = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "store", 20, prefix="r")
+    n = lambda c: sum(x[0] == "SampleSet" for x in c.calls)
+    assert n(c0) == n(c1) < n(c2) == n(c3)
+    for s, c in ((s1, c1), (s2, c2), (s3, c3)):
+        assert hour_cpu.comparable(s) == hour_cpu.comparable(s0)
+        assert all(same(c.images[k], c0.images[k]) for k in c0.images)

@@ -26,6 +26,8 @@ All are optional; the defaults are what the regression tests use.
 |---|---|---|
 | `TTCALX_CHUNK_CACHE` | `auto` (`store` with `--archive`) | hour job: keep loaded chunks on the GPU (`auto`, if free memory allows), on the host (`host`) or not at all (`off`). Use `host`/`off` on a GPU shared with other daemons. `store`: on the GPU if it fits, else rebuilt per use from the archive records (u, v, w expanded on the GPU; no host copies). |
 | `TTCALX_CACHE_MARGIN_GB` | `5` | `auto` chunk cache: free GPU memory to leave. |
+| `TTCALX_CACHE_RESERVE` | `0` (`auto` in the gsi v3 engine) | chunk cache: free GPU memory to leave for the multiscale CLEAN of each interval, `auto` = estimated from the image size and the scales (`hour.deconv_reserve_bytes`, ~7 GB at 3122 px), or GB; the larger of this and the margin counts. |
+| `TTCALX_CACHE_OOM_FALLBACK` | `1` | hour: a GPU out-of-memory error in an interval that has chunks cached on the GPU images that interval again without the device cache (and the rest of that product); the arrays are the same, so are the products (to the cuFINUFFT floor). `0`: raise. Recorded as `cache_fallback` in the summary. |
 | `TTCALX_KEEP_FFT_PLANS` / `TTCALX_FFT_PLAN_CACHE_GB` | `1` / `1.5` | hour job: keep cuFFT plans across intervals in a plan cache of this size (set process wide, not restored). |
 | `TTCALX_HOGBOM_MB_BPS` | `2` | blocks per SM of the cooperative Hogbom kernel (falls back to the single-block kernel if the launch is refused). |
 | `TTCALX_HOGBOM_MATRIX_MAX_K` | `4096` | largest candidate set for the G-matrix Hogbom path. |
