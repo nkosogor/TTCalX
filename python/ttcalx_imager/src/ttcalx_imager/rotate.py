@@ -72,6 +72,16 @@ def chgcentre_uvw(ant_pos, a1, a2, time_s, ra, dec):
     return A[a1] - A[a2]
 
 
+def rephase(data, w_old, w_new, freqs, xp=np):
+    """chgcentre's re-phasing of every correlation of a snapshot (numpy or CuPy, ``xp``):
+    data (nrow, nchan, ncorr) * exp(2 pi i (w_old - w_new) f / c), in complex128, stored as
+    complex64 like the DATA column chgcentre writes.  w_old / w_new: per-row w [m] before / after
+    the phase-centre change (chgcentre_uvw); freqs (nchan,) Hz."""
+    lamf = xp.asarray(np.asarray(freqs, np.float64) / 299792458.0)
+    ph = xp.exp(2j * np.pi * (xp.asarray(w_old, xp.float64) - xp.asarray(w_new, xp.float64))[:, None] * lamf[None])
+    return (xp.asarray(data).astype(xp.complex128) * ph[:, :, None]).astype(xp.complex64)
+
+
 def rotation_from_uvw(uvw_stored, uvw_new):
     """Least-squares R (3x3) with uvw_new ~= R @ uvw_stored (rows are baselines)."""
     return np.linalg.lstsq(uvw_stored, uvw_new, rcond=None)[0].T

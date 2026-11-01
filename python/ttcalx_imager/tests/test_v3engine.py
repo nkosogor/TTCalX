@@ -134,3 +134,11 @@ def test_run_hour_snaps_equals_cli_archive(tmp_path, monkeypatch):
         cli.run_hour_snaps(["--archive", str(p)] + args, lambda *a: [])
     with pytest.raises(ValueError):
         cli.run_hour_snaps(["--band", "41", "--out", str(tmp_path / "x")], lambda *a: [])
+
+
+def test_rotate_rephase_is_the_snapshot_rephase():
+    snapshot = _snapshot()
+    rng = np.random.default_rng(2)
+    data = (rng.normal(size=(9, 3, 4)) + 1j * rng.normal(size=(9, 3, 4))).astype(np.complex64)
+    w0, w1, f = rng.normal(size=9) * 10, rng.normal(size=9) * 10, 4e7 + np.arange(3) * 1e5
+    assert np.array_equal(rotate.rephase(data, w0, w1, f), snapshot.rephase(data, w0, w1, f, xp=np))

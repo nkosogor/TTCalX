@@ -101,14 +101,10 @@ def gpu_select(small, raw, scale_deg, pols="IV", zero_limit=0.999):
 
 
 def rephase(data, w_old, w_new, freqs, xp=cp):
-    """chgcentre's re-phasing of every correlation of a snapshot, on the GPU (or numpy, xp=np):
-    data (nrow, nchan, ncorr) * exp(2 pi i (w_old - w_new) f / c), in complex128, stored as
-    complex64 like the DATA column chgcentre writes.  w_old / w_new: per-row w [m] before / after
-    the phase-centre change (rotate.chgcentre_uvw); freqs (nchan,) Hz.  (gsi v3 images a peeled
-    snapshot from shared memory at the LST-hour centre without the chgcentre MS copy.)"""
-    lamf = xp.asarray(np.asarray(freqs, np.float64) / C)
-    ph = xp.exp(2j * np.pi * (xp.asarray(w_old, xp.float64) - xp.asarray(w_new, xp.float64))[:, None] * lamf[None])
-    return (xp.asarray(data).astype(xp.complex128) * ph[:, :, None]).astype(xp.complex64)
+    """rotate.rephase on the GPU by default (gsi v3: a peeled snapshot imaged from shared memory at
+    the LST-hour centre without the chgcentre MS copy)."""
+    from .rotate import rephase as _rephase
+    return _rephase(data, w_old, w_new, freqs, xp=xp)
 
 
 class SnapshotImager:
