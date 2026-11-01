@@ -57,7 +57,8 @@ def archive(tmp_path, mss, R=None, name="a.gsiv", pd_new=(1.3, 0.65)):
         c["pd_new"] = pd_new
         meta, arrays = gsiv.record_from_samples(c)
         if w is None:
-            w = gsiv.RecordWriter(p, dict(mode="iv", pd_new=list(pd_new)), {k: arrays[k] for k in gsiv.SHARED_ARRAYS})
+            w = gsiv.RecordWriter(p, dict(mode="iv", band=41, pd_new=list(pd_new)),
+                                  {k: arrays[k] for k in gsiv.SHARED_ARRAYS + gsiv.CHECK_ARRAYS})
         w.append(meta, arrays)
     w.close()
     return p
@@ -104,7 +105,7 @@ def test_roundtrip_bitwise_both_backends(tmp_path):
     p = archive(tmp_path, mss, R)
     for backend in ("ram", "memmap"):
         snaps = gsiv.load_archive(str(p), 1.3, 0.65, backend=backend)
-        assert [s["stem"] for s in snaps] == [ms.stem for ms in mss]     # equal times: stable, file order
+        assert [s["stem"] for s in snaps] == sorted(ms.stem for ms in mss)   # equal times: stem order
         for ms in mss:
             s = next(x for x in snaps if x["stem"] == ms.stem)
             assert_same_samples(reference(ms, R, (1.3, 0.65)), s)
@@ -142,7 +143,11 @@ def test_torn_tail_detected_and_truncated(tmp_path):
         fh.truncate(e3["offset"] + e3["nbytes"] // 2)
     sc = gsiv.scan(p)
     assert len(sc.entries) == 2 and sc.torn_bytes == e3["nbytes"] // 2 and sc.idx_dropped == 1
-    assert [s["stem"] for s in gsiv.load_archive(p)] == [mss[0].stem, mss[1].stem]
+    with pytest.raises(gsiv.GSIVError, match="torn"):
+        gsiv.load_archive(p)                                    # never a silently reduced set
+    rep = {}
+    assert [s["stem"] for s in gsiv.load_archive(p, strict=False, report=rep)] == [mss[0].stem, mss[1].stem]
+    assert any("torn" in x for x in rep["problems"])
     w = gsiv.RecordWriter(p, dict(mode="iv"))                   # resume: truncate, rewrite index, append
     assert len(w) == 2
     meta, arrays = gsiv.record_from_samples(dict(samples_from_msdata(mss[2], compact=True), pd_new=None))
@@ -158,7 +163,9 @@ def test_record_without_index_line_is_recovered(tmp_path):
     idx.write_text("\n".join(lines[:2]) + "\n" + lines[2][:17])   # crash while writing the 3rd line
     sc = gsiv.scan(p)
     assert len(sc.entries) == 3 and sc.unindexed == 1 and sc.idx_dropped == 1 and sc.torn_bytes == 0
-    assert len(gsiv.load_archive(p)) == 3
+    with pytest.raises(gsiv.GSIVError, match="index"):
+        gsiv.load_archive(p)
+    assert len(gsiv.load_archive(p, strict=False)) == 3
     gsiv.repair(p)
     assert gsiv.scan(p).clean and len(idx.read_text().splitlines()) == 3
 
@@ -178,6 +185,28 @@ def test_crc_failure(tmp_path):
     assert len(gsiv.scan(p, verify=True).entries) == 1
 
 
+def test_newest_record_of_a_stem_in_one_file(tmp_path):
+    p = archive(tmp_path, [msdata(seed=1, path="/x/20261031_101001_41MHz.ms"),
+                           msdata(seed=2, path="/x/20261031_101001_41MHz.ms")])     # a reprocessed snapshot
+    (s,) = gsiv.load_archive(p)
+    assert same(s["I"], samples_from_msdata(msdata(seed=2))["I"])
+
+
+def test_band_and_channel_checks(tmp_path):
+    p = archive(tmp_path, [msdata(seed=0)])
+    with pytest.raises(gsiv.GSIVError, match="band 41 != 82"):
+        gsiv.load_archive(p, band="82MHz")
+    assert len(gsiv.load_archive(p, band=41)) == 1
+    q = tmp_path / "other.gsiv"                                 # same stem layout, other channels
+    ms = msdata(seed=3, path="/x/20261031_101003_41MHz.ms")
+    c = samples_from_msdata(ms, compact=True); c.update(R=np.eye(3), pd_new=(1.3, 0.65), freqs=c["freqs"] + 5e6)
+    meta, arrays = gsiv.record_from_samples(c)
+    w = gsiv.RecordWriter(q, dict(mode="iv"), {k: arrays[k] for k in gsiv.SHARED_ARRAYS + gsiv.CHECK_ARRAYS})
+    w.append(meta, arrays); w.close()
+    with pytest.raises(gsiv.GSIVError, match="freqs differ"):
+        gsiv.load_archive(f"{p},{q}")
+
+
 def test_bad_file_header(tmp_path):
     p = archive(tmp_path, [msdata()])
     with open(p, "r+b") as fh:
@@ -189,11 +218,17 @@ def test_bad_file_header(tmp_path):
         gsiv.load_archive(q)
 
 
-def test_multiple_files_and_duplicates(tmp_path):
+def test_multiple_files_newest_wins(tmp_path):
     a = archive(tmp_path, [msdata(seed=s, path=f"/x/20261031_1010{s:02d}_41MHz.ms") for s in (0, 1)], name="b0.gsiv")
-    b = archive(tmp_path, [msdata(seed=s, path=f"/x/20261031_1010{s:02d}_41MHz.ms") for s in (1, 2)], name="b1.gsiv")
-    snaps = gsiv.load_archive(f"{a},{b}")
-    assert [s["stem"] for s in snaps] == [f"20261031_1010{s:02d}_41MHz" for s in (0, 1, 2)]
+    b = archive(tmp_path, [msdata(seed=s + 10, path=f"/x/20261031_1010{s:02d}_41MHz.ms") for s in (1, 2)],
+                name="b1.gsiv")                                 # written later: its stem 01 wins
+    new01 = samples_from_msdata(msdata(seed=11, path="/x/20261031_101001_41MHz.ms"))
+    for spec in (f"{a},{b}", f"{b},{a}"):
+        rep = {}
+        snaps = gsiv.load_archive(spec, report=rep)
+        assert [s["stem"] for s in snaps] == [f"20261031_1010{s:02d}_41MHz" for s in (0, 1, 2)]
+        assert snaps[1].source == str(b) and same(snaps[1]["I"], new01["I"])
+        assert rep["superseded"] == [("20261031_101001_41MHz", str(a), 2)]
     lst = tmp_path / "l.txt"; lst.write_text(f"{a}\n{b}\n")
     assert len(gsiv.load_archive(f"@{lst}")) == 3
 
@@ -267,6 +302,7 @@ def test_image_hour_snaps_cpu_archive_equals_dicts(tmp_path, cache, free_gb):
     hour_cpu = pytest.importorskip("hour_cpu")
     prods = bands.hour_products(["I-Deep-Taper-Robust-0", "V-Taper-Deep", "I-Taper-10min", "V-Taper-10min"])
     dicts, p = _hour_snaps(tmp_path)
+    assert len(gsiv.load_archive(p)) == len(dicts)
     kw = dict(N=64, exclude_stems=(dicts[3]["stem"],), qa="none")
     ref_s, ref = hour_cpu.run([dict(d) for d in dicts], "41MHz", str(tmp_path / "ref"), 1.3, 0.65, prods,
                               cache="auto", free_gb=1000, **kw)
@@ -280,3 +316,24 @@ def test_image_hour_snaps_cpu_archive_equals_dicts(tmp_path, cache, free_gb):
     assert sorted(got.images) == sorted(ref.images)
     for k in ref.images:
         assert same(got.images[k], ref.images[k]), k
+
+
+def test_cli_archive_no_verify_warns_and_checks_band(tmp_path, monkeypatch, capsys):
+    hour_cpu = pytest.importorskip("hour_cpu")
+    hour = hour_cpu.import_hour()
+    from ttcalx_imager import cli
+    p = archive(tmp_path, [msdata(seed=s, path=f"/x/20261031_1010{s:02d}_41MHz.ms") for s in (0, 1)])
+    got = {}
+    monkeypatch.setattr(hour, "image_hour_snaps", lambda snaps, band, out, ra, dec, **kw:
+                        got.update(n=len(snaps), kw=kw) or dict(rejected=[], timing={}, products={}))
+    from ttcalx_imager import rotate
+    monkeypatch.setattr(rotate, "snapshot_rotation", lambda *a: np.eye(3))     # no casacore measures needed
+    monkeypatch.setenv("TTCALX_CHUNK_CACHE", "unset")
+    monkeypatch.delenv("TTCALX_CHUNK_CACHE")                    # restored (absent) after the test
+    cli.main(["hour", "--archive", str(p), "--band", "41", "--out", str(tmp_path / "o" / "41MHz"), "--lst-hour", "4",
+              "--qa", "none", "--no-verify", "--exclude-stems", "20261031_101001_41MHz"])
+    assert "--no-verify" in capsys.readouterr().err and got["n"] == 2
+    assert got["kw"]["exclude_stems"] == ("20261031_101001_41MHz",) and os.environ["TTCALX_CHUNK_CACHE"] == "store"
+    os.environ.pop("TTCALX_CHUNK_CACHE")
+    with pytest.raises(gsiv.GSIVError, match="band"):
+        cli.main(["hour", "--archive", str(p), "--band", "82", "--out", str(tmp_path / "o" / "82MHz"), "--qa", "none"])
