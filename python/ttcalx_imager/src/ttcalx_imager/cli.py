@@ -95,8 +95,10 @@ def cmd_hour(a):
         t0 = time.perf_counter()
         ra, dec = parse_phase_centre(pc) if pc else archive_phase_centre(a.archive)
         log = (lambda *x: print(*x, flush=True)) if a.verbose else None
+        if a.no_verify:
+            print("WARNING: --no-verify: the archive record crc are not checked", file=sys.stderr, flush=True)
         snaps = load_archive(a.archive, ra, dec, want_v=_want_v(prods, a.pols, a.qa), backend=a.archive_backend,
-                             verify=not a.no_verify, workers=a.nproc, log=log)
+                             verify=not a.no_verify, workers=a.nproc, log=log, band=a.band)
         T = {"load + rotation (CPU)": time.perf_counter() - t0}
         s = image_hour_snaps(snaps, a.band, a.out, ra, dec, timing=T, t0=t0, **kw)
     else:

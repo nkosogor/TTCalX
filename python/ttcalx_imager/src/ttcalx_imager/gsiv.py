@@ -6,8 +6,9 @@ cross-correlation row uvw (float64), natw (float32) and the kept mask, plus R, t
 freqs, chan_width, pd, zero_frac, flagfrac and stem.  The records are what
 ``msio.samples_from_msdata(..., compact=True)`` returns; :class:`LazySnap` rebuilds u, v, w, nw
 with :func:`msio.expand_coord` / :func:`msio.expand_nw`, the expressions of
-``msio.load_samples``, so ``load_archive`` gives bit-identical sample arrays (and the hour
-products of ``hour.image_hour_snaps`` equal those of ``hour.image_hour`` on the MSes).
+``msio.load_samples``, so ``load_archive`` gives bit-identical u, v, w, nw, I and V; R is the
+writer's (see load_archive for the ~1e-10 casacore call-order caveat).  Loading is strict:
+a torn, partial or mixed archive raises instead of giving a reduced set.
 
 The format is defined (and written) by ``gpu_subband_imaging/v3/hourstore.py``; the section
 between the BEGIN/END markers below is a verbatim copy of it (the pipeline tests compare the
@@ -46,8 +47,16 @@ _HCRC = struct.Struct("<I")
 MODES = ("iv",)                          # "full" (full-pol + flags + weights) is not implemented yet
 # per-record arrays that are left out when they equal the file header's (same for every snapshot)
 SHARED_ARRAYS = ("a1", "a2", "ant_pos")
+# header arrays every record must match (a record of another band / channelisation is refused)
+CHECK_ARRAYS = ("freqs", "chan_width")
+# header keys a resumed file must match (a rerun with another band, run, calibration or phase
+# centre must not append to it)
+RESUME_KEYS = ("mode", "phase_centre", "pd_new", "band", "date", "group", "run_label", "cal_bp", "cal_xy")
 # metadata copied into each index line (the rest is in the record JSON)
-INDEX_KEYS = ("stem", "time", "tstart", "zero_frac", "peel")
+INDEX_KEYS = ("stem", "time", "tstart", "zero_frac", "peel", "written_ns")
+# a writer lock whose file was not touched for this long is stale (the writer touches it on
+# every append); GSIV_LOCK_STALE_S overrides
+LOCK_STALE_S = 1800.0
 
 PathLike = Union[str, Path]
 
@@ -126,14 +135,29 @@ def decode_block(buf, off: int = 0, hdr: Optional[Dict[str, Any]] = None
     mv = memoryview(buf).cast("B") if not isinstance(buf, np.ndarray) else buf
     if hdr is None:
         hdr = decode_header(bytes(mv[off:off + BLOCK_HEADER]))
+    end = off + hdr["nbytes"]
+    if end > len(mv):
+        raise GSIVError(f"block at {off}: {hdr['nbytes']} B but only {len(mv) - off} B in the buffer")
     js = bytes(mv[off + BLOCK_HEADER: off + BLOCK_HEADER + hdr["meta_len"]])
-    meta = json.loads(js)
+    try:
+        meta = json.loads(js)
+        table = meta.pop("arrays")
+    except (ValueError, KeyError, AttributeError) as e:
+        raise GSIVError(f"block at {off}: bad JSON ({e})") from None
     d0 = off + BLOCK_HEADER + hdr["meta_len"] + _pad(hdr["meta_len"])
     arrays = {}
-    for t in meta.pop("arrays"):
-        dt = np.dtype(t["dtype"])
-        cnt = int(np.prod(t["shape"], dtype=np.int64)) if t["shape"] else 1
-        a = np.frombuffer(buf, dtype=dt, count=cnt, offset=d0 + t["offset"]).reshape(t["shape"])
+    for t in table:                          # bounds-checked whether or not the crc was verified
+        try:
+            dt = np.dtype(t["dtype"])
+            shape = [int(x) for x in t["shape"]]
+            o, nb = int(t["offset"]), int(t["nbytes"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise GSIVError(f"block at {off}: bad array table entry {t!r} ({e})") from None
+        cnt = int(np.prod(shape, dtype=np.int64)) if shape else 1
+        if (dt.hasobject or min(shape, default=0) < 0 or o < 0 or o % ALIGN or nb != cnt * dt.itemsize
+                or d0 + o + nb > end):
+            raise GSIVError(f"block at {off}: array {t.get('name')!r} outside the block or inconsistent")
+        a = np.frombuffer(buf, dtype=dt, count=cnt, offset=d0 + o).reshape(shape)
         a.flags.writeable = False
         arrays[t["name"]] = a
     return meta, arrays
@@ -194,6 +218,18 @@ class Scan:
     @property
     def clean(self) -> bool:
         return not (self.torn_bytes or self.unindexed or self.idx_dropped or self.bad_crc)
+
+    def problems(self) -> List[str]:
+        out = []
+        if self.torn_bytes:
+            out.append(f"{self.torn_bytes} torn bytes after record {len(self.entries)}")
+        if self.idx_dropped:
+            out.append(f"{self.idx_dropped} index line(s) dropped")
+        if self.unindexed:
+            out.append(f"{self.unindexed} record(s) without an index line")
+        if self.bad_crc:
+            out.append(f"crc mismatch in record(s) {self.bad_crc}")
+        return [f"{self.path}: {p}" for p in out]
 
     @property
     def stems(self) -> List[str]:
@@ -325,9 +361,19 @@ def _write_index(path: PathLike, entries: Sequence[Dict[str, Any]]) -> None:
     _fsync_dir(p)
 
 
-def repair(path: PathLike, log=None) -> Scan:
+def repair(path: PathLike, log=None, lock: bool = True) -> Scan:
     """Make the file and its index consistent: truncate at the first bad record (torn tail or
-    bad crc), rewrite the index for the valid prefix.  Returns the scan of the repaired file."""
+    bad crc), rewrite the index for the valid prefix.  Returns the scan of the repaired file.
+    lock: take the writer lock for the repair (a RecordWriter already holds it)."""
+    lk = WriterLock(path) if lock else None
+    try:
+        return _repair(path, log)
+    finally:
+        if lk is not None:
+            lk.release()
+
+
+def _repair(path: PathLike, log=None) -> Scan:
     sc = scan(path, verify=True)
     if sc.bad_crc:
         first = min(sc.bad_crc)
@@ -349,14 +395,23 @@ def repair(path: PathLike, log=None) -> Scan:
 
 
 def read_blocks(path: PathLike, backend: str = "ram", verify: bool = True, strict: bool = True,
-                workers: int = 8, log=None) -> Tuple[Dict[str, Any], Dict[str, np.ndarray],
-                                                     List[Tuple[Dict[str, Any], Dict[str, np.ndarray], Dict[str, Any]]]]:
-    """(header meta, header arrays, [(meta, arrays, index entry)]) of the valid records of a
-    GSIV file.  ram: one read per record (threads) into its own buffer, crc computed on that
-    buffer; memmap: views of one read-only np.memmap.  A bad crc raises (strict) or drops the
-    record.  Records without a1/a2/ant_pos get the header's."""
+                workers: int = 8, log=None, report: Optional[Dict[str, Any]] = None
+                ) -> Tuple[Dict[str, Any], Dict[str, np.ndarray],
+                           List[Tuple[Dict[str, Any], Dict[str, np.ndarray], Dict[str, Any]]]]:
+    """(header meta, header arrays, [(meta, arrays, index entry)]) of the records of a GSIV file,
+    in file order.  ram: one read per record (threads) into its own buffer, crc computed on that
+    buffer; memmap: views of one read-only np.memmap.
+
+    strict (default): any defect raises GSIVError -- torn bytes, dropped index lines, records
+    without an index line, a bad crc, a record whose freqs / chan_width differ from the header's.
+    strict=False: the defective records are dropped and the defects listed in ``report``
+    (dict, filled in: problems, n_records, n_dropped).  Records without a1/a2/ant_pos get the
+    header's."""
     sc = scan(path, verify=False)
     entries = sc.entries
+    problems = sc.problems()
+    if problems and strict:
+        raise GSIVError("; ".join(problems))
     if backend == "memmap":
         mm = np.memmap(str(path), dtype=np.uint8, mode="r")
         bufs = [(mm, int(e["offset"])) for e in entries]
@@ -379,20 +434,130 @@ def read_blocks(path: PathLike, backend: str = "ram", verify: bool = True, stric
         with ThreadPoolExecutor(max(1, workers)) as ex:
             crcs = list(ex.map(lambda be: block_crc(be[0][0], be[0][1], int(be[1]["nbytes"])), zip(bufs, entries)))
         bad = [e["seq"] for e, c in zip(entries, crcs) if c != e["crc"]]
-        if bad and strict:
-            raise GSIVError(f"{path}: crc mismatch in record(s) {bad}")
-        if bad and log:
-            log(f"GSIV {path}: dropped record(s) with a bad crc: {bad}")
+        if bad:
+            problems.append(f"{path}: crc mismatch in record(s) {bad}")
+            if strict:
+                raise GSIVError(problems[-1])
     out = []
+    dropped = len(bad)
     for (b, off), e in zip(bufs, entries):
         if e["seq"] in bad:
             continue
-        meta, arrays = decode_block(b, off)
+        try:
+            meta, arrays = decode_block(b, off)
+        except GSIVError as err:
+            problems.append(f"{path}: record {e['seq']}: {err}")
+            if strict:
+                raise GSIVError(problems[-1]) from None
+            dropped += 1
+            continue
+        bad_arr = [k for k in CHECK_ARRAYS if k in sc.header_arrays and not _same_array(arrays.get(k), sc.header_arrays[k])]
+        if bad_arr:
+            problems.append(f"{path}: record {e['seq']} ({meta.get('stem')}): {bad_arr} differ from the header's "
+                            f"(another band?)")
+            if strict:
+                raise GSIVError(problems[-1])
+            dropped += 1
+            continue
         for k in SHARED_ARRAYS:
             if k not in arrays and k in sc.header_arrays:
                 arrays[k] = sc.header_arrays[k]
         out.append((meta, arrays, e))
+    if problems and log:
+        log("GSIV " + "; ".join(problems))
+    if report is not None:
+        report.update(problems=problems, n_records=len(entries), n_dropped=dropped, header=sc.header_meta)
     return sc.header_meta, sc.header_arrays, out
+
+
+def _same_array(a, b) -> bool:
+    if a is None or b is None:
+        return False
+    a, b = np.asarray(a), np.asarray(b)
+    return a.dtype == b.dtype and a.shape == b.shape and a.tobytes() == b.tobytes()
+
+
+def newest(blocks_by_file: Sequence[Tuple[str, Sequence[Tuple[Dict[str, Any], Any, Dict[str, Any]]]]]):
+    """Newest record per stem over several files: the largest (written_ns, seq) wins, the file
+    path breaks a tie -- deterministic and independent of the order the files are given in (a
+    reprocessed snapshot supersedes its old record, as v2's keep_ms overwrites the kept MS).
+    Returns ({stem: (path, block)}, [(stem, superseded path, seq)])."""
+    best: Dict[str, Tuple[Tuple[int, int, str], str, Any]] = {}
+    superseded = []
+    for path, blocks in blocks_by_file:
+        for blk in blocks:
+            meta, _, e = blk
+            key = (int(meta.get("written_ns", 0)), int(e["seq"]), str(path))
+            st = meta["stem"]
+            if st not in best or key > best[st][0]:
+                if st in best:
+                    superseded.append((st, best[st][1], best[st][0][1]))
+                best[st] = (key, str(path), blk)
+            else:
+                superseded.append((st, str(path), int(e["seq"])))
+    return {st: (p, blk) for st, (_, p, blk) in best.items()}, superseded
+
+
+class WriterLock:
+    """O_EXCL lock file ``<file>.lock`` (pid, host, time) -- flock is not reliable on Lustre.
+    A lock of a dead process on this host, or one not touched for GSIV_LOCK_STALE_S (default
+    1800 s; the writer touches it on every append), is taken over."""
+
+    def __init__(self, path: PathLike):
+        self.path = Path(f"{path}.lock")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        stale_s = float(os.environ.get("GSIV_LOCK_STALE_S", LOCK_STALE_S))
+        me = dict(pid=os.getpid(), host=os.uname().nodename, t=time.time())
+        for _ in range(3):
+            try:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                try:
+                    other = json.loads(self.path.read_text() or "{}")
+                    age = time.time() - self.path.stat().st_mtime
+                except (OSError, ValueError):
+                    other, age = {}, 0.0
+                dead = other.get("host") == me["host"] and not _pid_alive(int(other.get("pid", -1)))
+                if dead or age > stale_s:
+                    try:
+                        self.path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                raise GSIVError(f"{path} is being written by pid {other.get('pid')} on {other.get('host')} "
+                                f"(lock {self.path}, {age:.0f} s old)") from None
+            with os.fdopen(fd, "w") as fh:
+                fh.write(json.dumps(me))
+            self.held = True
+            return
+        raise GSIVError(f"cannot take the lock {self.path}")
+
+    def touch(self) -> None:
+        try:
+            os.utime(str(self.path))
+        except OSError:
+            pass
+
+    def release(self) -> None:
+        if getattr(self, "held", False):
+            try:
+                if json.loads(self.path.read_text()).get("pid") == os.getpid():
+                    self.path.unlink()
+            except (OSError, ValueError):
+                pass
+            self.held = False
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 # ----------------------------------------------------------------------------- writer
@@ -411,14 +576,28 @@ class RecordWriter:
         self._lock = threading.Lock()
         self._f = None
         self._idx = None
+        self._flock = WriterLock(self.path)
+        try:
+            self._open(header_meta, header_arrays, resume, log)
+        except BaseException:
+            self._flock.release()
+            raise
+
+    def _open(self, header_meta, header_arrays, resume, log) -> None:
         if self.path.exists() and self.path.stat().st_size > 0:
             if not resume:
                 raise GSIVError(f"{self.path} exists (resume=False)")
-            sc = repair(self.path, log=log)
+            sc = scan(self.path)                 # header checks before anything is truncated
             if header_meta is not None:
-                for k in ("mode", "phase_centre"):
+                for k in RESUME_KEYS:
                     if k in header_meta and sc.header_meta.get(k) != header_meta.get(k):
-                        raise GSIVError(f"{self.path}: {k} {sc.header_meta.get(k)!r} != {header_meta.get(k)!r}")
+                        raise GSIVError(f"{self.path}: cannot resume, header {k} {sc.header_meta.get(k)!r} != "
+                                        f"{header_meta.get(k)!r} (remove the file to start over)")
+            for k in CHECK_ARRAYS:
+                if header_arrays and k in header_arrays and k in sc.header_arrays and \
+                        not _same_array(np.asarray(header_arrays[k]), sc.header_arrays[k]):
+                    raise GSIVError(f"{self.path}: cannot resume, header {k} differ (another band?)")
+            sc = _repair(self.path, log=log)
             self.header_meta, self.header_arrays = sc.header_meta, sc.header_arrays
             self.entries = list(sc.entries)
             self._end = sc.end
@@ -443,6 +622,7 @@ class RecordWriter:
             self.entries = []
             self._end = nbytes
         self._f = open(self.path, "r+b")
+        self.lock = self._flock
         self._idx = open(idx_path(self.path), "a")
         self.stems = {e.get("stem") for e in self.entries}
 
@@ -465,9 +645,19 @@ class RecordWriter:
         return out
 
     def append(self, meta: Dict[str, Any], arrays: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        """Append one record (a stem that is already in the file is appended again: the newest
+        record of a stem wins on load).  Refused if its freqs / chan_width differ from the
+        header's."""
         with self._lock:
             if self._f is None:
                 raise GSIVError("writer closed")
+            for k in CHECK_ARRAYS:
+                if k in self.header_arrays and not _same_array(arrays.get(k), self.header_arrays[k]):
+                    raise GSIVError(f"{self.path}: record {meta.get('stem')}: {k} differ from the header's "
+                                    f"(another band?)")
+            meta = dict(meta)
+            meta["written_ns"] = max(time.time_ns(), max((int(e.get("written_ns", 0)) for e in self.entries),
+                                                         default=0) + 1)
             seq = len(self.entries) + 1
             arrays = self._strip_shared(arrays)
             hdr, pieces, nbytes, crc = encode_block(MAGIC_REC, seq, meta, arrays)
@@ -487,6 +677,7 @@ class RecordWriter:
             self.entries.append(e)
             self.stems.add(e.get("stem"))
             self._end = off + nbytes
+            self._flock.touch()
             return e
 
     def close(self) -> None:
@@ -495,6 +686,7 @@ class RecordWriter:
                 if f is not None:
                     f.close()
             self._f = self._idx = None
+            self._flock.release()
 
 
 # END shared section
@@ -535,7 +727,7 @@ def write_archive(path, ms_paths, ra=None, dec=None, phase_centre=None, want_v=T
                                                                compact=True))
         if w is None:
             hm = dict(header or {}, phase_centre=phase_centre, pd_new=None if ra is None else [ra, dec])
-            w = RecordWriter(path, hm, {k: arrays[k] for k in SHARED_ARRAYS})
+            w = RecordWriter(path, hm, {k: arrays[k] for k in SHARED_ARRAYS + CHECK_ARRAYS})
         if meta["stem"] not in w.stems:
             w.append(meta, arrays)
     if w is None:
@@ -661,43 +853,80 @@ def archive_phase_centre(paths) -> Tuple[float, float]:
 
 
 def load_archive(paths, ra=None, dec=None, want_v=True, backend="ram", verify=True, strict=True, workers=8,
-                 log=None) -> List[LazySnap]:
+                 log=None, band=None, report=None) -> List[LazySnap]:
     """Snapshots of one or more GSIV files (list, comma-separated string or @listfile) as
-    :class:`LazySnap` mappings, in time order (a stem present twice: the first one is kept).
+    :class:`LazySnap` mappings, in time order.
+
+    A stem in several records (a reprocessed snapshot, possibly in another batch's file): the
+    newest wins, by (written_ns, seq) then path -- independent of the order of ``paths``.
+
+    strict (default): GSIVError on any defect -- torn bytes, dropped index lines, records without
+    an index line, a bad crc (verify), a record whose freqs / chan_width differ from its file
+    header's, files with different freqs, a header band other than ``band`` (int or '55MHz').
+    strict=False: defective records are dropped; ``report`` (dict) lists the problems, the
+    files, the stems and the superseded records.
 
     (ra, dec): the hour phase centre.  A record's R was computed for the header's phase centre
     (``pd_new``); for another (ra, dec) it is recomputed from the record's uvw, a1, a2, ant_pos
-    and time with rotate.snapshot_rotation (casacore), exactly as load_samples would.  ra=None:
-    the stored R."""
+    and time with rotate.snapshot_rotation (casacore), as load_samples would.  ra=None: the
+    stored R.  R is the writer's load_samples R: casacore measures caching makes R depend on the
+    order of the calls in a process (~1e-10), so it equals a sequential load_samples in the
+    writer's order, not necessarily a process-pool load_all (which differs between v2 runs too)."""
+    import re
     log = log or (lambda *a: None)
-    snaps, seen = [], set()
     t0 = time.perf_counter()
-    nbytes = 0
+    want_band = int(re.search(r"\d+", str(band)).group()) if band is not None else None
+    problems: List[str] = []
+    per_file = []
+    freqs0 = None
     for p in _split_paths(paths):
-        hm, ha, blocks = read_blocks(p, backend=backend, verify=verify, strict=strict, workers=workers, log=log)
-        nrot = 0
-        for meta, arrays, e in blocks:
-            if meta["stem"] in seen:
-                log(f"load_archive: duplicate {meta['stem']} in {p} ignored")
+        rep = {}
+        hm, ha, blocks = read_blocks(p, backend=backend, verify=verify, strict=strict, workers=workers, log=log,
+                                     report=rep)
+        problems += rep.get("problems", [])
+        if want_band is not None and hm.get("band") is not None and int(hm["band"]) != want_band:
+            problems.append(f"{p}: band {hm.get('band')} != {want_band}")
+            if strict:
+                raise GSIVError(problems[-1])
+            continue
+        f = blocks[0][1]["freqs"] if blocks else ha.get("freqs")
+        if f is not None:
+            if freqs0 is None:
+                freqs0 = (p, np.asarray(f))
+            elif not _same_array(np.asarray(f), freqs0[1]):
+                problems.append(f"{p}: freqs differ from {freqs0[0]}")
+                if strict:
+                    raise GSIVError(problems[-1])
                 continue
-            seen.add(meta["stem"])
-            pd_rec = meta.get("pd_new")
-            if ra is None:
-                R, pd_new = arrays["R"], pd_rec
-            elif pd_rec is not None and float(pd_rec[0]) == float(ra) and float(pd_rec[1]) == float(dec):
-                R, pd_new = arrays["R"], (ra, dec)
-            else:
-                from .rotate import snapshot_rotation
-                R = snapshot_rotation(arrays["uvw"], arrays["a1"], arrays["a2"], arrays["ant_pos"], meta["time"],
-                                      ra, dec).astype(np.float64)
-                pd_new = (ra, dec); nrot += 1
-            if not want_v:
-                arrays = {k: v for k, v in arrays.items() if k != "V"}
-            snaps.append(LazySnap(meta, arrays, R, pd_new, source=p))
-            nbytes += sum(a.nbytes for a in arrays.values())
-        if nrot:
-            log(f"load_archive: {p}: R recomputed for {nrot} record(s) (phase centre differs from the archive's)")
+        per_file.append((p, blocks))
+    best, superseded = newest(per_file)
+    if superseded:
+        log(f"load_archive: {len(superseded)} older record(s) superseded: {superseded[:5]}")
+    snaps = []
+    nbytes = 0
+    nrot = 0
+    for stem in sorted(best):
+        p, (meta, arrays, e) = best[stem]
+        pd_rec = meta.get("pd_new")
+        if ra is None:
+            R, pd_new = arrays["R"], pd_rec
+        elif pd_rec is not None and float(pd_rec[0]) == float(ra) and float(pd_rec[1]) == float(dec):
+            R, pd_new = arrays["R"], (ra, dec)
+        else:
+            from .rotate import snapshot_rotation
+            R = snapshot_rotation(arrays["uvw"], arrays["a1"], arrays["a2"], arrays["ant_pos"], meta["time"],
+                                  ra, dec).astype(np.float64)
+            pd_new = (ra, dec); nrot += 1
+        if not want_v:
+            arrays = {k: v for k, v in arrays.items() if k != "V"}
+        snaps.append(LazySnap(meta, arrays, R, pd_new, source=p))
+        nbytes += sum(a.nbytes for a in arrays.values())
+    if nrot:
+        log(f"load_archive: R recomputed for {nrot} record(s) (phase centre differs from the archive's)")
     snaps.sort(key=lambda s: s["time"])
+    if report is not None:
+        report.update(problems=problems, files=[p for p, _ in per_file], stems=[s["stem"] for s in snaps],
+                      superseded=superseded)
     log(f"load_archive: {len(snaps)} snapshots, {sum(s.n for s in snaps) / 1e6:.1f} M samples, "
         f"{nbytes / 1e9:.2f} GB ({backend}), {time.perf_counter() - t0:.1f} s")
     return snaps
