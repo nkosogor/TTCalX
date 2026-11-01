@@ -18,6 +18,14 @@ snapshot frame and the target frame (used by reproject.py).
 import numpy as np
 
 
+def parse_phase_centre(pc):
+    """'02h30m00s 37d12m57.057s' (or 'ra_deg dec_deg') -> (ra, dec) rad."""
+    from astropy.coordinates import Angle
+    a, b = pc.split()
+    ra = Angle(a, unit="hourangle") if any(c in a for c in "hm:") else Angle(float(a), unit="deg")
+    return ra.rad, Angle(b, unit="deg").rad
+
+
 def measures_uvw(ant_pos, time_s, ra, dec):
     """Per-antenna J2000 uvw [m] (nant, 3) of ITRF antenna positions at MJD seconds time_s."""
     from casacore.measures import measures
