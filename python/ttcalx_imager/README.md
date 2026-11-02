@@ -25,8 +25,8 @@ imager: no chunk cache, cuFFT plans cleared per interval, LAPACK SVD, FFT local 
 FFTs, FFT residual updates.  The gsi v3 entry points (`hour --archive`, `cli.run_hour_snaps`, the gsi v3
 engine) call `ttcalx_imager.use_fast_settings()`, which sets every variable of `FAST_ENV` that is not
 already set (value in the third column).  Always on (not gated): the compact w-term factors
-(float32 interpolation of the 1-D tables) and the new Hogbom kernels; images equal 748884a's to
-float32 rounding (2026-10-27 regression set, snap 108/108 + hour 57/57 PASS with 86afd89).
+(float32 interpolation of the 1-D tables) and the new Hogbom kernels; images are within 748884a's
+run-to-run GPU floor (82 MHz MS hour job vs 748884a, 2026-11-02; 2026-10-27 regression set PASS with 86afd89).
 
 | variable | default | `FAST_ENV` | meaning |
 |---|---|---|---|
