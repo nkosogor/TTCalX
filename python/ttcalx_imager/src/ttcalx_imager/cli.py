@@ -109,6 +109,7 @@ def run_hour_snaps(argv, get_snaps, timing=None, t0=None):
         raise ValueError("run_hour_snaps needs --phase-centre or --lst-hour")
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     os.environ.setdefault("TTCALX_CHUNK_CACHE", "store")      # as --archive: no host-side u, v, w copies
+    os.environ.setdefault("TTCALX_CACHE_OOM_FALLBACK", "1")   # as --archive: a GPU OOM retries without the device cache
     t0 = time.perf_counter() if t0 is None else t0
     ra, dec = parse_phase_centre(pc)
     snaps = get_snaps(ra, dec, _want_v(prods, a.pols, a.qa))
@@ -129,6 +130,7 @@ def cmd_hour(a):
         # archive snapshots: device chunk cache when it fits, else rebuilt on the GPU from the
         # records (no host-side u, v, w duplicates); TTCALX_CHUNK_CACHE overrides
         os.environ.setdefault("TTCALX_CHUNK_CACHE", "store")
+        os.environ.setdefault("TTCALX_CACHE_OOM_FALLBACK", "1")
         from .rotate import parse_phase_centre
         t0 = time.perf_counter()
         ra, dec = parse_phase_centre(pc) if pc else archive_phase_centre(a.archive)

@@ -355,7 +355,7 @@ def _run_hour(tmp_path, snaps, cache, free_gb=1000, oom=None, prefix="o"):
 def test_oom_fallback_equals_no_cache(tmp_path, monkeypatch, cache, oom):
     """A GPU OOM in an interval with a device chunk cache: the interval is imaged again without the
     device cache, and the products are bit for bit those of a run without any cache."""
-    monkeypatch.delenv("TTCALX_CACHE_OOM_FALLBACK", raising=False)
+    monkeypatch.setenv("TTCALX_CACHE_OOM_FALLBACK", "1")
     monkeypatch.delenv("TTCALX_CACHE_RESERVE", raising=False)
     dicts, p = _hour_snaps(tmp_path)
     ref_s, ref = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "off", 0, prefix="ref")
@@ -384,6 +384,7 @@ def test_oom_fallback_equals_no_cache(tmp_path, monkeypatch, cache, oom):
 def test_oom_fallback_is_per_product(tmp_path, monkeypatch):
     """After a fallback the rest of that product runs without the device cache; the next product
     caches again."""
+    monkeypatch.setenv("TTCALX_CACHE_OOM_FALLBACK", "1")
     monkeypatch.delenv("TTCALX_CACHE_RESERVE", raising=False)
     dicts, p = _hour_snaps(tmp_path)
     s0, c0 = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "store", 1000, prefix="a")
@@ -395,11 +396,14 @@ def test_oom_fallback_is_per_product(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("cache,free_gb,env", [("off", 0, {}), ("store", 0, {}), ("auto", 0, {}),
-                                               ("store", 1000, {"TTCALX_CACHE_OOM_FALLBACK": "0"})])
+                                               ("store", 1000, {"TTCALX_CACHE_OOM_FALLBACK": "0"}),
+                                               ("store", 1000, {}), ("auto", 1000, {})])
 def test_oom_without_device_cache_raises(tmp_path, monkeypatch, cache, free_gb, env):
-    """No device cache to give up (or the fallback switched off): the OOM is raised, as before."""
+    """No device cache to give up, or the fallback not switched on (the default for image_hour_snaps /
+    MS hour jobs, as 86afd89): the OOM is raised, as before."""
     hour_cpu = pytest.importorskip("hour_cpu")
     monkeypatch.delenv("TTCALX_CACHE_RESERVE", raising=False)
+    monkeypatch.delenv("TTCALX_CACHE_OOM_FALLBACK", raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     dicts, p = _hour_snaps(tmp_path)
@@ -409,6 +413,7 @@ def test_oom_without_device_cache_raises(tmp_path, monkeypatch, cache, free_gb, 
 
 def test_second_oom_raises(tmp_path, monkeypatch):
     hour_cpu = pytest.importorskip("hour_cpu")
+    monkeypatch.setenv("TTCALX_CACHE_OOM_FALLBACK", "1")
     monkeypatch.delenv("TTCALX_CACHE_RESERVE", raising=False)
     dicts, p = _hour_snaps(tmp_path)
     with pytest.raises(hour_cpu.FakeOOM):

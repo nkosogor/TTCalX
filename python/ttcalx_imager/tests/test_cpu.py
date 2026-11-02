@@ -215,9 +215,46 @@ def test_normal_psf_support_passes(band, maxuvw):
 
 def test_fit_beam_rejects_an_empty_psf():
     with pytest.raises(DegeneratePSFError, match="centre pixel"):
-        fit_beam(np.zeros((64, 64), np.float32), 0.0767, 6.0)
+        fit_beam(np.zeros((64, 64), np.float32), 0.0767, 6.0, strict=True)
     with pytest.raises(DegeneratePSFError, match="centre pixel"):
-        fit_beam(np.full((64, 64), np.nan, np.float32), 0.0767, 6.0)
+        fit_beam(np.full((64, 64), np.nan, np.float32), 0.0767, 6.0, strict=True)
+
+
+def _fit_beam_86afd89(psf, scale_deg, theo):
+    """fit_beam of 86afd89 (no checks)."""
+    from ttcalx_imager.beam import fit_psf_wsclean
+    psf = np.asarray(psf, dtype=np.float32)
+    H, W = psf.shape
+    c = psf[H // 2, W // 2]
+    if c != 0:
+        psf = psf / c
+    maj, mnr, pa = fit_psf_wsclean(psf, max(float(theo), 1.0))
+    return maj * scale_deg, mnr * scale_deg, math.degrees(pa)
+
+
+def _outcome(fn, *a):
+    import warnings
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return ("ok", np.asarray(fn(*a), np.float64).tobytes())
+    except Exception as e:                       # noqa: BLE001
+        return ("raised", type(e).__name__)
+
+
+@pytest.mark.parametrize("kind", ["zeros", "nan", "spike"])
+def test_fit_beam_default_is_86afd89(kind, monkeypatch):
+    """Default (TTCALX_STRICT_BEAM unset): the hour multiscale cleaner fits the beam as before, whatever
+    the PSF -- no DegeneratePSFError turns a previously written hour image into a failed hour job."""
+    monkeypatch.delenv("TTCALX_STRICT_BEAM", raising=False)
+    psf = {"zeros": np.zeros((64, 64), np.float32), "nan": np.full((64, 64), np.nan, np.float32),
+           "spike": np.pad(np.ones((1, 1), np.float32), 31)[:64, :64]}[kind]
+    got = _outcome(fit_beam, psf, 0.0767, 6.0)
+    assert got == _outcome(_fit_beam_86afd89, psf, 0.0767, 6.0)
+    assert got[1] != "DegeneratePSFError"
+    monkeypatch.setenv("TTCALX_STRICT_BEAM", "1")
+    if kind != "spike":
+        assert _outcome(fit_beam, psf, 0.0767, 6.0) == ("raised", "DegeneratePSFError")
 
 
 def test_to_fwhm_pa_circular():

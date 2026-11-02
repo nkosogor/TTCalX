@@ -468,9 +468,11 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
     # (~2-3 s per interval).  Keep them across intervals, in an LRU plan cache capped at
     # TTCALX_FFT_PLAN_CACHE_GB (default 1.5); TTCALX_KEEP_FFT_PLANS=0: clear after every interval.
     keep_plans = os.environ.get("TTCALX_KEEP_FFT_PLANS", "1") == "1"
-    # GPU OOM in an interval whose chunks were partly kept on the GPU: once more without the device
-    # chunk cache (TTCALX_CACHE_OOM_FALLBACK=0: raise, as before)
-    oom_fallback = os.environ.get("TTCALX_CACHE_OOM_FALLBACK", "1") == "1"
+    # TTCALX_CACHE_OOM_FALLBACK=1: a GPU OOM in an interval whose chunks were partly kept on the GPU is
+    # imaged once more without the device chunk cache (same inputs, bit-identical products).  Default 0
+    # (raise, as 86afd89) for MS hour jobs; the archive / in-memory entry points (cli --archive,
+    # run_hour_snaps: gsi v3) turn it on
+    oom_fallback = os.environ.get("TTCALX_CACHE_OOM_FALLBACK", "0") == "1"
     if keep_plans:
         cp.fft.config.get_plan_cache().set_memsize(int(float(os.environ.get("TTCALX_FFT_PLAN_CACHE_GB", "1.5")) * 1e9))
     N, sdeg = bands.geometry(band)

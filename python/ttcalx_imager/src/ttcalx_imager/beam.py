@@ -27,6 +27,7 @@ The prototype's fit (centred Gaussian on the main lobe only, pixels > 5 % of the
 1-3 % wider than WSClean's.
 """
 import math
+import os
 
 import numpy as np
 
@@ -156,7 +157,14 @@ def fit_psf_wsclean(psf, beam_est_px, box_scale=10.0, wrap=WRAP):
     return maj, mnr, pa
 
 
-def fit_beam(psf, scale_deg, theoretical_beam_px, wrap=WRAP):
+def strict_beam():
+    """TTCALX_STRICT_BEAM=1: fit_beam raises DegeneratePSFError for an unusable PSF / beam fit.  Off by
+    default (86afd89 behaviour: the fit's values are used as they come, e.g. a NaN beam in the header);
+    a degenerate snapshot is caught before the fit by check_psf_support in either case."""
+    return os.environ.get("TTCALX_STRICT_BEAM", "0") == "1"
+
+
+def fit_beam(psf, scale_deg, theoretical_beam_px, wrap=WRAP, strict=None):
     """Restoring beam (BMAJ, BMIN, BPA) in degrees, as written by WSClean.
 
     psf: [y, x] array (numpy or cupy), normalised here by its centre pixel (H/2, W/2) as WSClean.
@@ -168,10 +176,11 @@ def fit_beam(psf, scale_deg, theoretical_beam_px, wrap=WRAP):
     c = psf[H // 2, W // 2]
     if c != 0:
         psf = psf / c
-    if not (c != 0 and math.isfinite(float(c))):
+    strict = strict_beam() if strict is None else strict
+    if strict and not (c != 0 and math.isfinite(float(c))):
         raise DegeneratePSFError(f"degenerate PSF: centre pixel is {float(c)!r} (no usable uv samples)")
     maj, mnr, pa = fit_psf_wsclean(psf, max(float(theoretical_beam_px), 1.0), wrap=wrap)
-    if not (math.isfinite(maj) and math.isfinite(mnr) and math.isfinite(pa) and maj > 0 and mnr > 0):
+    if strict and not (math.isfinite(maj) and math.isfinite(mnr) and math.isfinite(pa) and maj > 0 and mnr > 0):
         raise DegeneratePSFError(f"degenerate restoring beam: fit gave major {maj!r} px, minor {mnr!r} px, "
                                  f"PA {pa!r} rad (theoretical beam {float(theoretical_beam_px):.3g} px)")
     return maj * scale_deg, mnr * scale_deg, math.degrees(pa)
