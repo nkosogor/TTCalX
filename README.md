@@ -7,6 +7,11 @@
 GPU-accelerated direction-dependent calibration developed for the OVRO LWA.
 TTCalX is an extended version of the previous TTCal package by Michael Eastwood (see https://github.com/mweastwood/TTCal.jl).
 
+**Versions used by the OVRO-LWA GPU pipeline (gsi):** tag `gsi-v1` = as deployed until 2026-10-25;
+tag `gsi-v2` = 748884a (production with gsi v2); branch `exp/ttcalx-v3-all` = 0.3.0 peeler + gsi v3
+imager in one commit. Its defaults give 748884a's peel (bitwise) and images (GPU floor); the new
+speed paths are opt-in (`fast_kernels!`, `PeelWorkspace`, imager `FAST_ENV`).
+
 
 ## Table of Contents
 
