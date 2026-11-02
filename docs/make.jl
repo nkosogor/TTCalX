@@ -24,6 +24,7 @@ makedocs(
         "Source Models"    => "sources.md",
         "GPU Kernels"     => "kernels.md",
         "MS I/O"          => "msio.md",
+        "GPU CLEAN Imager" => "gpu-clean-imager.md",
         "CLI Reference"   => "cli.md",
         "API Reference"   => "api.md",
     ],

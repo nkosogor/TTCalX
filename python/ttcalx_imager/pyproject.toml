@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ttcalx-imager"
+version = "0.1.0"
+description = "GPU CLEAN imager for OVRO-LWA snapshots and 1-h / 10-min images (WSClean-equivalent settings)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Nikita Kosogorov" }]
+dependencies = [
+    "numpy>=1.24,<2",
+    "scipy",
+    "astropy",
+    "python-casacore",
+]
+
+[project.optional-dependencies]
+# CUDA 12 wheels; validated with cupy-cuda12x 13.6.0 + cufinufft 2.5.1 on RTX A4000 (driver CUDA 12.3)
+gpu = ["cupy-cuda12x", "cufinufft>=2.5"]
+test = ["pytest"]
+
+[project.scripts]
+ttcalx-image = "ttcalx_imager.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: needs CuPy + cuFINUFFT and a CUDA device"]
