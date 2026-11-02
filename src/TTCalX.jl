@@ -54,11 +54,12 @@ export SPEED_OF_LIGHT, j2000_to_itrf_matrix, uvw_geometry, geometric_uvw!, ms_mj
 export GPURFISource, GPURFISpectrum, is_rfi, wgs84_to_itrf
 export genvis_exact!, exact_model_tables
 export PhaseRegularization, phase_regularization, regularized_fraction, antenna_planar_distances
-export tukey_prior, regularize_element
+export tukey_prior, regularize_element, GainRidge, gain_ridge
 export mask_short_baselines!, stefcal_steps!, solve_gains!, host_makesquare!
 export read_ms_fast, write_ms_fast!
 export residual_power, flag_zero_visibilities!, max_gain_amplitude, guarded_zest!
 export source_elevation_deg, zest_sky_rfi!, zest_sky_rfi_ms!, restore_point_sources!
+export KeptSources, kept_sources, fit_kept, set_kept!, update_kept!, kept_fluxes
 export PeelWorkspace, workspace_bytes, free_workspace!
 export fast_kernels!, fast_kernels
 
@@ -89,6 +90,7 @@ include("gpu/workspace.jl")
 include("gpu/solver.jl")
 include("gpu/ms_io.jl")
 include("gpu/guard.jl")
+include("gpu/keep.jl")
 include("gpu/sky_rfi.jl")
 
 """

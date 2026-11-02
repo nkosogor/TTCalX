@@ -138,6 +138,12 @@ cost, and the off-diagonal term is moved to its conditional optimum.
     abs(det_den) > eps(Float64) || return z, z, z, z
     inv_det = 1.0 / det_den
     if start === nothing
+        if lam > 0.0     # GainRidge: X = (D + μ)⁻¹ (N + μ I), μ = lam (see `GainRidge`)
+            dxx += lam; dyy += lam; nxx += lam; nyy += lam
+            det_den = dxx*dyy - dxy*dyx
+            abs(det_den) > eps(Float64) || return z, z, z, z
+            inv_det = 1.0 / det_den
+        end
         inv_xx = dyy * inv_det; inv_xy = -dxy * inv_det
         inv_yx = -dyx * inv_det; inv_yy = dxx * inv_det
         sol_xx = inv_xx*nxx + inv_xy*nyx
@@ -187,6 +193,9 @@ end
 """Diagonal StefCal step for antenna j, channel β (as `stefcal_step_diagonal_kernel!`), optionally regularized."""
 @inline function _diag_step(j, β, gxx, gyy, Vxx, Vxy, Vyx, Vyy, Mxx, Mxy, Myx, Myy, start, width, lam, Nant)
     nxx, nyy, dxx, dyy = _diag_normal_equations(j, β, gxx, gyy, Vxx, Vxy, Vyx, Vyy, Mxx, Mxy, Myx, Myy, Nant)
+    if start === nothing && lam > 0.0       # GainRidge toward unit gains
+        nxx += lam; nyy += lam; dxx += lam; dyy += lam
+    end
     new_xx = abs(dxx) > eps(Float64) ? conj(nxx / dxx) : gxx[j, β]
     new_yy = abs(dyy) > eps(Float64) ? conj(nyy / dyy) : gyy[j, β]
     if start !== nothing
@@ -388,7 +397,8 @@ function stefcal_steps!(k, g, is_diagonal::Bool, meas_sq::GPUSquareVisibilities,
                         model_sq::GPUSquareVisibilities, Nant::Int; reg=nothing, active=nothing,
                         ne=nothing)
     Nf = size(g[1], 2)
-    start, width, lam = reg === nothing ? (nothing, nothing, 0.0) : (reg.start, reg.width, reg.lambda)
+    start, width, lam = reg === nothing ? (nothing, nothing, 0.0) :
+                        reg isa GainRidge ? (nothing, nothing, reg.mu) : (reg.start, reg.width, reg.lambda)
     V = (meas_sq.xx, meas_sq.xy, meas_sq.yx, meas_sq.yy)
     M = (model_sq.xx, model_sq.xy, model_sq.yx, model_sq.yy)
     if g[1] isa CuArray
@@ -628,7 +638,9 @@ function solve_gains!(calibration::GPUCalibration, measured::GPUVisibilities,
     smooth_flux >= 0 || throw(ArgumentError("smooth_flux must be ≥ 0 (got $smooth_flux)"))
     smooth_flux > 0 && (reg !== nothing || wideband) &&
         throw(ArgumentError("smooth_flux cannot be combined with reg or a wideband calibration"))
-    if reg !== nothing
+    if reg isa GainRidge
+        wideband && throw(ArgumentError("GainRidge is per channel only"))
+    elseif reg !== nothing
         size(reg.start) == (Na, Nfreq(calibration)) || throw(ArgumentError(
             "phase prior is $(size(reg.start)), calibration is $((Na, Nfreq(calibration))) " *
             "(use phase_regularization(...; nfreq=1) for wideband calibrations)"))

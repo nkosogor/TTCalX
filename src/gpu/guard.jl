@@ -191,6 +191,9 @@ the source subtracted with its previous gains).  Otherwise the previous gains
 are restored and the source is subtracted with them if that beats leaving it
 in, or left in the data (the residual never grows from a source update).
 
+`after_pass(subtracted)` (optional) is called after the initial subtraction and after
+every pass over the sources, e.g. to refit kept sources (`update_kept!`) on the residual.
+
 `report(index, iteration; converged, niters, finite, max_gain, p_with, p_old,
 p_new, action)` is called after every update (`action` is :accept,
 :keep_previous or :leave_in).  Returns which sources end up subtracted;
@@ -201,7 +204,7 @@ function guarded_zest!(vis::GPUVisibilities, meta::GPUMetadata,
                        coherencies::AbstractVector, calibrations::AbstractVector, solve;
                        peeliter::Integer=3, max_gain::Real=Inf,
                        require_convergence::Bool=false, report=nothing,
-                       workspace::Union{Nothing,PeelWorkspace}=nothing)
+                       workspace::Union{Nothing,PeelWorkspace}=nothing, after_pass=nothing)
     ws = workspace
     N = length(coherencies)
     all(c -> size(c.xx) == size(vis.xx), coherencies) ||
@@ -216,6 +219,7 @@ function guarded_zest!(vis::GPUVisibilities, meta::GPUMetadata,
     for s in 1:N
         _subtract!(vis, coherencies[s], calibrations[s], meta, buf)
     end
+    after_pass === nothing || after_pass(subtracted)
     for iteration in 1:peeliter, s in 1:N
         coherency, cal = coherencies[s], calibrations[s]
         p_old = subtracted[s] ? power() : Inf
@@ -233,6 +237,7 @@ function guarded_zest!(vis::GPUVisibilities, meta::GPUMetadata,
                 report === nothing || report(s, iteration; converged, niters, finite,
                                              max_gain=gmax, p_with, p_old, p_new,
                                              action=:accept)
+                s == N && after_pass !== nothing && after_pass(subtracted)
                 continue
             end
             _add!(vis, coherency, cal, meta, buf)       # undo the new subtraction
@@ -248,6 +253,7 @@ function guarded_zest!(vis::GPUVisibilities, meta::GPUMetadata,
         end
         report === nothing || report(s, iteration; converged, niters, finite,
                                      max_gain=gmax, p_with, p_old, p_new, action)
+        s == N && after_pass !== nothing && after_pass(subtracted)
     end
     subtracted
 end

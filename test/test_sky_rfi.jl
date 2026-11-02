@@ -150,6 +150,57 @@ const TIGHT = (maxiter=30, tolerance=1e-8)
                                                  restore=[jup], restore_offset_deg=-1)
     end
 
+    @testset "kept sources (keep=...)" begin
+        meta, model, measured, _ = synthetic_problem()
+        ra, dec = azel_radec(80.0, 60.0)
+        src = GPUPointSource("src", ra, dec, GPUPowerLaw(1000.0, 20.0, 10.0, 5.0, 50e6, [-0.7]))
+        kp = GPUPointSource("kp", azel_radec(250.0, 40.0)..., GPUPowerLaw(300.0, 0.0, 0.0, 0.0, 50e6, [0.0]))
+        km = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=false); genvis_exact!(km, meta, kp, TEST_MJD)
+        data = deepcopy_gpu(measured); gpu_putsrc!(data, km)
+        ref = deepcopy_gpu(measured)                       # src peeled, nothing else in the data
+        zest_sky_rfi!(ref, meta, TEST_MJD, [src]; TIGHT...)
+        dist(v) = sum(abs2, v.xx .- km.xx .- ref.xx) + sum(abs2, v.yy .- km.yy .- ref.yy)
+        plain = deepcopy_gpu(data)
+        zest_sky_rfi!(plain, meta, TEST_MJD, [src]; TIGHT...)
+        for mode in (:cosolve, :both, :restore)
+            v = deepcopy_gpu(data)
+            r = zest_sky_rfi!(v, meta, TEST_MJD, [src]; keep=[kp], keep_mode=mode, TIGHT...)
+            @test first(r.kept[1]) == "kp" && r.peeled == ["src"]
+            @test dist(v) <= dist(plain)                    # the kept source is not peeled
+            # src still peeled as before: :cosolve exactly here; :both's final restore fits the
+            # subtracted signal on the raw src model, which leaks a little src into kp
+            # :restore puts back only the projection of what the gains took on kp's fringe (here
+            # dist/kp 0.43 vs 0.57 unrestored), :cosolve never lets the gains take it (3e-7), :both ~1e-3
+            mode == :restore || @test dist(v) < (mode == :cosolve ? 1e-5 : 1e-2) * sum(abs2, km.xx)
+        end
+        # kept_sources / fit_kept alone: the fit of a pure point source is exact
+        ks = kept_sources(data, meta, TEST_MJD, [kp]; minuvw=0.0)
+        C = fit_kept(ks, (km.xx, km.xy, km.yx, km.yy))
+        set_kept!(ks, C)
+        @test sum(abs2, ks.K[1] .- km.xx) < 1e-12 * sum(abs2, km.xx)
+        gated = deepcopy_gpu(data)
+        r = zest_sky_rfi!(gated, meta, TEST_MJD, [src]; keep=[kp], keep_below_mhz=10.0, TIGHT...)
+        @test isempty(r.kept) && gated.xx == plain.xx
+        @test_throws ArgumentError zest_sky_rfi!(deepcopy_gpu(data), meta, TEST_MJD, [src]; keep=[kp], keep_mode=:x)
+    end
+
+    @testset "GainRidge" begin
+        meta, model, measured, _ = synthetic_problem()
+        ra, dec = azel_radec(80.0, 60.0)
+        src = GPUPointSource("src", ra, dec, GPUPowerLaw(1000.0, 20.0, 10.0, 5.0, 50e6, [-0.7]))
+        sm = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=false); genvis_exact!(sm, meta, src, TEST_MJD)
+        free = calibration_type(GPUZestingSource(src), meta.Nant, meta.Nfreq; gpu=false)
+        stiff = calibration_type(GPUZestingSource(src), meta.Nant, meta.Nfreq; gpu=false)
+        solve_gains!(free, measured, sm, meta; TIGHT...)
+        solve_gains!(stiff, measured, sm, meta; reg=gain_ridge(meta.Nant, 1e7), TIGHT...)
+        dev(c) = maximum(abs.(Array(c.xx) .- 1))
+        @test dev(stiff) < 0.05 * dev(free)                # a huge ridge keeps unit gains
+        weak = calibration_type(GPUZestingSource(src), meta.Nant, meta.Nfreq; gpu=false)
+        solve_gains!(weak, measured, sm, meta; reg=gain_ridge(meta.Nant, 1e-3), TIGHT...)
+        @test maximum(abs.(Array(weak.xx) .- Array(free.xx))) < 1e-4   # a tiny one changes nothing
+        @test_throws ArgumentError solve_gains!(weak, measured, sm, meta; reg=GainRidge(1.0), smooth_flux=10.0)
+    end
+
     @testset "solver, peel, regularisation, zero flags, report" begin
         meta, model, measured, _ = synthetic_problem()
         ra, dec = azel_radec(80.0, 60.0)

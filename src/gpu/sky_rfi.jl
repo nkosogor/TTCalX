@@ -222,6 +222,15 @@ Keywords:
   flux ≥ `smooth_exempt_flux = Inf` (e.g. 1e4 for Cas A, Cyg A) always keep per-channel gains,
   and so do the sky sources named in `smooth_exempt_names` (a collection of source names, e.g.
   chosen per snapshot by elevation or apparent flux; names that are not in `sky` are ignored)
+- `keep = GPUSource[]`: point sources (e.g. Per A, 3C134, Jupiter at its ephemeris position) modelled
+  but not peeled (`kept_sources`): their per-channel coherency is fitted to the residual and taken
+  out while the directions are solved, refitted after every pass, and put back at the end, so the
+  directions' gains do not absorb them.  `keep_mode = :both` (default) then also restores the part
+  of their fringes the directions still subtracted; `:cosolve` does not; `:restore` only restores
+  (production peel, then `restore_point_sources!`-style fit of before - after on the kept fringes
+  and the peeled models, several sources, V search only for Jupiter).  Only when the band starts
+  below `keep_below_mhz = Inf`; Jupiter (names starting with "Jupiter") is moved to the Stokes V peak
+  within `keep_vsearch_deg = 0.5`.  Host or GPU arrays; allocates (no workspace).
 - `restore = GPUSource[]`: point sources (e.g. Jupiter at its ephemeris position) given back
   after peeling (`restore_point_sources!`), only when the band starts below
   `restore_below_mhz = Inf`; `restore_offset_deg = 0.0` position search radius on Stokes V
@@ -237,7 +246,7 @@ Keywords:
   allocate almost no device memory (a long-lived process with a CUDA soft memory limit then
   does not collect inside the solve).  Results are bitwise the same as without it.
 
-Returns `(peeled, skipped, flagged_zeros, restored, gains)`: names of the subtracted sources,
+Returns `(peeled, skipped, flagged_zeros, restored, kept, gains)`: names of the subtracted sources,
 names of the sky sources below `min_elevation`, newly flagged zero samples,
 `name => (C, offset)` for each restored source, and `gains = (channels, mjd, cals)` with
 `cals = Dict(name => final gains)` (the live calibration objects; a source the guard rejected
@@ -251,6 +260,8 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
                        reg=nothing, flag_zeros::Bool=true, report=nothing,
                        smooth_flux::Real=0.0, rfi_smooth_flux::Real=smooth_flux,
                        smooth_exempt_flux::Real=Inf, smooth_exempt_names=(),
+                       keep::AbstractVector=GPUSource[], keep_mode::Symbol=:both,
+                       keep_below_mhz::Real=Inf, keep_vsearch_deg::Real=0.5,
                        restore::AbstractVector=GPUSource[],
                        restore_below_mhz::Real=Inf, restore_offset_deg::Real=0.0,
                        precision::Symbol=:double, initial_gains=nothing, warm_max_age_s::Real=60.0,
@@ -263,6 +274,8 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
     (smooth_flux > 0 || rfi_smooth_flux > 0) && reg !== nothing &&
         throw(ArgumentError("smooth_flux cannot be combined with reg"))
     restore_offset_deg >= 0 || throw(ArgumentError("restore_offset_deg must be ≥ 0"))
+    keep_mode in (:cosolve, :both, :restore) ||
+        throw(ArgumentError("keep_mode must be :cosolve, :both or :restore"))
     gpu = _is_gpu(vis.xx)
     ws = workspace
     ws === nothing || _ws_prepare!(ws, (meta.Nant, meta.Nbase, meta.Nfreq, precision, gpu))
@@ -275,6 +288,11 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
         (get_name(s) in exempt_names || _intrinsic_flux(s, nu0) >= smooth_exempt_flux) ? 0.0 : smooth_flux
 
     up = [source_elevation_deg(s, meta) >= min_elevation for s in sky]
+    ks = isempty(keep) || _band_above(meta, keep_below_mhz) ? nothing :
+         kept_sources(vis, meta, mjd, keep; minuvw=minuvw, vsearch_deg=keep_vsearch_deg)
+    ks !== nothing && isempty(ks.names) && (ks = nothing)
+    before_keep = ks === nothing || keep_mode == :cosolve ? nothing : deepcopy_gpu(vis)
+    keep_models = []                       # xx models of every subtracted direction (keep basis)
     restored = _band_above(meta, restore_below_mhz) ? GPUSource[] :
         [s for s in restore if source_elevation_deg(s, meta) >= min_elevation]
     before = isempty(restored) ? nothing : ws === nothing ? deepcopy_gpu(vis) : _ws_copy!(ws, :before, vis)
@@ -325,10 +343,29 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
                                                 workspace=ws)
             converged, niters
         end
+        after = ks === nothing || keep_mode == :restore ? nothing :
+            subd -> update_kept!(ks, vis; others=[cohs[i].xx for i in eachindex(cohs) if subd[i]])
         sub = guarded_zest!(vis, meta, cohs, cals, solve; peeliter=peeliter,
-                            max_gain=max_gain, report=rep, workspace=ws)
+                            max_gain=max_gain, report=rep, workspace=ws, after_pass=after)
         append!(peeled, get_name.(sources[sub]))
+        ks === nothing || append!(keep_models, [copy(c.xx) for c in cohs[sub]])
         before === nothing || append!(peeled_models, [c.xx for c in cohs[sub]])
+    end
+    kept = Pair{String,Any}[]
+    if ks !== nothing
+        if keep_mode != :cosolve           # give back the kept fringes' part of what was subtracted
+            K1 = map(copy, ks.K)
+            D = ntuple(q -> _visq(before_keep)[q] .- _visq(vis)[q] .- K1[q], 4)
+            C1 = ks.C
+            set_kept!(ks, fit_kept(ks, D; others=keep_models))
+            for q in 1:4; ks.K[q] .+= K1[q]; end
+            isempty(C1) || (ks.C = [ntuple(q -> C1[k][q] .+ ks.C[k][q], 4) for k in eachindex(C1)])
+        end
+        for (q, a) in enumerate(_visq(vis)); a .+= ks.K[q]; end
+        kept = [ks.names[k] => (ks.C[k], ks.offsets[k]) for k in eachindex(ks.names)]
+        for (nm, (I, V)) in kept_fluxes(ks)
+            log_detail(@sprintf("%s: kept %.1f Jy I, %.1f Jy V (band mean)", nm, I, V))
+        end
     end
     res = isempty(restored) ? [] :
         restore_point_sources!(vis, before, meta, mjd, restored; others=peeled_models,
@@ -339,7 +376,7 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
                             rad2deg(d[1]) * 60, rad2deg(d[2]) * 60))
     end
     (peeled=peeled, skipped=get_name.(sky[.!up]), flagged_zeros=nzero,
-     restored=[get_name(s) => r for (s, r) in zip(restored, res)],
+     restored=[get_name(s) => r for (s, r) in zip(restored, res)], kept=kept,
      gains=(channels=Array(meta.channels), mjd=mjd, cals=Dict(solved)))
 end
 

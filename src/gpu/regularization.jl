@@ -130,3 +130,21 @@ golden-section search in the phase.  Returns z0 when the prior is inactive
     r = max(0.0, r0 * cos(t - a))
     return r * cis(copysign(t, φ0))
 end
+
+
+"""
+    GainRidge(mu) / gain_ridge(nant, flux)
+
+Ridge prior pulling each direction's gains toward unit (identity) Jones matrices:
+the solve minimises Σ|V - GMGᴴ|² + μ Σ_p ‖G_p - I‖² per channel, i.e. every StefCal
+step is X = (D + μ)⁻¹ (N + μ I) instead of D⁻¹ N (X = G_pᴴ).  The data are
+bandpass-calibrated, so a direction's gains should stay near identity apart from
+beam and ionospheric errors.  `gain_ridge(nant, flux)` sets μ = nant (flux/2)², the
+normal-equation weight of a direction of apparent flux `flux` (as `smooth_flux`):
+a direction much brighter than `flux` is free, a much fainter one keeps unit gains
+(its catalogue model, subtracted as it is) and cannot bend into other sources.
+"""
+struct GainRidge
+    mu::Float64
+end
+gain_ridge(nant::Integer, flux::Real) = GainRidge(nant * (Float64(flux) / 2)^2)
