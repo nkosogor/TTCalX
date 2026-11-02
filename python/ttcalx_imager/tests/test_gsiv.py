@@ -431,9 +431,9 @@ def test_cache_reserve(tmp_path, monkeypatch):
     products do not depend on it."""
     hour_cpu = pytest.importorskip("hour_cpu")
     hour = hour_cpu.import_hour()
-    b = hour.deconv_reserve_bytes(3122, 3.0, bands.DEEP_I)
-    assert 6e9 < b < 11e9                                        # 64 / 69 MHz: more than the 5 GB margin
-    assert hour.deconv_reserve_bytes(1024, 3.0, bands.DEEP_I) < 2.5e9
+    b = hour.deconv_reserve_bytes(3122, 6.85, bands.DEEP_I)       # 64 MHz: theo 6.85 px, 7 scales
+    assert 8e9 < b < 10e9                                        # more than the 5 / 8 GB margins
+    assert hour.deconv_reserve_bytes(1024, 3.0, bands.DEEP_I) < 3.5e9         # mostly the cuFFT plan cache
     dicts, p = _hour_snaps(tmp_path)
     monkeypatch.delenv("TTCALX_CACHE_RESERVE", raising=False)
     s0, c0 = _run_hour(tmp_path, gsiv.load_archive(p, 1.3, 0.65), "store", 20, prefix="r")

@@ -100,8 +100,11 @@ def deconv_reserve_bytes(N, theo_pix, params):
     top of the gridding (clean.MultiScaleClean + the major cycles): the P x P real-FFT kernels of
     every scale (S_s and S_s * PSF, P = fast_len(1.5 N + 2)) and of the scale images, the per-scale
     N x N images and masks of the minor loop, the 2x band-limited model of the major cycle, the
-    padded FFT temporaries and the cuFFT plan cache (TTCALX_FFT_PLAN_CACHE_GB).  At 3122 px
-    (64-82 MHz, 7-8 scales): 7.1-7.6 GB (the 5 GB default margin ran out at 64 / 69 MHz)."""
+    padded FFT temporaries and the cuFFT plan cache (TTCALX_FFT_PLAN_CACHE_GB), times 1.25 for what
+    the CuPy pool does not see (cuFINUFFT plans) and pool fragmentation: at 64 MHz the cache left
+    the unscaled 7.1 GB free and the first major cycle still ran out of memory (a 312 MB model
+    upsampling), while an 8 GB margin was enough for every product.  At 3122 px (64-82 MHz, 7-8
+    scales): 8.8-9.5 GB."""
     from .clean import fast_len
     scales = [0]
     if params.multiscale:
@@ -120,7 +123,7 @@ def deconv_reserve_bytes(N, theo_pix, params):
     fft_tmp = 2 * P * P * 4 + 2 * F
     major = 40 * I                                                       # fft_upsample (2N)^2 complex, prefilter, coords
     plans = float(os.environ.get("TTCALX_FFT_PLAN_CACHE_GB", "1.5")) * 1e9
-    return kernels + minor + fft_tmp + major + plans
+    return 1.25 * (kernels + minor + fft_tmp + major + plans)
 
 
 def _reserve(N, sn, sc, params):
