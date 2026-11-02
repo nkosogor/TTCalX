@@ -133,7 +133,7 @@ def _fake_sampleset(rec, xp):
 @contextlib.contextmanager
 def cpu_hour(cache="auto", free_gb=1000.0, N=None, oom=None):
     """Context in which ttcalx_imager.hour (image_hour, image_hour_snaps, the CLI) runs on the
-    CPU; yields the Recorder.  cache: the TTCALX_CHUNK_CACHE mode; free_gb: the 'free GPU memory'
+    CPU; yields the Recorder.  cache: the TTCALX_CHUNK_CACHE mode (None: unset); free_gb: the 'free GPU memory'
     the chunk-cache decision sees; N: image size override (default: the band's); oom: GPU OOM
     injection, {"deconv" | "grid": call numbers (0-based, over the run) that raise}."""
     import os
@@ -166,7 +166,10 @@ def cpu_hour(cache="auto", free_gb=1000.0, N=None, oom=None):
         hour.WeightGrid = partial(weights.WeightGrid, xp=fcp)
         if N is not None:
             hour.bands.geometry = lambda b: (N, geo(b)[1])
-        os.environ["TTCALX_CHUNK_CACHE"] = cache
+        if cache is None:                              # the default (variable unset)
+            os.environ.pop("TTCALX_CHUNK_CACHE", None)
+        else:
+            os.environ["TTCALX_CHUNK_CACHE"] = cache
         yield rec
     finally:
         for k, v in saved.items():

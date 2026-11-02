@@ -372,7 +372,7 @@ function _tiled_full_steps!(k, g, V, M, start, width, lam, active, Nant, Nf, par
     k
 end
 
-const TILED_STEPS = Ref(true)          # false: the per-antenna loop kernel (for comparisons)
+const TILED_STEPS = Ref(false)         # true: the tiled normal equations (fast_kernels!); false: the per-antenna loop kernel (as 748884a)
 
 """
     stefcal_steps!(k, g, is_diagonal, meas_sq, model_sq, Nant; reg=nothing, active=nothing)

@@ -20,6 +20,7 @@ Conventions
 """
 import itertools
 import math
+import os
 
 import numpy as np
 import cupy as cp
@@ -52,13 +53,15 @@ _FACTOR_CACHE = {}      # (wmax, tol, nw, nx) -> (K, wg, A [nw, K] complex128, V
 _FACTOR_CACHE_MAX = 512
 _GEOM_CACHE = {}        # (N, scale_rad, rmax, nx) -> (inside, x', cell j int16, fraction t float32)
 _GEOM_CACHE_MAX = 4
-SVD_METHOD = "gram"     # "gram" (top eigenpairs of M M^H, 2-4x faster, same K) or "lapack" (np.linalg.svd)
+# "lapack" (np.linalg.svd, as 748884a; default) or "gram" (top eigenpairs of M M^H, 2-4x faster, same K,
+# factors equal to rounding); env TTCALX_SVD_METHOD, read per call (ttcalx_imager.FAST_ENV: gram)
+SVD_METHOD = None
 
 
 def _svd_factors(wmax, tol, nw, nx, method=None):
     """Truncated factorisation exp(-2 pi i w x') ~= sum_{k<K} A[:, k](w) Vh[k](x') on the (w, x') grid,
     K = smallest rank with max |M - A_K Vh_K| < tol (as before).  Cached (compact, host)."""
-    method = method or SVD_METHOD
+    method = method or SVD_METHOD or os.environ.get("TTCALX_SVD_METHOD", "lapack")
     key = (float(wmax), float(tol), int(nw), int(nx), method)
     hit = _FACTOR_CACHE.get(key)
     if hit is not None:

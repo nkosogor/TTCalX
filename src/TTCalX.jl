@@ -60,6 +60,7 @@ export read_ms_fast, write_ms_fast!
 export residual_power, flag_zero_visibilities!, max_gain_amplitude, guarded_zest!
 export source_elevation_deg, zest_sky_rfi!, zest_sky_rfi_ms!, restore_point_sources!
 export PeelWorkspace, workspace_bytes, free_workspace!
+export fast_kernels!, fast_kernels
 
 # Export logging utilities
 export set_verbosity, get_verbosity, is_quiet, is_verbose, is_normal

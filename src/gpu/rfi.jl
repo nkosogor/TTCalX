@@ -146,7 +146,7 @@ function gpu_genvis!(vis::GPUVisibilities, meta::GPUMetadata, source::GPURFISour
     vis
 end
 
-const RFI_GENVIS_KERNEL = Ref(true)
+const RFI_GENVIS_KERNEL = Ref(false)   # true: the fringes on the device (fast_kernels!); false: the host loop (as 748884a)
 
 function rfi_genvis_kernel!(xx, xy, yx, yy, path, flux, baselines, channels, Nb, Nf)
     idx = thread_index_1d()

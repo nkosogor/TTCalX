@@ -138,5 +138,30 @@ end
             @test same(host_copy(a), host_copy(b))
             @test warm < 0.2 * cold
         end
+        @testset "fast_kernels!: off by default, on agrees with the old kernels to rounding" begin
+            @test !fast_kernels() && !TTCalX.TILED_STEPS[] && !TTCalX.RFI_GENVIS_KERNEL[] && !TTCalX.FUSED_CORRUPT[]
+            p = ws_problem(; seed=5, gpu=true)
+            cfg = (precision=:double, smooth_flux=0.0)
+            old = ws_run(p...; cfg...)
+            rfi_old = deepcopy_gpu(p[2])
+            gpu_genvis!(rfi_old, p[1], p[4][1], p[1].phase_center_ra, p[1].phase_center_dec, 0.0)
+            try
+                fast_kernels!(true)
+                @test fast_kernels()
+                new = ws_run(p...; cfg...)
+                scale = maximum(abs, host_copy(p[2]).xx)
+                for f in (:xx, :xy, :yx, :yy)
+                    @test maximum(abs, getfield(new.vis, f) .- getfield(old.vis, f)) < 1e-9 * scale
+                end
+                @test new.peeled == old.peeled
+                rfi_new = deepcopy_gpu(p[2])
+                gpu_genvis!(rfi_new, p[1], p[4][1], p[1].phase_center_ra, p[1].phase_center_dec, 0.0)
+                @test maximum(abs, Array(rfi_new.xx) .- Array(rfi_old.xx)) < 1e-9 * maximum(abs, Array(rfi_old.xx))
+                ws_sequence_tests(gpu=true)                  # the v3 setting: workspace + fast kernels
+            finally
+                fast_kernels!(false)
+            end
+            @test !fast_kernels()
+        end
     end
 end

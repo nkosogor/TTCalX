@@ -357,3 +357,46 @@ def test_multiscale_max_scales_and_divergence_guard():
     _, R, M, info = deconvolve_multiscale(dirty, psf, 0.3, theo, params, residual_fn=residual, beam=(0.9, 0.9, 0.0))
     assert info["diverged"] and bool(cp.isfinite(M).all()) and bool(cp.isfinite(R).all())
     assert float(M.sum()) > 40.0
+
+
+def test_hogbom_multiblock_compile_failure_falls_back(monkeypatch):
+    """A cooperative-groups kernel that does not compile (CompileException) falls back to the
+    single-block kernel, which gives the same components."""
+    from cupy.cuda.compiler import CompileException
+    from ttcalx_imager import clean
+    rng = np.random.default_rng(3)
+    pn = 129; yy, xx = np.mgrid[:pn, :pn] - pn // 2
+    psf = cp.asarray(np.exp(-0.5 * (xx ** 2 + yy ** 2) / 4.0), dtype=cp.float32)
+    K = clean.HOGBOM_MB_MIN_K + 100
+    flat = rng.choice(512 * 512, K, replace=False)
+    ys, xs = cp.asarray(flat // 512), cp.asarray(flat % 512)
+    vals = cp.asarray(rng.normal(0, 1, K), dtype=cp.float32); fac = cp.ones(K, cp.float32)
+    monkeypatch.setattr(clean, "_MB_BROKEN", [False])
+    ref = clean.hogbom_on_set(psf, ys, xs, vals.copy(), fac, 0.1, 0.5, 2000)
+
+    def broken():
+        raise CompileException("cooperative_groups.h: no such file (test)", "src", "hogbom_mb", ())
+    monkeypatch.setattr(clean, "_hogbom_mb_kernel", broken)
+    monkeypatch.setattr(clean, "_MB_BROKEN", [False])
+    with pytest.warns(UserWarning, match="multi-block Hogbom unavailable"):
+        got = clean.hogbom_on_set(psf, ys, xs, vals.copy(), fac, 0.1, 0.5, 2000)
+    assert clean._MB_BROKEN[0]
+    assert got[1] == ref[1] and bool((got[0] == ref[0]).all())
+
+
+def test_fast_settings_agree_with_defaults_to_rounding(monkeypatch):
+    """Defaults = 748884a's operations (LAPACK SVD, FFT local RMS); the FAST_ENV variants agree to rounding."""
+    from ttcalx_imager import FAST_ENV, clean, gridder
+    for k in FAST_ENV:
+        monkeypatch.delenv(k, raising=False)
+    a = gridder._svd_factors(300.0, 1e-4, 600, 2001)
+    monkeypatch.setenv("TTCALX_SVD_METHOD", "gram")
+    b = gridder._svd_factors(300.0, 1e-4, 600, 2001)
+    assert a[0] == b[0]
+    ma, mb = a[2] @ a[3], b[2] @ b[3]
+    assert np.abs(ma - mb).max() < 1e-6
+    img = cp.asarray(np.random.default_rng(1).normal(0, 1, (300, 300)), dtype=cp.float32)
+    r0 = clean.rms_image(img, 3.0)
+    monkeypatch.setenv("TTCALX_RMS_FILTER", "circulant")
+    r1 = clean.rms_image(img, 3.0)
+    assert float(cp.abs(r1 - r0).max()) < 1e-4 * float(r0.max())

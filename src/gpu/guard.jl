@@ -144,7 +144,7 @@ function _apply_corrupted!(vis, coherency, cal, meta, subtract::Bool)
     vis
 end
 
-const FUSED_CORRUPT = Ref(true)      # false: gpu_corrupt! into a scratch, then subsrc/putsrc
+const FUSED_CORRUPT = Ref(false)     # true: one fused kernel (fast_kernels!); false: gpu_corrupt! into a scratch, then subsrc/putsrc (as 748884a)
 _fused(vis, cal) = FUSED_CORRUPT[] && _is_gpu(vis) && _is_gpu(cal)
 _subtract!(vis, coherency, cal, meta, buf) = _fused(vis, cal) ?
     _apply_corrupted!(vis, coherency, cal, meta, true) :
@@ -156,6 +156,21 @@ _add!(vis, coherency, cal, meta, buf) = _fused(vis, cal) ?
 _scratch(vis, coherency) = FUSED_CORRUPT[] && _is_gpu(vis) ? nothing : deepcopy_gpu(coherency)
 _subtract!(vis, coherency, cal, meta) = _subtract!(vis, coherency, cal, meta, _scratch(vis, coherency))
 _add!(vis, coherency, cal, meta) = _add!(vis, coherency, cal, meta, _scratch(vis, coherency))
+
+"""
+    fast_kernels!(on::Bool) -> on
+    fast_kernels() -> Bool
+
+Switch the GPU kernels added in 0.3.0 for speed: the tiled full-Jones normal equations
+(`TILED_STEPS`), the device RFI fringes (`RFI_GENVIS_KERNEL`) and the fused corrupt-subtract
+(`FUSED_CORRUPT`).  Off by default: the GPU then runs the 0.2.0 (748884a) kernels.  On, the
+results agree with the old kernels to rounding (summation order), not bitwise.  Process-wide.
+"""
+function fast_kernels!(on::Bool)
+    TILED_STEPS[] = on; RFI_GENVIS_KERNEL[] = on; FUSED_CORRUPT[] = on
+    on
+end
+fast_kernels() = TILED_STEPS[] && RFI_GENVIS_KERNEL[] && FUSED_CORRUPT[]
 
 """
     guarded_zest!(vis, meta, coherencies, calibrations, solve;

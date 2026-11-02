@@ -243,7 +243,7 @@ class HourGrid:
     def _chunk(self, ids, col):
         """(SampleSet, rotated visibilities of ``col``) of the snapshots ``ids``.
 
-        Chunk cache (env TTCALX_CHUNK_CACHE = auto (default) | device | host | off | store): the
+        Chunk cache (env TTCALX_CHUNK_CACHE = off (default, as 748884a) | auto | device | host | store): the
         dirty image, the PSF, every major cycle and V of one interval re-use the same samples, so
         the first call keeps them -- on the GPU (rotated, folded SampleSet + rotated I + unrotated
         w, ~29 B/sample) if that leaves TTCALX_CACHE_MARGIN_GB (default 5) free, else the
@@ -254,7 +254,7 @@ class HourGrid:
         The arrays and operations are the same as without the cache (bit-identical images).
         self.ctl (CacheCtl): device=False keeps nothing on the GPU (OOM fallback of
         image_hour_snaps); the free memory to leave is max(margin, ctl.reserve)."""
-        mode = os.environ.get("TTCALX_CHUNK_CACHE", "auto")
+        mode = os.environ.get("TTCALX_CHUNK_CACHE", "off")
         store = mode == "store"
         key = tuple(ids)
         c = self._cache.get(key) if mode != "off" else None
@@ -465,9 +465,9 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
     products = [_as_product(p, pols) for p in products]
     # cuFFT plans: every interval of every product uses the same few sizes (deconvolution P x P
     # r2c/c2r, the scale-image size, the 2x model upsampling), and creating one costs ~0.25 s
-    # (~2-3 s per interval).  Keep them across intervals, in an LRU plan cache capped at
-    # TTCALX_FFT_PLAN_CACHE_GB (default 1.5); TTCALX_KEEP_FFT_PLANS=0: clear after every interval.
-    keep_plans = os.environ.get("TTCALX_KEEP_FFT_PLANS", "1") == "1"
+    # (~2-3 s per interval).  TTCALX_KEEP_FFT_PLANS=1 keeps them across intervals, in an LRU plan cache
+    # capped at TTCALX_FFT_PLAN_CACHE_GB (default 1.5); default 0: cleared after every interval (748884a).
+    keep_plans = os.environ.get("TTCALX_KEEP_FFT_PLANS", "0") == "1"
     # TTCALX_CACHE_OOM_FALLBACK=1: a GPU OOM in an interval whose chunks were partly kept on the GPU is
     # imaged once more without the device chunk cache (same inputs, bit-identical products).  Default 0
     # (raise, as 86afd89) for MS hour jobs; the archive / in-memory entry points (cli --archive,

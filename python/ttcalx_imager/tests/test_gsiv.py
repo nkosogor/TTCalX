@@ -318,6 +318,23 @@ def test_image_hour_snaps_cpu_archive_equals_dicts(tmp_path, cache, free_gb):
         assert same(got.images[k], ref.images[k]), k
 
 
+def test_ms_hour_default_keeps_no_chunk_cache(tmp_path):
+    """TTCALX_CHUNK_CACHE unset (the MS hour job): as 748884a, every call rebuilds its chunk (no device or
+    host cache), the same calls and images as cache=off."""
+    hour_cpu = pytest.importorskip("hour_cpu")
+    prods = bands.hour_products(["I-Deep-Taper-Robust-0", "V-Taper-Deep"])
+    dicts, _ = _hour_snaps(tmp_path)
+    kw = dict(N=64, qa="none")
+    off_s, off = hour_cpu.run([dict(d) for d in dicts], "41MHz", str(tmp_path / "a"), 1.3, 0.65, prods, cache="off", **kw)
+    with hour_cpu.cpu_hour(None, 1000.0, 64) as rec:
+        hour = hour_cpu.import_hour()
+        s = hour.image_hour_snaps([dict(d) for d in dicts], "41MHz", str(tmp_path / "a"), 1.3, 0.65, products=prods,
+                                  mode="vis", qa="none")
+    assert rec.calls == off.calls and hour_cpu.comparable(s) == hour_cpu.comparable(off_s)
+    n_sets = sum(1 for c in rec.calls if c[0] == "SampleSet")
+    assert n_sets > len([c for c in rec.calls if c[0] == "grid_psf"])     # rebuilt per use, nothing cached
+
+
 def test_cli_archive_no_verify_warns_and_checks_band(tmp_path, monkeypatch, capsys):
     hour_cpu = pytest.importorskip("hour_cpu")
     hour = hour_cpu.import_hour()
@@ -328,13 +345,16 @@ def test_cli_archive_no_verify_warns_and_checks_band(tmp_path, monkeypatch, caps
                         got.update(n=len(snaps), kw=kw) or dict(rejected=[], timing={}, products={}))
     from ttcalx_imager import rotate
     monkeypatch.setattr(rotate, "snapshot_rotation", lambda *a: np.eye(3))     # no casacore measures needed
-    monkeypatch.setenv("TTCALX_CHUNK_CACHE", "unset")
-    monkeypatch.delenv("TTCALX_CHUNK_CACHE")                    # restored (absent) after the test
+    from ttcalx_imager import FAST_ENV
+    for k in FAST_ENV:
+        monkeypatch.setenv(k, "unset")
+        monkeypatch.delenv(k)                                   # restored (absent) after the test
+    monkeypatch.setenv("TTCALX_SVD_METHOD", "lapack")           # a variable already set wins
     cli.main(["hour", "--archive", str(p), "--band", "41", "--out", str(tmp_path / "o" / "41MHz"), "--lst-hour", "4",
               "--qa", "none", "--no-verify", "--exclude-stems", "20261031_101001_41MHz"])
     assert "--no-verify" in capsys.readouterr().err and got["n"] == 2
     assert got["kw"]["exclude_stems"] == ("20261031_101001_41MHz",) and os.environ["TTCALX_CHUNK_CACHE"] == "store"
-    os.environ.pop("TTCALX_CHUNK_CACHE")
+    assert os.environ["TTCALX_CACHE_RESERVE"] == "auto" and os.environ["TTCALX_SVD_METHOD"] == "lapack"
     with pytest.raises(gsiv.GSIVError, match="band"):
         cli.main(["hour", "--archive", str(p), "--band", "82", "--out", str(tmp_path / "o" / "82MHz"), "--qa", "none"])
 

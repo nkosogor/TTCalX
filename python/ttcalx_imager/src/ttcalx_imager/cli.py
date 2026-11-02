@@ -4,6 +4,8 @@ import json
 import os
 import sys
 
+from . import use_fast_settings
+
 
 def _beam(s):
     if not s:
@@ -108,8 +110,7 @@ def run_hour_snaps(argv, get_snaps, timing=None, t0=None):
     if not pc:
         raise ValueError("run_hour_snaps needs --phase-centre or --lst-hour")
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    os.environ.setdefault("TTCALX_CHUNK_CACHE", "store")      # as --archive: no host-side u, v, w copies
-    os.environ.setdefault("TTCALX_CACHE_OOM_FALLBACK", "1")   # as --archive: a GPU OOM retries without the device cache
+    use_fast_settings()        # as --archive: chunk cache store, kept cuFFT plans, reserve auto, OOM fallback, ...
     t0 = time.perf_counter() if t0 is None else t0
     ra, dec = parse_phase_centre(pc)
     snaps = get_snaps(ra, dec, _want_v(prods, a.pols, a.qa))
@@ -127,10 +128,10 @@ def cmd_hour(a):
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     if a.archive:
         from .gsiv import archive_phase_centre, load_archive
-        # archive snapshots: device chunk cache when it fits, else rebuilt on the GPU from the
-        # records (no host-side u, v, w duplicates); TTCALX_CHUNK_CACHE overrides
-        os.environ.setdefault("TTCALX_CHUNK_CACHE", "store")
-        os.environ.setdefault("TTCALX_CACHE_OOM_FALLBACK", "1")
+        # archive snapshots (gsi v3): the validated speed settings (ttcalx_imager.FAST_ENV): device chunk
+        # cache when it fits, else rebuilt on the GPU from the records (no host-side u, v, w duplicates),
+        # reserve auto, GPU OOM fallback, ...; a variable already set overrides
+        use_fast_settings()
         from .rotate import parse_phase_centre
         t0 = time.perf_counter()
         ra, dec = parse_phase_centre(pc) if pc else archive_phase_centre(a.archive)

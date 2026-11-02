@@ -121,13 +121,20 @@ def test_run_hour_snaps_equals_cli_archive(tmp_path, monkeypatch):
     w.close()
     args = ["--band", "41", "--out", str(tmp_path / "o" / "41MHz"), "--lst-hour", "4", "--qa", "none",
             "--products", "I-Deep-Taper-Robust-0,V-Taper-Deep", "--exclude-stems", "20261031_101001_41MHz", "-v"]
-    monkeypatch.delenv("TTCALX_CHUNK_CACHE", raising=False)
+    from ttcalx_imager import FAST_ENV
+
+    def unset_fast():
+        for k in FAST_ENV:
+            monkeypatch.setenv(k, "x"); monkeypatch.delenv(k)     # absent, and absent again after the test
+    unset_fast()
     cli.main(["hour", "--archive", str(p)] + args)
-    os.environ.pop("TTCALX_CHUNK_CACHE")
+    assert {k: os.environ.get(k) for k in FAST_ENV} == FAST_ENV
+    unset_fast()
     got = {}
     cli.run_hour_snaps(args, lambda ra, dec, want_v: got.update(ra=ra, dec=dec, want_v=want_v) or
                        gsiv.lazy_snaps([(m, a, "mem") for m, a in recs], ra, dec, want_v))
-    assert os.environ.pop("TTCALX_CHUNK_CACHE") == "store"
+    assert {k: os.environ.get(k) for k in FAST_ENV} == FAST_ENV       # the v3 entry points: all fast settings
+    unset_fast()
     assert calls[0] == calls[1] and got["want_v"] is True
     assert calls[1]["kw"]["exclude_stems"] == ("20261031_101001_41MHz",)
     with pytest.raises(ValueError):

@@ -258,15 +258,26 @@ def _hogbom_on_set_mb(psf, ys, xs, vals, fac, gain, thresh, maxiter):
 _MB_BROKEN = [False]
 
 
+def _mb_errors():
+    """What makes the multi-block Hogbom unusable: a refused cooperative launch (driver / runtime
+    error) or a kernel that does not compile (cupy.cuda.compiler.CompileException)."""
+    c = cp.cuda
+    errs = (getattr(getattr(c, "driver", None), "CUDADriverError", None),
+            getattr(getattr(c, "runtime", None), "CUDARuntimeError", None),
+            getattr(getattr(c, "compiler", None), "CompileException", None))
+    return tuple(e for e in errs if isinstance(e, type))
+
+
 def hogbom_on_set(psf, ys, xs, vals, fac, gain, thresh, maxiter):
     """Run the Hogbom kernel; returns (component amplitudes per candidate, n_iter, last peak)."""
     K = int(ys.size)
     if K >= HOGBOM_MB_MIN_K and not _MB_BROKEN[0]:
         try:
             return _hogbom_on_set_mb(psf, ys, xs, vals, fac, gain, thresh, maxiter)
-        except (cp.cuda.driver.CUDADriverError, cp.cuda.runtime.CUDARuntimeError) as e:
+        except _mb_errors() as e:
             # cooperative launch refused (grid not co-resident, e.g. MPS SM limit or a too
-            # large TTCALX_HOGBOM_MB_BPS): the single-block kernel gives the same components
+            # large TTCALX_HOGBOM_MB_BPS), or the cooperative-groups kernel does not compile
+            # (NVRTC without cooperative_groups.h): the single-block kernel gives the same components
             _MB_BROKEN[0] = True
             warnings.warn(f"multi-block Hogbom unavailable ({e}); using the single-block kernel")
     if K <= HOGBOM_SMALL_K:
@@ -415,7 +426,12 @@ def rms_image(img, beam_fwhm_pix, window=25.0):
     (cyclic FFT smoothing with a unit-sum Gaussian)."""
     N = img.shape[0]
     sig = window * beam_fwhm_pix / (2.0 * math.sqrt(2.0 * math.log(2.0)))
-    # The Gaussian filter is separable, so the 2-D cyclic convolution is A X A^T with A the N x N
+    if os.environ.get("TTCALX_RMS_FILTER", "fft") != "circulant":      # 748884a (default)
+        f = cp.fft.fftfreq(N).astype(cp.float32)
+        g = cp.exp(-2.0 * (math.pi * sig) ** 2 * (f[:, None] ** 2 + f[None, :] ** 2)).astype(cp.float32)
+        sm = cp.fft.ifft2(cp.fft.fft2(img.astype(cp.float32) ** 2) * g).real
+        return cp.sqrt(cp.maximum(sm, 0)).astype(cp.float32)
+    # TTCALX_RMS_FILTER=circulant: the Gaussian filter is separable, so the 2-D cyclic convolution is A X A^T with A the N x N
     # circulant matrix of the 1-D kernel ifft(g1): two SGEMMs instead of a complex N x N FFT pair
     # (N = 2358 = 2 3^2 131 needs a Bluestein cuFFT plan, ~0.5-0.9 s to create after every
     # plan-cache clear in the hour driver).  Same filter; differences ~1e-6 of the max.
@@ -590,7 +606,7 @@ class MultiScaleClean:
                  kmax=60000, max_scale_frac=0.5, multiscale=True, max_scales=0, divergence_limit=4.0, log=None):
         self.N = N; self.sdeg = scale_deg; self.gain = gain; self.kmax = kmax
         self.divergence_limit = divergence_limit; self.diverged = False
-        self.sparse_max = min(64, int(os.environ.get("TTCALX_SPARSE_UPDATE_MAX", "64")))   # kernel limit
+        self.sparse_max = min(64, int(os.environ.get("TTCALX_SPARSE_UPDATE_MAX", "0")))    # 0: FFT updates (748884a); 64 = kernel limit
         self._small, self._fullps = {}, {}
         self.log = log or (lambda *a: None)
         self.psf = cp.asarray(psf, dtype=cp.float32)
@@ -608,7 +624,7 @@ class MultiScaleClean:
         self.C = Convolver(N, N, extra=2)
         Kpsf = self.C.kfft(self.psf)
         hmax = max(int(math.ceil(0.5 * s)) for s in scales)
-        if os.environ.get("TTCALX_SCALE_FFT", "small") == "small":
+        if os.environ.get("TTCALX_SCALE_FFT", "full") == "small":
             self.Cs = Convolver(N, 2 * hmax + 1, extra=2)
             self.KSs = [None if s == 0 else self.Cs.kfft(shape_kernel(N, s)) for s in scales]
         else:
