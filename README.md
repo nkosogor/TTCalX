@@ -327,7 +327,11 @@ model = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=false)
 cal = calibration_type(GPUZestingSource(source), meta.Nant, meta.Nfreq; gpu=false)
 ```
 
-**New in 0.3.0** (all off by default; default results are unchanged):
+**New in 0.3.0** (all off by default.  With none set, the production gsi peel on 4 OVRO-LWA 55 MHz
+snapshots gave bitwise the visibilities of 0.2.0 / 748884a on the GPU, 2026-11-02):
+- `fast_kernels!(true)` (gsi `peel.fast_kernels`, `ZEST_FAST_KERNELS=1`): tiled full-Jones normal
+  equations, RFI fringes on the device, fused corrupt-subtract.  Equal to the old kernels to rounding
+  (summation order), not bitwise.  Off by default: the GPU runs 0.2.0's (748884a's) kernels.
 - `smooth_flux` / `rfi_smooth_flux` / `smooth_exempt_flux` (`solve_gains!`, `zest_sky_rfi!`,
   CLI `--smooth-flux` ...): per-channel gains tied to a band gain for faint directions.
 - `restore` / `restore_below_mhz` / `restore_offset_deg` and `restore_point_sources!`
@@ -346,7 +350,7 @@ square matrices, solver scratch, residual and restore buffers are then kept and 
 (Nant, Nbase, Nfreq, precision, device) stay the same, so a warm call allocates ~20 MB of device
 memory instead of ~10 GB (OVRO-LWA, 352 antennas, 48 channels, Jupiter restore) and CUDA.jl does
 not collect inside the solve under `JULIA_CUDA_SOFT_MEMORY_LIMIT`.  Results are bitwise identical
-to calls without it.  `workspace_bytes(ws)` is its size (~2.4 GB for 4 sky sources + 1 RFI
+to calls without it in the tests (`test_workspace.jl`, host and GPU, with the fast kernels off and on).  `workspace_bytes(ws)` is its size (~2.4 GB for 4 sky sources + 1 RFI
 emitter + restore; `cache_model_sq=false` keeps one square model instead of one per direction,
 ~180 MB each); `free_workspace!(ws)` releases it.
 
