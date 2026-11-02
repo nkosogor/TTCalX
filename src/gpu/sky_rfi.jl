@@ -198,6 +198,37 @@ end
 _intrinsic_flux(s::GPUMultiSource, nu) = sum(_intrinsic_flux(c, nu) for c in s.components)
 _intrinsic_flux(s, nu) = hasproperty(s, :spectrum) ? Float64(s.spectrum(nu)[1]) : 0.0
 
+wrap_zest(sky) = GPUZestingSource
+
+"""
+A kept Jupiter (name starting with "Jupiter") whose first fit (on the data, with the sky models
+in the basis) is brighter than `min_jy` (band-mean I) becomes a kept *direction*: its model is
+that fitted point coherency, its per-antenna gains are solved in the first peel pass (first of
+all directions) and its corrupted model is put back at the end.  Its gains absorb what a point
+model cannot (ionospheric distortion of a 10^4-10^5 Jy burst), which otherwise is the brightest
+unmodelled signal and gets captured by a fainter direction (Cyg A).  It is removed from `ks`.
+Returns `nothing` or (name, coh, cal, flux, subtracted::Ref{Bool}).
+"""
+function _kept_direction!(ks::KeptSources, vis, meta, mjd, sky_up, min_jy, wrap, gpu)
+    j = findfirst(n -> startswith(n, "Jupiter"), ks.names)
+    j === nothing && return nothing
+    raw = map(sky_up) do s
+        c = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=gpu); genvis_exact!(c, meta, s, mjd); c.xx
+    end
+    C = fit_kept(ks, _visq(vis); others=raw)
+    flux = real(sum(C[j][1]) + sum(C[j][4])) / 2 / length(C[j][1])
+    flux > min_jy || return nothing
+    coh = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=gpu)
+    for (q, a) in enumerate(_visq(coh))
+        c = reshape(C[j][q], 1, :)
+        a .= (gpu ? CuArray(c) : c) .* ks.fringes[j]
+    end
+    cal = GPUCalibration(meta.Nant, meta.Nfreq; diagonal=false, gpu=gpu)
+    name = ks.names[j]
+    deleteat!(ks.names, j); deleteat!(ks.fringes, j); deleteat!(ks.offsets, j)
+    (name=name, coh=coh, cal=cal, flux=flux, subtracted=Ref(false))
+end
+
 """True when the whole band lies above `mhz`."""
 _band_above(meta, mhz) = minimum(Array(meta.channels)) > mhz * 1e6
 
@@ -228,7 +259,9 @@ Keywords:
   directions' gains do not absorb them.  `keep_mode = :both` (default) then also restores the part
   of their fringes the directions still subtracted; `:cosolve` does not; `:restore` only restores
   (production peel, then `restore_point_sources!`-style fit of before - after on the kept fringes
-  and the peeled models, several sources, V search only for Jupiter).  Only when the band starts
+  and the peeled models, several sources, V search only for Jupiter).  `keep_dir_jy = Inf`: a kept
+  Jupiter brighter than this (first fit) is kept as a direction with solved gains instead
+  (`_kept_direction!`; needed in 10^4-10^5 Jy bursts, e.g. 3000).  Only when the band starts
   below `keep_below_mhz = Inf`; Jupiter (names starting with "Jupiter") is moved to the Stokes V peak
   within `keep_vsearch_deg = 0.5`.  Host or GPU arrays; allocates (no workspace).
 - `restore = GPUSource[]`: point sources (e.g. Jupiter at its ephemeris position) given back
@@ -261,7 +294,7 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
                        smooth_flux::Real=0.0, rfi_smooth_flux::Real=smooth_flux,
                        smooth_exempt_flux::Real=Inf, smooth_exempt_names=(),
                        keep::AbstractVector=GPUSource[], keep_mode::Symbol=:both,
-                       keep_below_mhz::Real=Inf, keep_vsearch_deg::Real=0.5,
+                       keep_below_mhz::Real=Inf, keep_vsearch_deg::Real=0.5, keep_dir_jy::Real=Inf,
                        restore::AbstractVector=GPUSource[],
                        restore_below_mhz::Real=Inf, restore_offset_deg::Real=0.0,
                        precision::Symbol=:double, initial_gains=nothing, warm_max_age_s::Real=60.0,
@@ -291,6 +324,8 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
     ks = isempty(keep) || _band_above(meta, keep_below_mhz) ? nothing :
          kept_sources(vis, meta, mjd, keep; minuvw=minuvw, vsearch_deg=keep_vsearch_deg)
     ks !== nothing && isempty(ks.names) && (ks = nothing)
+    jd = ks === nothing || keep_mode == :restore || !isfinite(keep_dir_jy) ? nothing :
+         _kept_direction!(ks, vis, meta, mjd, sky[up], keep_dir_jy, wrap_zest(sky), gpu)
     before_keep = ks === nothing || keep_mode == :cosolve ? nothing : deepcopy_gpu(vis)
     keep_models = []                       # xx models of every subtracted direction (keep basis)
     restored = _band_above(meta, restore_below_mhz) ? GPUSource[] :
@@ -311,7 +346,7 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
             warm && _warm_start!(cal, get(initial_gains.cals, get_name(s), nothing), get_name(s))
         end
         append!(solved, get_name.(sources) .=> cals)
-        cohs = map(sources) do s
+        cohs0 = map(sources) do s
             c = ws === nothing ? GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=gpu) :
                                  _ws_vis!(ws, :model, meta.Nbase, meta.Nfreq, gpu, nmodel += 1)
             if is_rfi(s)
@@ -322,9 +357,14 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
             c.flags .= vis.flags
             c
         end
+        o = jd !== nothing && sources === passes[1] ? 1 : 0     # the kept Jupiter direction goes first
+        names = o == 1 ? vcat([jd.name], get_name.(sources)) : get_name.(sources)
+        cohs = o == 1 ? vcat([jd.coh], cohs0) : cohs0
+        cals = o == 1 ? vcat([jd.cal], cals) : cals
+        o == 1 && (jd.coh.flags .= vis.flags)
         rep = report === nothing ? nothing :
-            (i, it; kw...) -> report(get_name(sources[i]), it; kw...)
-        sflux = smooth_of.(sources)
+            (i, it; kw...) -> report(names[i], it; kw...)
+        sflux = o == 1 ? vcat([0.0], smooth_of.(sources)) : smooth_of.(sources)
         # the square models are constant over the peel passes: built once per direction
         # (Nant² Nfreq × 4 per direction: 190 MB at 352 antennas, 48 channels, :mixed)
         sqcache = IdDict{Any,Any}()
@@ -347,9 +387,16 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
             subd -> update_kept!(ks, vis; others=[cohs[i].xx for i in eachindex(cohs) if subd[i]])
         sub = guarded_zest!(vis, meta, cohs, cals, solve; peeliter=peeliter,
                             max_gain=max_gain, report=rep, workspace=ws, after_pass=after)
-        append!(peeled, get_name.(sources[sub]))
-        ks === nothing || append!(keep_models, [copy(c.xx) for c in cohs[sub]])
-        before === nothing || append!(peeled_models, [c.xx for c in cohs[sub]])
+        o == 1 && (jd.subtracted[] = sub[1])
+        ssub = sub[(1 + o):end]
+        append!(peeled, get_name.(sources[ssub]))
+        ks === nothing || append!(keep_models, [copy(c.xx) for c in cohs0[ssub]])
+        before === nothing || append!(peeled_models, [c.xx for c in cohs0[ssub]])
+    end
+    if jd !== nothing && jd.subtracted[]   # the kept Jupiter direction joins the kept component
+        b = deepcopy_gpu(jd.coh); gpu_corrupt!(b, jd.cal, meta)
+        for q in 1:4; ks.K[q] .+= _visq(b)[q]; end    # part of the kept component, added back below
+        log_detail(@sprintf("%s: kept as a direction (first fit %.0f Jy)", jd.name, jd.flux))
     end
     kept = Pair{String,Any}[]
     if ks !== nothing

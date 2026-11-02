@@ -173,6 +173,20 @@ const TIGHT = (maxiter=30, tolerance=1e-8)
             # dist/kp 0.43 vs 0.57 unrestored), :cosolve never lets the gains take it (3e-7), :both ~1e-3
             mode == :restore || @test dist(v) < (mode == :cosolve ? 1e-5 : 1e-2) * sum(abs2, km.xx)
         end
+        # a bright kept Jupiter-named source becomes a kept direction (gains solved, put back)
+        jb = GPUPointSource("Jupiter_b", azel_radec(250.0, 40.0)..., GPUPowerLaw(5000.0, 0.0, 0.0, 3000.0, 50e6, [0.0]))
+        jbm = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=false); genvis_exact!(jbm, meta, jb, TEST_MJD)
+        gpu_corrupt!(jbm, random_gains(meta.Nant, meta.Nfreq; seed=5, ε=0.05), meta)   # not a pure point
+        dj = deepcopy_gpu(measured); gpu_putsrc!(dj, jbm)
+        distj(v) = sum(abs2, v.xx .- jbm.xx .- ref.xx) + sum(abs2, v.yy .- jbm.yy .- ref.yy)
+        pj, cj, dirj = deepcopy_gpu(dj), deepcopy_gpu(dj), deepcopy_gpu(dj)
+        zest_sky_rfi!(pj, meta, TEST_MJD, [src]; TIGHT...)
+        zest_sky_rfi!(cj, meta, TEST_MJD, [src]; keep=[jb], keep_mode=:cosolve, keep_vsearch_deg=0.0, TIGHT...)
+        r = zest_sky_rfi!(dirj, meta, TEST_MJD, [src]; keep=[jb], keep_mode=:cosolve, keep_vsearch_deg=0.0,
+                          keep_dir_jy=1000.0, TIGHT...)
+        println("keep-dir test: plain $(distj(pj) / sum(abs2, jbm.xx)) cosolve $(distj(cj) / sum(abs2, jbm.xx)) dir $(distj(dirj) / sum(abs2, jbm.xx))")
+        @test isempty(r.kept) && r.peeled == ["src"]
+        @test distj(dirj) <= distj(cj) && distj(dirj) < 0.1 * distj(pj)
         # kept_sources / fit_kept alone: the fit of a pure point source is exact
         ks = kept_sources(data, meta, TEST_MJD, [kp]; minuvw=0.0)
         C = fit_kept(ks, (km.xx, km.xy, km.yx, km.yy))
