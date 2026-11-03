@@ -9,16 +9,30 @@ The source file is a JSON array of source objects. Each source has:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | ✓ | Source name (e.g., `"Cyg A"`) |
-| `ra` | ✓ | Right ascension — degrees or `"HHhMMmSS.SSs"` |
-| `dec` | ✓ | Declination — degrees or `"+DDdMMmSS.SSs"` |
+| `ra` | ✓ | Right ascension: `"HHhMMmSS.SSs"` (a JSON number is read as radians) |
+| `dec` | ✓ | Declination: `"+DDdMMmSS.SSs"` (a JSON number is read as radians) |
 | `I` | ✓ | Stokes I flux density (Jy) at reference frequency |
-| `freq` | | Reference frequency (Hz) for the spectral model |
-| `index` | | Spectral index coefficients `[α₁, α₂, ...]` |
+| `freq` | ✓ | Reference frequency (Hz) for the spectral model |
+| `index` | ✓ | Spectral index coefficients `[α₁, α₂, ...]` |
 | `Q`, `U`, `V` | | Stokes parameters (default: 0) |
 | `major-fwhm` | | Major axis FWHM in arcseconds (Gaussian sources) |
 | `minor-fwhm` | | Minor axis FWHM in arcseconds (Gaussian sources) |
 | `position-angle` | | Position angle in degrees (Gaussian sources) |
-| `components` | | Array of sub-components for multi-component sources |
+| `components` | | Array of sub-components for multi-component sources (then no other field is needed) |
+
+Sources named exactly `Sun`, `Moon` or `Jupiter` (and `az`/`el` positions) are read as a
+placeholder at (0, 0); give moving sources a J2000 position and another name, e.g.
+`"Jupiter (ephemeris)"`.
+
+Included models: `sources/sources_7src_tauA.json` (Cyg A, Cas A, Tau A, Vir A, Her A, Hya A,
+Per B; the production sky model) and `sources/rfi_43.2_ver20251101.json` (RFI emitters).
+
+## RFI emitters
+
+Entries with `rfi-frequencies` and `el` are near-field emitters (`GPURFISource`, peeled by
+`zest_sky_rfi!` / `--rfi`): `sys` (`"WGS84"`: `long`, `lat` in degrees, height `el` in m;
+`"ITRF"`: X, Y, Z in `el`, `long`, `lat`), `rfi-frequencies` (Hz), `rfi-I` (Jy per frequency)
+and optional `rfi-Q`, `rfi-U`, `rfi-V`.
 
 ## Example
 

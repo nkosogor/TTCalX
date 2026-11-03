@@ -573,7 +573,9 @@ end
 
 """
     solve_gains!(cal, measured, model, meta; solver=:rk4, maxiter=5, tolerance=1e-4,
-                 minuvw=0.0, reg=nothing) -> (converged, niters, fraction_converged)
+                 minuvw=0.0, reg=nothing, smooth_flux=0.0, precision=:double,
+                 model_sq=nothing, meas_sq=nothing, workspace=nothing)
+        -> (converged, niters, fraction_converged)
 
 Solve for the gains `cal` (updated in place) that best fit `measured` with
 `model`, as in one direction of a peel/zest.

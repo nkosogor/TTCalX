@@ -54,7 +54,7 @@ at 0.037 deg.
 Conventions: kernel exp(+2πi(ul + vm − w(n−1))) (WSClean/ducc0); images in FITS order with RA to the
 left, centre pixel N/2; Stokes V = i(YX − XY)/2 (checked against `wsclean -pol IV`).
 
-## Validation (RTX A4000, against WSClean 3.4 with the orca parameters on the same MSes)
+## Validation (October 2026, RTX A4000, against WSClean 3.4 with the orca parameters on the same MSes)
 
 | | 41 MHz | 69 MHz |
 |---|---|---|

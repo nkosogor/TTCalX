@@ -13,6 +13,13 @@ The GPU code is organized in `src/gpu/kernels/`:
 | `corrupt.jl` | Corrupt/apply calibration to visibilities |
 | `stefcal.jl` | StEFCal gain solver iterations |
 
+The sky + RFI path (`zest_sky_rfi!`) adds `src/gpu/genvis_exact.jl` (exact model), `solver.jl`
+(RK4 / damped `solve_gains!`, normal-equation kernels), `guard.jl` (peel loop, fused
+corrupt-subtract), `rfi.jl`, `geometry.jl`, `workspace.jl` and `host_backend.jl` (the same code on
+host arrays). `fast_kernels!(true)` switches on the 0.3.0 kernels (tiled full-Jones normal
+equations, device RFI fringes, fused corrupt-subtract); they are off by default, so the GPU runs
+the 748884a kernels; on, results agree to rounding.
+
 ## Jones Matrix Operations (`utils.jl`)
 
 All Jones operations are `@inline` device-side functions:
@@ -44,7 +51,8 @@ Computes geometric delay fringes using UVW coordinates:
 Same as point sources but with baseline coherency attenuation from the Gaussian envelope (Fourier transform of the sky brightness).
 
 ### Disk Sources
-Uses Bessel function ``J_1`` for the coherency of a uniform disk model.
+Uses Bessel function ``J_1`` for the coherency of a uniform disk model (kernel only; the JSON
+reader has no disk sources).
 
 ## Corrupt & Applycal (`corrupt.jl`)
 

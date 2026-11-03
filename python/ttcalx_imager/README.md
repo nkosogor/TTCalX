@@ -16,7 +16,7 @@ ttcalx-image hour --archive 41MHz-2026-10-31-02h-peeled-b000.gsiv --band 41 --ou
 pytest python/ttcalx_imager/tests        # GPU tests are skipped without CuPy/CUDA
 ```
 
-Full documentation: `docs/src/gpu-clean-imager.md`.
+Full documentation: [docs/src/gpu-clean-imager.md](../../docs/src/gpu-clean-imager.md).
 
 ## Tuning environment variables
 

@@ -84,18 +84,16 @@ CALIBRATION MODES:
   shave/prune Wideband calibration (one solution per subband)
 
 SOURCES FILE FORMAT:
-  JSON array of source objects. Each source has:
-    - name: source name
-    - ra: right ascension (degrees or "HH:MM:SS")
-    - dec: declination (degrees or "+DD:MM:SS")
-    - flux: Stokes I flux in Jy (or spectrum object)
-    - type: "point" or "gaussian"
-    - major_fwhm, minor_fwhm, position_angle: for Gaussian sources
+  JSON array in TTCal format (see sources/sources_7src_tauA.json and docs/src/sources.md):
+    - name; ra, dec as strings "19h59m29.990s", "+40d43m57.53s" (a bare number is radians)
+    - I (Jy) at freq (Hz), index (log-polynomial spectral index); optional Q, U, V
+    - major-fwhm, minor-fwhm (arcsec), position-angle (deg): Gaussian source
+    - components: array of sub-sources (multi-component source)
 
   Example sources.json:
   [
-    {"name": "CasA", "ra": "23:23:24", "dec": "+58:48:54", "flux": 16530},
-    {"name": "CygA", "ra": 299.868, "dec": 40.734, "flux": 16300}
+    {"name": "Cas A", "ra": "23h23m27.94s", "dec": "+58d48m42.4s",
+     "I": 22000.0, "freq": 1.0e6, "index": [0.3, -0.2]}
   ]
 """)
 end

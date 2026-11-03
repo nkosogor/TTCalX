@@ -12,6 +12,15 @@ For each bright source, TTCalX solves for antenna-based Jones gains ``J_i`` that
 
 where ``V_{ij}`` are the measured visibilities and ``M_{ij}`` are the model visibilities for that source.
 
+TTCalX has two peeling paths:
+
+| | `bin/ttcal_gpu.jl` (`peel_gpu!`, ...) | `bin/zest_sky_rfi.jl` (`zest_sky_rfi!`) |
+|---|---|---|
+| solver | damped StefCal (below) | RK4 StefCal as CPU TTCal's `solve!`, per-channel stopping (`solver=:rk4`; `:damped` available) |
+| model | kernel model, MS UVW | exact model (`genvis_exact!`), geometric UVW (`geometric_uvw!`) |
+| guard | none | an update is kept only if it lowers the residual power and \|g\| ≤ `max_gain` (`guarded_zest!`) |
+| extras | | RFI emitters, phase prior (`--reg`), gain smoothing (`--smooth-flux`), restore of point sources (`--restore`), mixed precision, warm start |
+
 ## Peeling Loop
 
 The peeling procedure iterates over sources multiple times (`--peeliter`):
@@ -34,7 +43,7 @@ For full 2×2 Jones matrices, the update involves a matrix solve per antenna per
 
 ### Convergence
 
-The solver iterates until either:
+The damped solver (`ttcal_gpu.jl`) iterates until either:
 - The relative change falls below `--tolerance`: ``\|\delta g\| < \text{tol} \times \|g\|``
 - The maximum number of iterations `--maxiter` is reached
 
@@ -55,12 +64,12 @@ Half-step damping is applied to improve stability: ``g \leftarrow \frac{1}{2}(g_
 ### Shave (diagonal, wideband)
 - 2 complex parameters per antenna per subband
 - Fewer degrees of freedom than peel
-- ⚠️ Currently untested
+- Not validated against CPU TTCal
 
 ### Prune (full Jones, wideband)
 - 4 complex parameters per antenna per subband
 - Fewer degrees of freedom than zest
-- ⚠️ Currently untested
+- Not validated against CPU TTCal
 
 ## GPU vs CPU
 
@@ -70,13 +79,15 @@ TTCalX uses CUDA for all heavy computation:
 - **StEFCal iterations**: gain updates per antenna per frequency
 - **Makesquare**: baseline→antenna-antenna matrix reorganization
 
-When CUDA is unavailable, all operations fall back to equivalent CPU implementations automatically. The CPU path produces identical results but is significantly slower.
+When CUDA is unavailable, all operations fall back to equivalent CPU implementations automatically (slower). `zest_sky_rfi.jl --cpu` runs the sky + RFI path on host arrays with `julia -t N` threads, with the same results as the GPU to rounding.
 
 ## Key Parameters
 
-| Parameter | Flag | Default | Description |
-|-----------|------|---------|-------------|
-| Max iterations | `--maxiter` | 30 | Maximum StEFCal iterations per source per peel iteration |
-| Tolerance | `--tolerance` | 1e-4 | Relative convergence threshold |
-| Min UVW | `--minuvw` | 10.0 | Minimum baseline length in wavelengths (flags shorter baselines) |
-| Peel iterations | `--peeliter` | 3 | Number of peeling passes over all sources |
+| Parameter | Flag | `ttcal_gpu.jl` | `zest_sky_rfi.jl` | Description |
+|-----------|------|---------|---------|-------------|
+| Max iterations | `--maxiter` | 30 | 5 | StEFCal iterations per solve |
+| Tolerance | `--tolerance` | 1e-4 | 1e-4 | Relative convergence threshold |
+| Min UVW | `--minuvw` | 10.0 | 5.0 | Baselines shorter than this (wavelengths) are excluded from the solve |
+| Peel iterations | `--peeliter` | 3 | 3 | Peeling passes over all sources |
+
+All options: [CLI Reference](cli.md).

@@ -14,7 +14,7 @@ from ttcalx_imager.msio import C, msdata_from_arrays, samples_from_msdata
 sys.path.insert(0, os.path.dirname(__file__))
 
 # PHASE_DIR written by /opt/bin/chgcentre (wsclean chgcentre) for <h>h30m00s 37d12m57.057s,
-# measured on lwacalim10 on 2026-11-01 (gpu-subband-imaging scripts/v3_engine/chgcentre_check.py)
+# measured on a calim CPU node on 2026-11-01 (gpu-subband-imaging scripts/v3_engine/chgcentre_check.py)
 CHG_RA = [0.13089969389957473, 0.39269908169872414, 0.6544984694978736, 0.916297857297023,
           1.1780972450961724, 1.439896632895322, 1.7016960206944713, 1.9634954084936207,
           2.2252947962927703, 2.48709418409192, 2.748893571891069, 3.0106929596902186,

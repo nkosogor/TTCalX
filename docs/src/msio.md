@@ -4,7 +4,8 @@ TTCalX reads and writes CASA Measurement Sets using `python-casacore` via Julia'
 
 ## Overview
 
-The MS bridge (`src/gpu/pycall_ms_bridge.jl`) provides two main functions:
+The MS bridge (`src/gpu/pycall_ms_bridge.jl`) provides two main functions (the CLIs pass
+`--column`, default `CORRECTED_DATA`; the functions default to `DATA`):
 
 - **`read_ms_to_gpu`** — Read an MS into GPU-friendly data structures
 - **`write_gpu_to_ms!`** — Write calibrated visibilities back to the MS
@@ -12,7 +13,7 @@ The MS bridge (`src/gpu/pycall_ms_bridge.jl`) provides two main functions:
 ## Reading Data
 
 ```
-read_ms_to_gpu(ms_path; gpu=true, column="CORRECTED_DATA")
+read_ms_to_gpu(ms_path; gpu=true, column="DATA")
     → (vis, cal, meta, baseline_dict, Nrows)
 ```
 
@@ -41,10 +42,16 @@ When `gpu=true` and CUDA is functional, all arrays are transferred to GPU memory
 ## Writing Data
 
 ```
-write_gpu_to_ms!(ms_path, vis, baseline_dict, Nrows; column="CORRECTED_DATA")
+write_gpu_to_ms!(ms_path, vis, baseline_dict, Nrows; column="DATA")
 ```
 
 Transfers data from GPU to CPU (if needed), reconstructs the `(Nrows, Nfreq, 4)` layout expected by casacore, and writes back to the specified column using `python-casacore`.
+
+## Fast I/O
+
+`read_ms_fast` / `write_ms_fast!` (`src/gpu/ms_io.jl`, same arguments and return values) do the row
+gather/scatter in numpy instead of Julia loops (same results); `zest_sky_rfi_ms!` uses them.
+`ms_mjd(ms_path)` returns the mean `TIME` as MJD (UTC).
 
 ## Python Initialization
 

@@ -1,68 +1,36 @@
 # TTCalX
 
-*GPU-accelerated direction-dependent calibration for the OVRO-LWA.*
+GPU direction-dependent calibration (peeling) and a GPU CLEAN imager for the OVRO-LWA.
+TTCalX extends [TTCal](https://github.com/mweastwood/TTCal.jl) by Michael Eastwood.
+Source: <https://github.com/nkosogor/TTCalX>.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+| part | entry points |
+|---|---|
+| peeling, RK4 StefCal, exact model, RFI emitters (production) | `bin/zest_sky_rfi.jl`, `zest_sky_rfi_ms!`, `zest_sky_rfi!` |
+| peeling, damped StefCal (peel / zest / shave / prune) | `bin/ttcal_gpu.jl`, `peel_gpu!`, `zest_gpu!`, ... |
+| GPU CLEAN imager (Python) | `ttcalx-image snapshot`, `ttcalx-image hour` |
 
-## Overview
+## Versions
 
-TTCalX performs direction-dependent calibration to remove bright radio sources from interferometric data. All heavy computation runs on CUDA GPUs with automatic CPU fallback.
+| tag | commit | used by the OVRO-LWA GPU pipeline (gsi) |
+|---|---|---|
+| `gsi-v1` | 62f8c54 | until 2026-10-25 |
+| `gsi-v2` | 748884a | current production; the pre-installed copy on the calim servers |
+| `v0.3.0` | `main` | gsi v3; with default settings it peels bitwise like 748884a, the faster paths are opt-in |
 
-It is an extended, GPU-accelerated version of the original [TTCal](https://github.com/mweastwood/TTCal.jl) by Michael Eastwood.
-
-## Calibration Modes
-
-| Mode      | Jones Matrix     | Frequency   | Use Case                      |
-|-----------|-----------------|-------------|-------------------------------|
-| **peel**  | Diagonal (2 params) | Per-channel | Phase/amplitude calibration   |
-| **zest**  | Full (4 params)     | Per-channel | + Polarization leakage        |
-| **shave** | Diagonal            | Wideband    | Fast diagonal calibration     |
-| **prune** | Full                | Wideband    | Fast full Jones calibration   |
-
-## Quick Start
-
-```bash
-# Activate environment (on calim servers)
-ttcalx_env
-
-# Run zest on a measurement set
-ttcalx zest /home/pipeline/sources.json data.ms --verbose
-```
-
-For a full walkthrough, see the [Tutorial](@ref tutorial).
-
-## Contents
+## Pages
 
 ```@contents
 Pages = [
+    "install.md",
     "tutorial.md",
     "calibration.md",
     "sources.md",
     "kernels.md",
     "msio.md",
+    "gpu-clean-imager.md",
     "cli.md",
     "api.md",
 ]
-Depth = 2
-```
-
-## Requirements
-
-- **Julia 1.10+**
-- **NVIDIA GPU** with CUDA 11+ (falls back to CPU if unavailable)
-- **Python 3** with `python-casacore` (for Measurement Set I/O via PyCall)
-
-## Installation
-
-```bash
-git clone https://github.com/nkosogor/TTCalX.git
-cd TTCalX
-
-julia -e '
-using Pkg
-Pkg.activate(".")
-Pkg.instantiate()
-ENV["PYTHON"] = Sys.which("python")
-Pkg.build("PyCall")
-'
+Depth = 1
 ```
