@@ -19,6 +19,7 @@ makedocs(
     ),
     pages = [
         "Home"            => "index.md",
+        "Installation"    => "install.md",
         "Tutorial"        => "tutorial.md",
         "Calibration"     => "calibration.md",
         "Source Models"    => "sources.md",
