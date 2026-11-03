@@ -24,7 +24,7 @@ import numpy as np
 import cupy as cp
 
 from . import bands, gridder
-from .clean import clean_snapshot, mad_std
+from .clean import check_psf_support, clean_snapshot, mad_std
 from .fits import make_header, write_image, write_images
 from .gridder import SampleSet, dft_predict, get_svd, to_ws
 from .msio import C, is_empty, read_ms
@@ -100,6 +100,13 @@ def gpu_select(small, raw, scale_deg, pols="IV", zero_limit=0.999):
     return L
 
 
+def rephase(data, w_old, w_new, freqs, xp=cp):
+    """rotate.rephase on the GPU by default (gsi v3: a peeled snapshot imaged from shared memory at
+    the LST-hour centre without the chgcentre MS copy)."""
+    from .rotate import rephase as _rephase
+    return _rephase(data, w_old, w_new, freqs, xp=xp)
+
+
 class SnapshotImager:
     def __init__(self, eps=1e-4, svd_tol=1e-4, dft_max=8000, verbose=False):
         self.eps = eps; self.svd_tol = svd_tol; self.dft_max = dft_max
@@ -137,6 +144,7 @@ class SnapshotImager:
             S = SampleSet(None, None, None, iw, N, sc, svd=svd, eps=self.eps, pre=pre)
             u32 = cp.asarray(pre["u32"]); v32 = cp.asarray(pre["v32"]); w32 = cp.asarray(pre["w32"])
             theo_pix = pre["theo_pix"]
+        check_psf_support(scale_deg, theo_pix, params.local_rms_window, S.npts)   # no gridding for a degenerate PSF
         dI = cp.asarray(visI)
         lap("gridder setup")
         dirty = to_ws(S.grid(dI)) / sw
@@ -181,6 +189,21 @@ class SnapshotImager:
         if prods:
             prods = [(p, a.get(), st) for p, a, st in prods]
         return self._finish(info, prods, t0)
+
+    def compute(self, L, N, scale_deg, out_prefix=None, pols="IV", params=bands.SNAPSHOT_CLEAN_I, beam=None):
+        """GPU part of ``image`` for a selected snapshot (``gpu_select`` / ``load_snapshot`` dict):
+        (info, products with host arrays); ``write(info, prods, t0)`` writes the FITS + qa.json
+        (thread-safe, host only), as ``image_many`` splits the two."""
+        info, prods = self._compute(L, N, scale_deg, out_prefix, pols, params, beam, False, False, False)
+        if prods:
+            t1 = time.perf_counter()
+            prods = [(p, a.get(), st) for p, a, st in prods]
+            info["timing"]["D2H"] = time.perf_counter() - t1
+        return info, prods
+
+    @staticmethod
+    def write(info, prods, t0):
+        return SnapshotImager._finish(info, prods, t0)
 
     def _compute(self, L, N, scale_deg, out_prefix, pols, params, beam, write_aux, write_dirty, write_psf):
         ms = L["ms"]; T = dict(L["timing"])

@@ -80,6 +80,28 @@ def test_point_source_snapshot_clean():
     assert 0 < bmin <= bmaj < 20 * sdeg
 
 
+def test_degenerate_psf_snapshot_raises_specific_error():
+    """20261031_101739_32MHz-like: only 28 short baselines (max|uvw| 21.7 lambda) at the 32 MHz
+    geometry -> DegeneratePSFError before gridding (was: overflow in exp in the beam fit, then
+    'zero-size array to reduction operation' in local_rms_factor)."""
+    import warnings
+    from ttcalx_imager.beam import DegeneratePSFError
+    from ttcalx_imager.clean import horizon_mask, local_rms_factor
+    N, sdeg = bands.geometry(32)
+    rng = np.random.default_rng(3)
+    t = rng.uniform(0, 2 * np.pi, 28); r = rng.uniform(1.2, 21.7, 28); r[0] = 21.7
+    u = np.repeat(r * np.cos(t), 24); v = np.repeat(r * np.sin(t), 24); w = rng.uniform(-2, 2, u.size)
+    vis = (rng.normal(size=u.size) + 1j * rng.normal(size=u.size)).astype(np.complex64)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(DegeneratePSFError, match="degenerate PSF"):
+            SnapshotImager().image_arrays(u, v, w, np.ones(u.size, np.float32), vis, None, N, sdeg,
+                                          bands.SNAPSHOT_CLEAN_I)
+    theo = 1.0 / 21.7 / math.radians(sdeg)
+    with pytest.raises(DegeneratePSFError, match="local-RMS"):
+        local_rms_factor(cp.ones((N, N), cp.float32), theo, sdeg, horizon_mask(N, sdeg))
+
+
 def test_hour_orca_products_naming(tmp_path, monkeypatch):
     """image_hour with orca products: one load, WSClean/orca file names, V-only product."""
     import os
@@ -335,3 +357,46 @@ def test_multiscale_max_scales_and_divergence_guard():
     _, R, M, info = deconvolve_multiscale(dirty, psf, 0.3, theo, params, residual_fn=residual, beam=(0.9, 0.9, 0.0))
     assert info["diverged"] and bool(cp.isfinite(M).all()) and bool(cp.isfinite(R).all())
     assert float(M.sum()) > 40.0
+
+
+def test_hogbom_multiblock_compile_failure_falls_back(monkeypatch):
+    """A cooperative-groups kernel that does not compile (CompileException) falls back to the
+    single-block kernel, which gives the same components."""
+    from cupy.cuda.compiler import CompileException
+    from ttcalx_imager import clean
+    rng = np.random.default_rng(3)
+    pn = 129; yy, xx = np.mgrid[:pn, :pn] - pn // 2
+    psf = cp.asarray(np.exp(-0.5 * (xx ** 2 + yy ** 2) / 4.0), dtype=cp.float32)
+    K = clean.HOGBOM_MB_MIN_K + 100
+    flat = rng.choice(512 * 512, K, replace=False)
+    ys, xs = cp.asarray(flat // 512), cp.asarray(flat % 512)
+    vals = cp.asarray(rng.normal(0, 1, K), dtype=cp.float32); fac = cp.ones(K, cp.float32)
+    monkeypatch.setattr(clean, "_MB_BROKEN", [False])
+    ref = clean.hogbom_on_set(psf, ys, xs, vals.copy(), fac, 0.1, 0.5, 2000)
+
+    def broken():
+        raise CompileException("cooperative_groups.h: no such file (test)", "src", "hogbom_mb", ())
+    monkeypatch.setattr(clean, "_hogbom_mb_kernel", broken)
+    monkeypatch.setattr(clean, "_MB_BROKEN", [False])
+    with pytest.warns(UserWarning, match="multi-block Hogbom unavailable"):
+        got = clean.hogbom_on_set(psf, ys, xs, vals.copy(), fac, 0.1, 0.5, 2000)
+    assert clean._MB_BROKEN[0]
+    assert got[1] == ref[1] and bool((got[0] == ref[0]).all())
+
+
+def test_fast_settings_agree_with_defaults_to_rounding(monkeypatch):
+    """Defaults = 748884a's operations (LAPACK SVD, FFT local RMS); the FAST_ENV variants agree to rounding."""
+    from ttcalx_imager import FAST_ENV, clean, gridder
+    for k in FAST_ENV:
+        monkeypatch.delenv(k, raising=False)
+    a = gridder._svd_factors(300.0, 1e-4, 600, 2001)
+    monkeypatch.setenv("TTCALX_SVD_METHOD", "gram")
+    b = gridder._svd_factors(300.0, 1e-4, 600, 2001)
+    assert a[0] == b[0]
+    ma, mb = a[2] @ a[3], b[2] @ b[3]
+    assert np.abs(ma - mb).max() < 1e-6
+    img = cp.asarray(np.random.default_rng(1).normal(0, 1, (300, 300)), dtype=cp.float32)
+    r0 = clean.rms_image(img, 3.0)
+    monkeypatch.setenv("TTCALX_RMS_FILTER", "circulant")
+    r1 = clean.rms_image(img, 3.0)
+    assert float(cp.abs(r1 - r0).max()) < 1e-4 * float(r0.max())

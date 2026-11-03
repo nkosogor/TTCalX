@@ -41,7 +41,7 @@ function host_makesquare!(sq::GPUSquareVisibilities, vis::GPUVisibilities, meta:
     bl = meta.baselines
     Threads.@threads for β in 1:Nfreq(vis)
         for a in (sq.xx, sq.xy, sq.yx, sq.yy)
-            fill!(view(a, :, :, β), zero(ComplexF64))
+            fill!(view(a, :, :, β), zero(eltype(a)))
         end
         @inbounds for α in 1:meta.Nbase
             vis.flags[α, β] && continue

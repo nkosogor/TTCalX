@@ -62,6 +62,33 @@ def _subtable_col(path, sub, col, default=None):
         return default
 
 
+def msdata_from_arrays(path, a1, a2, uvw, data, flag, wcol, tcol, freqs, chan_width, phase_dir, ant_pos,
+                       telescope="OVRO-LWA", observer="", field_name="", want_v=True):
+    """:class:`MSData` from the main-table columns of a single-SPW snapshot (all rows, autos
+    included, MS row order) and its subtable values.
+
+    a1, a2: ANTENNA1/2; uvw (nrow, 3); data (nrow, nchan, 4) complex64; flag (nrow, nchan, 4)
+    bool; wcol: WEIGHT (nrow, 4); tcol: TIME (nrow,); freqs, chan_width: (nchan,) Hz;
+    phase_dir: (ra, dec) rad; ant_pos (nant, 3) ITRF m.  These are the expressions
+    :func:`read_ms` has always used, so an in-memory snapshot (gsi v3 SnapArrays) and the MS
+    written from it give identical arrays."""
+    keep = a1 != a2
+    a1 = a1[keep]; a2 = a2[keep]; uvw = uvw[keep]; data = data[keep]; flag = flag[keep]; wcol = wcol[keep]
+    ok = ~(flag[:, :, 0] | flag[:, :, 3])
+    visI = (0.5 * (data[:, :, 0] + data[:, :, 3])).astype(np.complex64)
+    visV = (0.5j * (data[:, :, 2] - data[:, :, 1])).astype(np.complex64) if want_v else None
+    nok = int(ok.sum())
+    zero = ((data[:, :, 0] == 0) & (data[:, :, 3] == 0) & ok).sum()
+    return MSData(path=path, uvw=uvw.astype(np.float64), a1=a1, a2=a2, visI=visI, visV=visV, ok=ok,
+                  natw=(0.5 * (wcol[:, 0] + wcol[:, 3])).astype(np.float32),
+                  freqs=np.asarray(freqs, np.float64), chan_width=np.asarray(chan_width, np.float64),
+                  phase_dir=(float(phase_dir[0]), float(phase_dir[1])), ant_pos=np.asarray(ant_pos, np.float64),
+                  time=float(tcol[0]), tstart=float(tcol.min()), tmid=float(tcol.mean()),
+                  telescope=telescope, observer=observer, field_name=field_name,
+                  zero_frac=float(zero / nok) if nok else 1.0,
+                  extra=dict(n_v_only_flag=int((ok & (flag[:, :, 1] | flag[:, :, 2])).sum())))
+
+
 def read_ms(path, want_v=True, column="DATA"):
     """Read a single-SPW snapshot MS into an :class:`MSData`."""
     from casacore.tables import table
@@ -77,22 +104,10 @@ def read_ms(path, want_v=True, column="DATA"):
     pos = _subtable_col(path, "ANTENNA", "POSITION")
     tel = _subtable_col(path, "OBSERVATION", "TELESCOPE_NAME", ["OVRO-LWA"])
     obs = _subtable_col(path, "OBSERVATION", "OBSERVER", [""])
-    keep = a1 != a2
-    a1 = a1[keep]; a2 = a2[keep]; uvw = uvw[keep]; data = data[keep]; flag = flag[keep]; wcol = wcol[keep]
-    ok = ~(flag[:, :, 0] | flag[:, :, 3])
-    visI = (0.5 * (data[:, :, 0] + data[:, :, 3])).astype(np.complex64)
-    visV = (0.5j * (data[:, :, 2] - data[:, :, 1])).astype(np.complex64) if want_v else None
-    nok = int(ok.sum())
-    zero = ((data[:, :, 0] == 0) & (data[:, :, 3] == 0) & ok).sum()
-    return MSData(path=path, uvw=uvw.astype(np.float64), a1=a1, a2=a2, visI=visI, visV=visV, ok=ok,
-                  natw=(0.5 * (wcol[:, 0] + wcol[:, 3])).astype(np.float32),
-                  freqs=np.asarray(freqs, np.float64), chan_width=np.asarray(chw, np.float64),
-                  phase_dir=(float(pdir[0]), float(pdir[1])), ant_pos=np.asarray(pos, np.float64),
-                  time=float(tcol[0]), tstart=float(tcol.min()), tmid=float(tcol.mean()),
-                  telescope=str(tel[0]) if len(tel) else "OVRO-LWA", observer=str(obs[0]) if len(obs) else "",
-                  field_name=str(names[0]) if len(names) else "",
-                  zero_frac=float(zero / nok) if nok else 1.0,
-                  extra=dict(n_v_only_flag=int((ok & (flag[:, :, 1] | flag[:, :, 2])).sum())))
+    return msdata_from_arrays(path, a1, a2, uvw, data, flag, wcol, tcol, freqs, chw, pdir, pos,
+                              telescope=str(tel[0]) if len(tel) else "OVRO-LWA",
+                              observer=str(obs[0]) if len(obs) else "",
+                              field_name=str(names[0]) if len(names) else "", want_v=want_v)
 
 
 def is_empty(ms, zero_limit=0.999):
@@ -100,28 +115,53 @@ def is_empty(ms, zero_limit=0.999):
     return (not ms.ok.any()) or ms.zero_frac >= zero_limit
 
 
-def load_samples(path, ra=None, dec=None, want_v=True):
-    """Kept-sample arrays of one snapshot for the hour imager (picklable; runs in worker processes).
+def expand_coord(uvw, k, freqs, ok, xp=np):
+    """Per-kept-sample coordinate k (0 = u, 1 = v, 2 = w) in wavelengths, float32: the
+    load_samples expression, from per-row uvw [m] (nrow, 3), freqs (nchan,) Hz and the
+    (nrow, nchan) kept mask.  One float64 multiply and a cast, so numpy and CuPy agree bitwise."""
+    lamf = freqs / C
+    return (uvw[:, k:k + 1] * lamf[None])[ok].astype(xp.float32)
+
+
+def expand_nw(natw, nchan, ok, xp=np):
+    """Per-kept-sample natural weight (float32) from the per-row natw (nrow,)."""
+    return (natw[:, None] * xp.ones((1, nchan)))[ok].astype(xp.float32)
+
+
+def samples_from_msdata(ms, ra=None, dec=None, want_v=True, compact=False):
+    """Kept-sample arrays of one snapshot (:class:`MSData`) for the hour imager.
 
     u, v, w are in wavelengths (float32) in the *stored* (snapshot phase centre) frame; R is the
     3x3 matrix with uvw_hour = R @ uvw_stored (chgcentre-exact, see rotate.py), identity if no
     target phase centre is given.
-    """
-    ms = read_ms(path, want_v=want_v)
+
+    compact=True (gsi v3 hour record): instead of u, v, w, nw it returns the per-row arrays they
+    are expanded from -- uvw (nrow, 3) float64, natw (nrow,) float32, ok (nrow, nchan) bool -- plus
+    n (number of kept samples), a1, a2, ant_pos, tmid and extra; :func:`expand_coord` / :func:`expand_nw`
+    rebuild u, v, w, nw bit-identically.  I and V are the same arrays in both forms."""
     R = np.eye(3)
     if ra is not None:
         from .rotate import snapshot_rotation
         R = snapshot_rotation(ms.uvw, ms.a1, ms.a2, ms.ant_pos, ms.time, ra, dec)
     ok = ms.ok
-    lamf = ms.freqs / C
-    out = dict(path=path, stem=ms.stem, time=ms.time, tstart=ms.tstart, freqs=ms.freqs, chan_width=ms.chan_width, pd=ms.phase_dir, R=R.astype(np.float64),
+    out = dict(path=ms.path, stem=ms.stem, time=ms.time, tstart=ms.tstart, freqs=ms.freqs, chan_width=ms.chan_width, pd=ms.phase_dir, R=R.astype(np.float64),
                pd_new=(ra, dec), nrow=int(ms.uvw.shape[0]), nchan=len(ms.freqs), flagfrac=ms.flag_frac,
                zero_frac=ms.zero_frac, telescope=ms.telescope, observer=ms.observer, field_name=ms.field_name)
-    out["u"] = (ms.uvw[:, 0:1] * lamf[None])[ok].astype(np.float32)
-    out["v"] = (ms.uvw[:, 1:2] * lamf[None])[ok].astype(np.float32)
-    out["w"] = (ms.uvw[:, 2:3] * lamf[None])[ok].astype(np.float32)
-    out["nw"] = (ms.natw[:, None] * np.ones((1, len(ms.freqs))))[ok].astype(np.float32)
+    if compact:
+        out.update(uvw=ms.uvw, natw=ms.natw, ok=ok, n=int(ok.sum()), a1=ms.a1, a2=ms.a2, ant_pos=ms.ant_pos, tmid=ms.tmid,
+                   extra=dict(ms.extra))
+    else:
+        out["u"] = expand_coord(ms.uvw, 0, ms.freqs, ok)
+        out["v"] = expand_coord(ms.uvw, 1, ms.freqs, ok)
+        out["w"] = expand_coord(ms.uvw, 2, ms.freqs, ok)
+        out["nw"] = expand_nw(ms.natw, len(ms.freqs), ok)
     out["I"] = ms.visI[ok]
     if want_v:
         out["V"] = ms.visV[ok]
     return out
+
+
+def load_samples(path, ra=None, dec=None, want_v=True):
+    """Kept-sample arrays of one snapshot MS for the hour imager (picklable; runs in worker
+    processes).  = samples_from_msdata(read_ms(path)), see there."""
+    return samples_from_msdata(read_ms(path, want_v=want_v), ra, dec, want_v)

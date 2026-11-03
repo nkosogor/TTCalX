@@ -4,6 +4,8 @@ import json
 import os
 import sys
 
+from . import use_fast_settings
+
 
 def _beam(s):
     if not s:
@@ -67,17 +69,81 @@ def cmd_snapshot(a):
     return rc
 
 
-def cmd_hour(a):
+def _stems(spec):
+    if not spec:
+        return ()
+    return tuple(x.strip() for x in (_read_list([spec]) if spec.startswith("@") else spec.split(",")) if x.strip())
+
+
+def hour_setup(a):
+    """(products, phase centre string or None, image_hour_snaps keyword arguments) of parsed
+    ``hour`` arguments -- shared by the CLI and :func:`run_hour_snaps`."""
     from . import bands
-    from .hour import image_hour
-    paths = _read_list(a.ms)
     prods = bands.hour_products(a.products, intervals=a.intervals, niter=a.niter,
                                 niter_10min=a.niter_10min, pols=a.pols)
     pc = a.phase_centre or (bands.hour_phase_centre(a.lst_hour) if a.lst_hour is not None else None)
+    kw = dict(products=prods, mode=a.mode, block=a.block, pols=a.pols, qa=a.qa, qa_dir=a.qa_dir,
+              exclude=[int(x) for x in a.exclude.split(",")] if a.exclude else (),
+              exclude_stems=_stems(a.exclude_stems), beam=_beam(a.beam), write_aux=not a.no_aux, verbose=a.verbose)
+    return prods, pc, kw
+
+
+def parse_hour(argv):
+    """Parsed ``ttcalx-image hour`` arguments (``argv`` without the 'hour' word)."""
+    a = build_parser().parse_args(["hour"] + list(argv))
+    a.products = [p.strip() for p in a.products.split(",") if p.strip()]
+    return a
+
+
+def run_hour_snaps(argv, get_snaps, timing=None, t0=None):
+    """``ttcalx-image hour <argv>`` on snapshots that are already in memory (gsi v3 hour store):
+    the same products, phase centre and options as the CLI, with ``get_snaps(ra, dec, want_v)``
+    -> list of LazySnap / load_samples mappings in place of the MS / archive load.  argv must
+    not name MSes or --archive.  Returns the summary dict (as the CLI writes it)."""
+    import time
+    from .hour import image_hour_snaps, _want_v
+    from .rotate import parse_phase_centre
+    a = parse_hour(argv)
+    if a.ms or a.archive:
+        raise ValueError("run_hour_snaps: the snapshots come from get_snaps, not from MSes / --archive")
+    prods, pc, kw = hour_setup(a)
+    if not pc:
+        raise ValueError("run_hour_snaps needs --phase-centre or --lst-hour")
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    s = image_hour(paths, a.band, a.out, phase_centre=pc, products=prods, mode=a.mode, block=a.block, pols=a.pols,
-                   qa=a.qa, qa_dir=a.qa_dir, exclude=[int(x) for x in a.exclude.split(",")] if a.exclude else (),
-                   nproc=a.nproc, beam=_beam(a.beam), write_aux=not a.no_aux, verbose=a.verbose)
+    use_fast_settings()        # as --archive: chunk cache store, kept cuFFT plans, reserve auto, OOM fallback, ...
+    t0 = time.perf_counter() if t0 is None else t0
+    ra, dec = parse_phase_centre(pc)
+    snaps = get_snaps(ra, dec, _want_v(prods, a.pols, a.qa))
+    T = {} if timing is None else timing
+    T.setdefault("load + rotation (CPU)", time.perf_counter() - t0)
+    return image_hour_snaps(snaps, a.band, a.out, ra, dec, timing=T, t0=t0, **kw)
+
+
+def cmd_hour(a):
+    import time
+    from .hour import image_hour, image_hour_snaps, _want_v
+    if bool(a.ms) == bool(a.archive):
+        raise SystemExit("ttcalx-image hour: give snapshot MSes or --archive, not both / neither")
+    prods, pc, kw = hour_setup(a)
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    if a.archive:
+        from .gsiv import archive_phase_centre, load_archive
+        # archive snapshots (gsi v3): the validated speed settings (ttcalx_imager.FAST_ENV): device chunk
+        # cache when it fits, else rebuilt on the GPU from the records (no host-side u, v, w duplicates),
+        # reserve auto, GPU OOM fallback, ...; a variable already set overrides
+        use_fast_settings()
+        from .rotate import parse_phase_centre
+        t0 = time.perf_counter()
+        ra, dec = parse_phase_centre(pc) if pc else archive_phase_centre(a.archive)
+        log = (lambda *x: print(*x, flush=True)) if a.verbose else None
+        if a.no_verify:
+            print("WARNING: --no-verify: the archive record crc are not checked", file=sys.stderr, flush=True)
+        snaps = load_archive(a.archive, ra, dec, want_v=_want_v(prods, a.pols, a.qa), backend=a.archive_backend,
+                             verify=not a.no_verify, workers=a.nproc, log=log, band=a.band)
+        T = {"load + rotation (CPU)": time.perf_counter() - t0}
+        s = image_hour_snaps(snaps, a.band, a.out, ra, dec, timing=T, t0=t0, **kw)
+    else:
+        s = image_hour(_read_list(a.ms), a.band, a.out, phase_centre=pc, nproc=a.nproc, **kw)
     print(json.dumps(dict(rejected=s["rejected"], timing=s["timing"],
                           products={k: [dict(name=o["name"], n_snap=o["n_snap"], beam=o.get("beam"), nit=o.get("nit"),
                                              nmajor=o.get("nmajor")) for o in v] for k, v in s["products"].items()}),
@@ -85,7 +151,7 @@ def cmd_hour(a):
     return 0
 
 
-def main(argv=None):
+def build_parser():
     ap = argparse.ArgumentParser(prog="ttcalx-image", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -112,7 +178,12 @@ def main(argv=None):
     s.set_defaults(fn=cmd_snapshot)
 
     h = sub.add_parser("hour", help="1-h and/or N x 10-min I + V from peeled snapshot MSes")
-    h.add_argument("ms", nargs="+", help="snapshot MS paths (or @listfile)")
+    h.add_argument("ms", nargs="*", help="snapshot MS paths (or @listfile)")
+    h.add_argument("--archive", help="GSIV record file(s) of the band-hour instead of MSes: path[,path] or "
+                                     "@listfile (gsi v3, ttcalx_imager.gsiv)")
+    h.add_argument("--archive-backend", default="ram", choices=["ram", "memmap"],
+                   help="read the archive into RAM (default) or memory-map it")
+    h.add_argument("--no-verify", action="store_true", help="skip the archive record crc check")
     h.add_argument("--band", required=True)
     h.add_argument("--out", required=True, help="output prefix")
     g = h.add_mutually_exclusive_group()
@@ -133,13 +204,17 @@ def main(argv=None):
                    help="snapshot QA source: json from --qa-dir, compute here, or both (auto)")
     h.add_argument("--qa-dir", help="directory with <stem>-qa.json from 'ttcalx-image snapshot'")
     h.add_argument("--exclude", default="", help="extra snapshot indices (time order) to drop")
-    h.add_argument("--nproc", type=int, default=8, help="MS reader processes")
+    h.add_argument("--exclude-stems", default="", help="snapshot stems to drop: s1,s2 or @listfile")
+    h.add_argument("--nproc", type=int, default=8, help="MS reader processes (archive: reader threads)")
     h.add_argument("--beam", help="fixed restoring beam BMAJ,BMIN,BPA [deg] instead of the fit")
     h.add_argument("--no-aux", action="store_true", help="do not write residual/model/dirty/psf")
     h.add_argument("-v", "--verbose", action="store_true")
     h.set_defaults(fn=cmd_hour)
+    return ap
 
-    a = ap.parse_args(argv)
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
     if a.cmd == "hour":
         a.products = [p.strip() for p in a.products.split(",") if p.strip()]
     return a.fn(a)

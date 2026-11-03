@@ -21,4 +21,5 @@ include("helpers.jl")
     include("test_host_backend.jl")
     include("test_ms_io.jl")
     include("test_sky_rfi.jl")
+    include("test_workspace.jl")
 end

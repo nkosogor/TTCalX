@@ -58,7 +58,9 @@ export tukey_prior, regularize_element
 export mask_short_baselines!, stefcal_steps!, solve_gains!, host_makesquare!
 export read_ms_fast, write_ms_fast!
 export residual_power, flag_zero_visibilities!, max_gain_amplitude, guarded_zest!
-export source_elevation_deg, zest_sky_rfi!, zest_sky_rfi_ms!
+export source_elevation_deg, zest_sky_rfi!, zest_sky_rfi_ms!, restore_point_sources!
+export PeelWorkspace, workspace_bytes, free_workspace!
+export fast_kernels!, fast_kernels
 
 # Export logging utilities
 export set_verbosity, get_verbosity, is_quiet, is_verbose, is_normal
@@ -83,6 +85,7 @@ include("gpu/rfi.jl")
 include("gpu/genvis_exact.jl")
 include("gpu/regularization.jl")
 include("gpu/host_backend.jl")
+include("gpu/workspace.jl")
 include("gpu/solver.jl")
 include("gpu/ms_io.jl")
 include("gpu/guard.jl")

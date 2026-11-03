@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from ttcalx_imager import bands
-from ttcalx_imager.beam import fit_beam, to_fwhm_pa
+from ttcalx_imager.beam import DegeneratePSFError, check_psf_support, fit_beam, local_rms_radius, to_fwhm_pa
 from ttcalx_imager.qa import qa_reject
 from ttcalx_imager.rotate import analytic_rotation, rotate_samples, rotation_from_uvw, uvw_frame
 from ttcalx_imager.weights import WeightGrid, padded_size
@@ -170,6 +170,91 @@ def test_beam_fit_matches_wsclean_psf():
     assert bpa == pytest.approx(ref[2], abs=1e-3)
     full = fit_beam(psf, 0.049, theo, wrap=False)        # naive full-box fit is ~1 % off
     assert abs(full[1] / ref[1] - 1) > 3e-3
+
+
+def _dft_psf(u, v, H, scale_deg):
+    """Natural-weight w-less PSF [y, x] of (u, v) [lambda] on a (2H)^2 grid, peak 1."""
+    j = (np.arange(2 * H) - H) * math.radians(scale_deg)
+    ph = 2 * np.pi * (u[:, None, None] * -j[None, None, :] + v[:, None, None] * j[None, :, None])
+    p = np.cos(ph).sum(0)
+    return (p / p[H, H]).astype(np.float32)
+
+
+def test_degenerate_psf_is_rejected_before_the_fit():
+    """20261031_101739_32MHz: after the peel's flag_zero only 28 baselines of one 8-antenna group
+    remain (672 samples, max|uvw| 21.7 lambda): theoretical beam 34.4 px at 0.0767 deg, local-RMS
+    radius < 0 (the old code: overflow in exp in the beam fit, then a zero-size min in
+    local_rms_factor).  Synthetic: the same kind of uv coverage."""
+    scale, window = 0.0767, 25.0
+    rng = np.random.default_rng(1)
+    ang = rng.uniform(0, 2 * np.pi, 28); r = rng.uniform(1.2, 21.7, 28); r[0] = 21.7
+    u, v = r * np.cos(ang), r * np.sin(ang)
+    theo = 1.0 / np.hypot(u, v).max() / math.radians(scale)
+    assert theo > 30 and local_rms_radius(scale, theo, window) < 0
+    psf = _dft_psf(u, v, 48, scale)
+    assert psf.max() == pytest.approx(1.0) and (psf > 0.5).sum() > 300     # main lobe ~25 px wide (normal: ~8 px)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                                    # no numpy overflow on the way
+        with pytest.raises(DegeneratePSFError, match="degenerate PSF: max.uvw. = 21.7 lambda over 672 samples"):
+            check_psf_support(scale, theo, window, npts=672)
+    with pytest.raises(ValueError):                                       # still a ValueError (v2 callers)
+        check_psf_support(scale, float("nan"), window)
+    assert DegeneratePSFError.permanent_input_failure is True
+
+
+@pytest.mark.parametrize("band,maxuvw", [(32, 123.546), (41, 295.801), (82, 900.0), (32, 31.9)])
+def test_normal_psf_support_passes(band, maxuvw):
+    """Normal snapshots (max|uvw| 123.5 lambda at 32 MHz on 2026-10-31) pass untouched; the limit
+    at 32 MHz is max|uvw| ~ 31.85 lambda."""
+    N, scale = bands.geometry(band)
+    theo = 1.0 / maxuvw / math.radians(scale)
+    assert check_psf_support(scale, theo, 25.0) is None
+    assert local_rms_radius(scale, theo) > 0
+
+
+def test_fit_beam_rejects_an_empty_psf():
+    with pytest.raises(DegeneratePSFError, match="centre pixel"):
+        fit_beam(np.zeros((64, 64), np.float32), 0.0767, 6.0, strict=True)
+    with pytest.raises(DegeneratePSFError, match="centre pixel"):
+        fit_beam(np.full((64, 64), np.nan, np.float32), 0.0767, 6.0, strict=True)
+
+
+def _fit_beam_86afd89(psf, scale_deg, theo):
+    """fit_beam of 86afd89 (no checks)."""
+    from ttcalx_imager.beam import fit_psf_wsclean
+    psf = np.asarray(psf, dtype=np.float32)
+    H, W = psf.shape
+    c = psf[H // 2, W // 2]
+    if c != 0:
+        psf = psf / c
+    maj, mnr, pa = fit_psf_wsclean(psf, max(float(theo), 1.0))
+    return maj * scale_deg, mnr * scale_deg, math.degrees(pa)
+
+
+def _outcome(fn, *a):
+    import warnings
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return ("ok", np.asarray(fn(*a), np.float64).tobytes())
+    except Exception as e:                       # noqa: BLE001
+        return ("raised", type(e).__name__)
+
+
+@pytest.mark.parametrize("kind", ["zeros", "nan", "spike"])
+def test_fit_beam_default_is_86afd89(kind, monkeypatch):
+    """Default (TTCALX_STRICT_BEAM unset): the hour multiscale cleaner fits the beam as before, whatever
+    the PSF -- no DegeneratePSFError turns a previously written hour image into a failed hour job."""
+    monkeypatch.delenv("TTCALX_STRICT_BEAM", raising=False)
+    psf = {"zeros": np.zeros((64, 64), np.float32), "nan": np.full((64, 64), np.nan, np.float32),
+           "spike": np.pad(np.ones((1, 1), np.float32), 31)[:64, :64]}[kind]
+    got = _outcome(fit_beam, psf, 0.0767, 6.0)
+    assert got == _outcome(_fit_beam_86afd89, psf, 0.0767, 6.0)
+    assert got[1] != "DegeneratePSFError"
+    monkeypatch.setenv("TTCALX_STRICT_BEAM", "1")
+    if kind != "spike":
+        assert _outcome(fit_beam, psf, 0.0767, 6.0) == ("raised", "DegeneratePSFError")
 
 
 def test_to_fwhm_pa_circular():

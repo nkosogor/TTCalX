@@ -28,6 +28,14 @@
 residual_power(vis::GPUVisibilities) =
     Float64(sum(abs2, vis.xx .* .!vis.flags) + sum(abs2, vis.yy .* .!vis.flags))
 
+"""`residual_power(vis)` with the masked visibilities in `buf` (Nbase×Nfreq ComplexF64) instead of new arrays."""
+function residual_power!(buf, vis::GPUVisibilities)
+    buf .= vis.xx .* .!vis.flags
+    pxx = sum(abs2, buf)
+    buf .= vis.yy .* .!vis.flags
+    Float64(pxx + sum(abs2, buf))
+end
+
 """
     flag_zero_visibilities!(vis) -> n
 
@@ -43,7 +51,26 @@ function flag_zero_visibilities!(vis::GPUVisibilities)
     n
 end
 
+"""`flag_zero_visibilities!(vis)` with its two masks in buffers of `ws`."""
+function flag_zero_visibilities!(vis::GPUVisibilities, ws::PeelWorkspace)
+    gpu = _is_gpu(vis.xx)
+    zero = _ws_buf!(ws, :zero_mask, Bool, size(vis.xx), gpu, 1; zero=false)
+    new = _ws_buf!(ws, :zero_mask, Bool, size(vis.xx), gpu, 2; zero=false)
+    zero .= (vis.xx .== 0) .& (vis.yy .== 0)
+    new .= zero .& .!vis.flags
+    n = Int(sum(new))
+    vis.flags .|= zero
+    n
+end
+
 _save_gains(cal) = (copy(cal.xx), copy(cal.xy), copy(cal.yx), copy(cal.yy), copy(cal.flags))
+
+function _save_gains!(ws::PeelWorkspace, cal)
+    gpu = _is_gpu(cal.xx)
+    c(q, f) = copyto!(_ws_buf!(ws, :saved_gains, ComplexF64, size(cal.xx), gpu, q; zero=false), getfield(cal, f))
+    (c(1, :xx), c(2, :xy), c(3, :yx), c(4, :yy),
+     copyto!(_ws_buf!(ws, :saved_flags, Bool, size(cal.flags), gpu; zero=false), cal.flags))
+end
 
 function _restore_gains!(cal, saved)
     cal.xx .= saved[1]; cal.xy .= saved[2]; cal.yx .= saved[3]; cal.yy .= saved[4]
@@ -64,22 +91,91 @@ function max_gain_amplitude(cal::GPUCalibration)
     finite, m
 end
 
-function _subtract!(vis, coherency, cal, meta)
-    c = deepcopy_gpu(coherency)
-    gpu_corrupt!(c, cal, meta)
-    gpu_subsrc!(vis, c)
+# The corrupted model goes into `buf` (one scratch per guarded_zest! call, so the
+# loop allocates no visibility-sized arrays).
+function _corrupted!(buf, coherency, cal, meta)
+    for f in (:xx, :xy, :yx, :yy, :flags)
+        copyto!(getfield(buf, f), getfield(coherency, f))
+    end
+    gpu_corrupt!(buf, cal, meta)
 end
 
-function _add!(vis, coherency, cal, meta)
-    c = deepcopy_gpu(coherency)
-    gpu_corrupt!(c, cal, meta)
-    gpu_putsrc!(vis, c)
+# GPU: one fused kernel vis ∓= J₁ C J₂ᴴ (same arithmetic as gpu_corrupt! + gpu_subsrc!/putsrc!,
+# without the scratch copy, the intermediate write and read, and the host syncs)
+@inline function _corrupt_full(c, g1, g2)
+    jv_xx = g1[1] * c[1] + g1[2] * c[3]
+    jv_xy = g1[1] * c[2] + g1[2] * c[4]
+    jv_yx = g1[3] * c[1] + g1[4] * c[3]
+    jv_yy = g1[3] * c[2] + g1[4] * c[4]
+    (jv_xx * conj(g2[1]) + jv_xy * conj(g2[2]), jv_xx * conj(g2[3]) + jv_xy * conj(g2[4]),
+     jv_yx * conj(g2[1]) + jv_yy * conj(g2[2]), jv_yx * conj(g2[3]) + jv_yy * conj(g2[4]))
 end
+
+@inline _corrupt_diag(c, g1, g2) = (g1[1] * c[1] * conj(g2[1]), g1[1] * c[2] * conj(g2[4]),
+                                    g1[4] * c[3] * conj(g2[1]), g1[4] * c[4] * conj(g2[4]))
+
+function corrupt_apply_kernel!(dxx, dxy, dyx, dyy, cxx, cxy, cyx, cyy, gxx, gxy, gyx, gyy,
+                               baselines, Nbase, Nfreq, Nfreq_cal, diag::Bool, subtract::Bool)
+    idx = thread_index_1d()
+    if idx <= Nbase * Nfreq
+        α = ((idx - 1) % Nbase) + 1
+        β = ((idx - 1) ÷ Nbase) + 1
+        a1 = baselines[1, α]; a2 = baselines[2, α]
+        b = Nfreq_cal == 1 ? 1 : β
+        c = (cxx[α, β], cxy[α, β], cyx[α, β], cyy[α, β])
+        g1 = (gxx[a1, b], gxy[a1, b], gyx[a1, b], gyy[a1, b])
+        g2 = (gxx[a2, b], gxy[a2, b], gyx[a2, b], gyy[a2, b])
+        m = diag ? _corrupt_diag(c, g1, g2) : _corrupt_full(c, g1, g2)
+        if subtract
+            dxx[α, β] -= m[1]; dxy[α, β] -= m[2]; dyx[α, β] -= m[3]; dyy[α, β] -= m[4]
+        else
+            dxx[α, β] += m[1]; dxy[α, β] += m[2]; dyx[α, β] += m[3]; dyy[α, β] += m[4]
+        end
+    end
+    return nothing
+end
+
+function _apply_corrupted!(vis, coherency, cal, meta, subtract::Bool)
+    Nb, Nf = size(vis.xx)
+    blocks, threads = kernel_config_1d(Nb * Nf)
+    @cuda blocks=blocks threads=threads corrupt_apply_kernel!(
+        vis.xx, vis.xy, vis.yx, vis.yy, coherency.xx, coherency.xy, coherency.yx, coherency.yy,
+        cal.xx, cal.xy, cal.yx, cal.yy, meta.baselines, Nb, Nf, Nfreq(cal), cal.is_diagonal, subtract)
+    vis
+end
+
+const FUSED_CORRUPT = Ref(false)     # true: one fused kernel (fast_kernels!); false: gpu_corrupt! into a scratch, then subsrc/putsrc (as 748884a)
+_fused(vis, cal) = FUSED_CORRUPT[] && _is_gpu(vis) && _is_gpu(cal)
+_subtract!(vis, coherency, cal, meta, buf) = _fused(vis, cal) ?
+    _apply_corrupted!(vis, coherency, cal, meta, true) :
+    gpu_subsrc!(vis, _corrupted!(buf, coherency, cal, meta))
+_add!(vis, coherency, cal, meta, buf) = _fused(vis, cal) ?
+    _apply_corrupted!(vis, coherency, cal, meta, false) :
+    gpu_putsrc!(vis, _corrupted!(buf, coherency, cal, meta))
+# allocating forms (tests, external callers)
+_scratch(vis, coherency) = FUSED_CORRUPT[] && _is_gpu(vis) ? nothing : deepcopy_gpu(coherency)
+_subtract!(vis, coherency, cal, meta) = _subtract!(vis, coherency, cal, meta, _scratch(vis, coherency))
+_add!(vis, coherency, cal, meta) = _add!(vis, coherency, cal, meta, _scratch(vis, coherency))
+
+"""
+    fast_kernels!(on::Bool) -> on
+    fast_kernels() -> Bool
+
+Switch the GPU kernels added in 0.3.0 for speed: the tiled full-Jones normal equations
+(`TILED_STEPS`), the device RFI fringes (`RFI_GENVIS_KERNEL`) and the fused corrupt-subtract
+(`FUSED_CORRUPT`).  Off by default: the GPU then runs the 0.2.0 (748884a) kernels.  On, the
+results agree with the old kernels to rounding (summation order), not bitwise.  Process-wide.
+"""
+function fast_kernels!(on::Bool)
+    TILED_STEPS[] = on; RFI_GENVIS_KERNEL[] = on; FUSED_CORRUPT[] = on
+    on
+end
+fast_kernels() = TILED_STEPS[] && RFI_GENVIS_KERNEL[] && FUSED_CORRUPT[]
 
 """
     guarded_zest!(vis, meta, coherencies, calibrations, solve;
                   peeliter=3, max_gain=Inf, require_convergence=false,
-                  report=nothing) -> subtracted::BitVector
+                  report=nothing, workspace=nothing) -> subtracted::BitVector
 
 Peel/zest loop of CPU TTCal (`peel!`: subtract every source with its
 starting gains, then `peeliter` passes of add back → solve → subtract), with
@@ -98,30 +194,40 @@ in, or left in the data (the residual never grows from a source update).
 `report(index, iteration; converged, niters, finite, max_gain, p_with, p_old,
 p_new, action)` is called after every update (`action` is :accept,
 :keep_previous or :leave_in).  Returns which sources end up subtracted;
-`calibrations` hold the gains that were used.
+`calibrations` hold the gains that were used.  With a `PeelWorkspace` the residual
+powers, saved gains and the host corruption scratch use its buffers (same results).
 """
 function guarded_zest!(vis::GPUVisibilities, meta::GPUMetadata,
                        coherencies::AbstractVector, calibrations::AbstractVector, solve;
                        peeliter::Integer=3, max_gain::Real=Inf,
-                       require_convergence::Bool=false, report=nothing)
+                       require_convergence::Bool=false, report=nothing,
+                       workspace::Union{Nothing,PeelWorkspace}=nothing)
+    ws = workspace
     N = length(coherencies)
+    all(c -> size(c.xx) == size(vis.xx), coherencies) ||
+        throw(DimensionMismatch("every coherency must have the visibilities' size"))
+    buf = N == 0 || _fused(vis, calibrations[1]) ? nothing :
+          ws === nothing ? deepcopy_gpu(coherencies[1]) : _ws_copy!(ws, :corrupt, coherencies[1])
+    rbuf = ws === nothing ? nothing :
+           _ws_buf!(ws, :residual, ComplexF64, size(vis.xx), _is_gpu(vis.xx); zero=false)
+    power() = rbuf === nothing ? residual_power(vis) : residual_power!(rbuf, vis)
     length(calibrations) == N || throw(ArgumentError("one calibration per coherency"))
     subtracted = trues(N)
     for s in 1:N
-        _subtract!(vis, coherencies[s], calibrations[s], meta)
+        _subtract!(vis, coherencies[s], calibrations[s], meta, buf)
     end
     for iteration in 1:peeliter, s in 1:N
         coherency, cal = coherencies[s], calibrations[s]
-        p_old = subtracted[s] ? residual_power(vis) : Inf
-        subtracted[s] && _add!(vis, coherency, cal, meta)
-        p_with = residual_power(vis)
-        saved = _save_gains(cal)
+        p_old = subtracted[s] ? power() : Inf
+        subtracted[s] && _add!(vis, coherency, cal, meta, buf)
+        p_with = power()
+        saved = ws === nothing ? _save_gains(cal) : _save_gains!(ws, cal)
         converged, niters = solve(cal, vis, coherency)
         finite, gmax = max_gain_amplitude(cal)
         p_new = Inf
         if finite && gmax <= max_gain && (converged || !require_convergence)
-            _subtract!(vis, coherency, cal, meta)
-            p_new = residual_power(vis)
+            _subtract!(vis, coherency, cal, meta, buf)
+            p_new = power()
             if p_new < p_with && p_new <= p_old
                 subtracted[s] = true
                 report === nothing || report(s, iteration; converged, niters, finite,
@@ -129,11 +235,11 @@ function guarded_zest!(vis::GPUVisibilities, meta::GPUMetadata,
                                              action=:accept)
                 continue
             end
-            _add!(vis, coherency, cal, meta)            # undo the new subtraction
+            _add!(vis, coherency, cal, meta, buf)       # undo the new subtraction
         end
         _restore_gains!(cal, saved)
         if p_old < p_with
-            _subtract!(vis, coherency, cal, meta)
+            _subtract!(vis, coherency, cal, meta, buf)
             subtracted[s] = true
             action = :keep_previous
         else
