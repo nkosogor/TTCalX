@@ -14,6 +14,8 @@ Manifest.toml
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
+.pytest_cache/
 
 # Temporary files
 *.tmp
