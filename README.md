@@ -14,7 +14,8 @@ peels bitwise like 748884a; the faster paths are opt-in.
 
 ## Install
 
-On the calim servers TTCalX is pre-installed at `/opt/devel/nkosogor/nkosogor/TTCalX`:
+On the calim servers TTCalX is pre-installed at `/opt/devel/nkosogor/nkosogor/TTCalX` (the `gsi-v2`
+version; to run `main`, see [install.md](docs/src/install.md)):
 
 ```bash
 conda activate /opt/devel/pipeline/envs/py38_orca_nkosogor
@@ -25,6 +26,7 @@ julia --project=/opt/devel/nkosogor/nkosogor/TTCalX /opt/devel/nkosogor/nkosogor
 
 Keep this Julia out of your global `PATH` if you also use the original TTCal (`julia060`); use a
 separate terminal for each. Installation from scratch: [docs/src/install.md](docs/src/install.md).
+Walkthrough (peel, then image): [tutorial](docs/src/tutorial.md).
 Requirements: Julia 1.10+, an NVIDIA GPU with CUDA 11+ (tested on RTX A4000), Python 3 with
 `python-casacore`.
 
@@ -94,4 +96,4 @@ pytest python/ttcalx_imager/tests           # GPU tests skipped without CuPy/CUD
 - `CUDA.functional()` false: check `nvidia-smi`, then
   `julia --project=. -e "using CUDA; println(CUDA.functional())"`.
 - "Package CUDA is required but does not seem to be installed": `JULIA_DEPOT_PATH` must include
-  the shared depot (see Install).
+  the shared depot (see Install), and a clone needs a `Manifest.toml` ([install.md](docs/src/install.md)).

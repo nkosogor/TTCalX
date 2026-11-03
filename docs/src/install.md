@@ -16,6 +16,16 @@ julia --project=/opt/devel/nkosogor/nkosogor/TTCalX /opt/devel/nkosogor/nkosogor
 installed packages, so no per-user installation is needed. Set this in an alias rather than in
 `~/.bashrc` globally; if you also use the original TTCal (`julia060`), use a separate terminal.
 
+The shared install is the version the production pipeline runs (tag `gsi-v2`, 748884a). To run
+another version (e.g. `main`, 0.3.0) with the same depot, clone it and copy the shared install's
+`Manifest.toml` into the clone (the repository has no manifest; without one Julia reports
+"Package CUDA is required but does not seem to be installed"):
+
+```bash
+git clone https://github.com/nkosogor/TTCalX.git && cp /opt/devel/nkosogor/nkosogor/TTCalX/Manifest.toml TTCalX/
+julia --project=TTCalX TTCalX/bin/zest_sky_rfi.jl --help
+```
+
 ## From scratch
 
 ```bash
