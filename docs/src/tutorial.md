@@ -14,7 +14,7 @@ zest() { julia --project=$T $T/bin/zest_sky_rfi.jl "$@"; }
 ```
 
 The shared install is the version the production pipeline runs (tag `gsi-v2`); see
-[Installation](install.md) to run `main` (0.3.0) with the same environment.
+[Installation](install.md) to run `main` (0.3) with the same environment.
 
 ## 1. Quick test (example MS)
 

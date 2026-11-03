@@ -9,7 +9,7 @@ TTCalX extends [TTCal](https://github.com/mweastwood/TTCal.jl) by Michael Eastwo
 Documentation: <https://nkosogor.github.io/TTCalX/>.
 
 **Versions used by the OVRO-LWA GPU pipeline (gsi):** `gsi-v1` (deployed until 2026-10-25),
-`gsi-v2` = 748884a (current production), `v0.3.0` = `main` (gsi v3). With default settings 0.3.0
+`gsi-v2` = 748884a (current production), `v0.3.1` = `main` (gsi v3; same code as `v0.3.0`, updated docs). With default settings 0.3
 peels bitwise like 748884a; the faster paths are opt-in.
 
 ## Install

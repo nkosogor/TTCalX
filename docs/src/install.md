@@ -17,7 +17,7 @@ installed packages, so no per-user installation is needed. Set this in an alias 
 `~/.bashrc` globally; if you also use the original TTCal (`julia060`), use a separate terminal.
 
 The shared install is the version the production pipeline runs (tag `gsi-v2`, 748884a). To run
-another version (e.g. `main`, 0.3.0) with the same depot, clone it and copy the shared install's
+another version (e.g. `main`, 0.3) with the same depot, clone it and copy the shared install's
 `Manifest.toml` into the clone (the repository has no manifest; without one Julia reports
 "Package CUDA is required but does not seem to be installed"):
 

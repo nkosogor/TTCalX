@@ -16,7 +16,7 @@ Source: <https://github.com/nkosogor/TTCalX>.
 |---|---|---|
 | `gsi-v1` | 62f8c54 | until 2026-10-25 |
 | `gsi-v2` | 748884a | current production; the pre-installed copy on the calim servers |
-| `v0.3.0` | `main` | gsi v3; with default settings it peels bitwise like 748884a, the faster paths are opt-in |
+| `v0.3.0`, `v0.3.1` | `main` | gsi v3 (0.3.1: same code, updated docs); with default settings it peels bitwise like 748884a, the faster paths are opt-in |
 
 ## Pages
 
@@ -24,13 +24,11 @@ Source: <https://github.com/nkosogor/TTCalX>.
 Pages = [
     "install.md",
     "tutorial.md",
-    "calibration.md",
-    "sources.md",
-    "kernels.md",
-    "msio.md",
+    "peeling.md",
     "gpu-clean-imager.md",
     "cli.md",
     "api.md",
+    "internals.md",
 ]
 Depth = 1
 ```
