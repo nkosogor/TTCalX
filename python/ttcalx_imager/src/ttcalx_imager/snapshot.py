@@ -443,7 +443,7 @@ class SnapshotImager:
             wr.shutdown(wait=True)
 
 
-def v_rms_from_samples(s, N, scale_deg, robust=0.0, tukey_inner=30.0, svd_tol=1e-4, eps=1e-4):
+def v_rms_from_samples(s, N, scale_deg, robust=0.0, tukey_inner=30.0, svd_tol=1e-4, eps=1e-4, scope="snap"):
     """QA statistic of one loaded snapshot (msio.load_samples dict): std of the central box of the
     dirty Stokes V image made with the snapshot's own Briggs weights (= orca pilot snapshot)."""
     if len(s["u"]) == 0:
@@ -454,6 +454,6 @@ def v_rms_from_samples(s, N, scale_deg, robust=0.0, tukey_inner=30.0, svd_tol=1e
     WG.add(u, v, nw); WG.finalize()
     iw = WG.weights(u, v, nw)
     svd = snapshot_svd(N, sc, float(cp.abs(w).max()), svd_tol)
-    S = SampleSet(u, v, w, iw, N, sc, svd=svd, eps=eps, precompute=False)
+    S = SampleSet(u, v, w, iw, N, sc, svd=svd, eps=eps, precompute=False, scope=scope)
     img = to_ws(S.grid(cp.asarray(s["V"]))) / float(iw.sum())
     return box_std(img)

@@ -51,6 +51,7 @@ run-to-run GPU floor (82 MHz MS hour job vs 748884a, 2026-11-02; 2026-10-27 regr
 | `TTCALX_FAST_COORDS` | `0` | | reprojection coordinates in one kernel with the same float64 operations (each rounded separately: same bits). |
 | `TTCALX_FIT_WINDOW` | `0` | | restoring-beam fit on a centred window of this many pixels (even) instead of copying the whole PSF; falls back to the whole PSF if a fitting box reaches the window (same fit). |
 | `TTCALX_FAST_UPSAMPLE` | `0` | | hour: the 2x band-limited model upsampling as four N-point inverse FFTs (polyphase identity) instead of one zero-padded 2N transform, a slow Bluestein one at the hour sizes (values to float32 rounding; 82 MHz hour -13 s). |
+| `TTCALX_NUFFT_PRUNED` | unset | | `1` (every scope) or a list of `snap,hour`: NUFFTs as cuFINUFFT spread / interpolation only plus our own fine-grid FFT (row FFTs of the occupied band, tiled transposes, contiguous row FFTs; `pruned.py`). Same transform to float32 rounding (5e-7); 82 MHz 8.2 -> 3.4 ms (type 1), 7.7 -> 2.3 ms (type 2); 82 MHz band-hour -29 %. |
 
 `SnapshotImager.image_many` reads with a spawned helper process: scripts calling it need an
 `if __name__ == "__main__":` guard (or `reader="thread"`). Set `CUPY_CACHE_DIR` if the home

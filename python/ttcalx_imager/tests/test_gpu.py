@@ -498,3 +498,38 @@ def test_fast_upsample_polyphase(N, monkeypatch):
         b = fft_upsample(img, 2, T)
         assert a.shape == b.shape == (2 * N, 2 * N) and a.dtype == b.dtype
         assert float(cp.abs(a - b).max()) <= 1e-5 * float(cp.abs(a).max())
+
+
+@pytest.mark.parametrize("N", [96, 250, 3122])
+def test_pruned_nufft_equals_cufinufft(N):
+    """TTCALX_NUFFT_PRUNED: spread-only cuFINUFFT + pruned FFT = cuFINUFFT's own type 1 / type 2 to float32 rounding,
+    for points that fill part of the fine grid (as at the all-sky geometries) and for the full grid."""
+    import cufinufft
+    from ttcalx_imager.pruned import PrunedPlan
+    rng = np.random.default_rng(3)
+    for frac in (0.6, 1.0):
+        M = 4000
+        x = cp.asarray(rng.uniform(-np.pi * frac, np.pi * frac * 0.999, M), cp.float32)
+        y = cp.asarray(rng.uniform(-np.pi * frac, np.pi * frac * 0.999, M) * 0.8, cp.float32)
+        c = cp.asarray(rng.normal(size=M) + 1j * rng.normal(size=M), cp.complex64)
+        f = cp.asarray(rng.normal(size=(N, N)) + 1j * rng.normal(size=(N, N)), cp.complex64)
+        R1 = cufinufft.Plan(1, (N, N), n_trans=1, eps=1e-4, isign=1, dtype="complex64"); R1.setpts(x, y)
+        R2 = cufinufft.Plan(2, (N, N), n_trans=1, eps=1e-4, isign=-1, dtype="complex64"); R2.setpts(x, y)
+        P1 = PrunedPlan(1, N, 1e-4, 1); P1.setpts(x, y)
+        P2 = PrunedPlan(2, N, 1e-4, -1); P2.setpts(x, y)
+        a, b = R1.execute(c), P1.execute(c)
+        assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 2e-6
+        b2 = P1.execute(c)                                      # the fine grid is cleared between calls
+        assert float(cp.abs(b2 - b).max() / cp.abs(b).max()) < 1e-6   # (spreading atomics: not bitwise)
+        a, b = R2.execute(f), P2.execute(f)
+        assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 2e-6
+
+
+def test_pruned_switch_scopes(monkeypatch):
+    from ttcalx_imager import gridder
+    monkeypatch.setenv("TTCALX_NUFFT_PRUNED", "hour")
+    assert gridder.pruned_on("hour") and not gridder.pruned_on("snap")
+    monkeypatch.setenv("TTCALX_NUFFT_PRUNED", "1")
+    assert gridder.pruned_on("snap") and gridder.pruned_on("hour")
+    monkeypatch.delenv("TTCALX_NUFFT_PRUNED")
+    assert not gridder.pruned_on("hour")

@@ -94,7 +94,7 @@ def _fake_sampleset(rec, xp):
     class FakeSampleSet:
         """Folds w >= 0 exactly as gridder.SampleSet (device branch); 'grids' by binning."""
 
-        def __init__(self, u, v, w, wt, N, scale_rad, svd=None, eps=1e-4, precompute=True, pre=None):
+        def __init__(self, u, v, w, wt, N, scale_rad, svd=None, eps=1e-4, precompute=True, pre=None, scope="snap"):
             flip = w < 0
             s = xp.where(flip, -1.0, 1.0).astype(xp.float32)
             u, v, w = u * s, v * s, w * s

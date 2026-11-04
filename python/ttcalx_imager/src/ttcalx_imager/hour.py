@@ -338,7 +338,7 @@ class HourGrid:
             if "wt" not in hc:
                 hc["wt"] = np.concatenate([self.iw[i] for i in ids])
             wt = cp.asarray(hc["wt"])
-        S = SampleSet(u, v, w, wt, self.N, self.sc, svd=self.svd, eps=self.eps, precompute=False)
+        S = SampleSet(u, v, w, wt, self.N, self.sc, svd=self.svd, eps=self.eps, precompute=False, scope="hour")
         if mode != "off" and c is None:
             npts = int(S.npts)
             need = npts * (S.x.itemsize + S.y.itemsize + S.w.itemsize + S.wt.itemsize + 1 + w0.itemsize + 8)
@@ -491,7 +491,7 @@ def snapshot_qa(snaps, N, sdeg, params, qa="auto", qa_dir=None, log=None):
             if os.path.exists(p):
                 r = json.load(open(p)).get("V_rms_box")
         if r is None and qa in ("auto", "compute"):
-            r = v_rms_from_samples(s, N, sdeg, params.robust, params.taper_inner_tukey)
+            r = v_rms_from_samples(s, N, sdeg, params.robust, params.taper_inner_tukey, scope="hour")
         out.append(float("nan") if r is None else float(r))
     return out
 

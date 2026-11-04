@@ -268,17 +268,37 @@ _PLAN_CACHE = {}
 _TOKENS = itertools.count()
 
 
-def get_plans(N, eps=1e-4):
-    """(type-1, type-2) single-transform complex64 cuFINUFFT plans for an N x N image."""
-    if (N, eps) not in _PLAN_CACHE:
-        _PLAN_CACHE[(N, eps)] = [cufinufft.Plan(1, (N, N), n_trans=1, eps=eps, isign=1, dtype="complex64"),
-                                 cufinufft.Plan(2, (N, N), n_trans=1, eps=eps, isign=-1, dtype="complex64"),
-                                 None, None]    # tokens of the SampleSets whose points are set
-    return _PLAN_CACHE[(N, eps)]
+def pruned_on(scope):
+    """TTCALX_NUFFT_PRUNED (default unset = off): "1" / "all" for every plan scope, or a comma list of scopes
+    (snap, hour): those plans are pruned.PrunedPlan (cuFINUFFT spread / interpolation only + a pruned
+    fine-grid FFT; the same NUFFT to float32 FFT rounding)."""
+    v = os.environ.get("TTCALX_NUFFT_PRUNED", "").strip().lower()
+    if v in ("", "0", "off", "none"):
+        return False
+    return v in ("1", "all", "on") or scope in {x.strip() for x in v.split(",")}
+
+
+def get_plans(N, eps=1e-4, scope="snap"):
+    """(type-1, type-2) single-transform complex64 cuFINUFFT plans for an N x N image.  scope: "snap" (snapshot
+    imager) or "hour" (hour stage), for TTCALX_NUFFT_PRUNED."""
+    pr = pruned_on(scope)
+    key = (N, eps, "pruned") if pr else (N, eps)
+    if key not in _PLAN_CACHE:
+        if pr:
+            from .pruned import PrunedPlan
+            _PLAN_CACHE[key] = [PrunedPlan(1, N, eps, 1), PrunedPlan(2, N, eps, -1), None, None]
+        else:
+            _PLAN_CACHE[key] = [cufinufft.Plan(1, (N, N), n_trans=1, eps=eps, isign=1, dtype="complex64"),
+                                cufinufft.Plan(2, (N, N), n_trans=1, eps=eps, isign=-1, dtype="complex64"),
+                                None, None]    # tokens of the SampleSets whose points are set
+    return _PLAN_CACHE[key]
 
 
 def clear_caches():
     _SVD_CACHE.clear(); _PLAN_CACHE.clear(); _FACTOR_CACHE.clear(); _GEOM_CACHE.clear()
+    if pruned_on("snap") or pruned_on("hour"):
+        from . import pruned
+        pruned.clear()
 
 
 # ----------------------------------------------------------------------------- sample sets
@@ -286,9 +306,10 @@ class SampleSet:
     """Visibility samples resident on the GPU, folded to w >= 0, ready for (de)gridding.
 
     u, v, w: per-sample coordinates [lambda], either host float64 (numpy) or device float32
-    (cupy); wt: imaging weights (float32, 0 = not used).  ``svd`` = None disables the w-term."""
+    (cupy); wt: imaging weights (float32, 0 = not used).  ``svd`` = None disables the w-term.
+    scope: the get_plans scope of its NUFFT plans ("snap" / "hour")."""
 
-    def __init__(self, u, v, w, wt, N, scale_rad, svd=None, eps=1e-4, precompute=True, pre=None):
+    def __init__(self, u, v, w, wt, N, scale_rad, svd=None, eps=1e-4, precompute=True, pre=None, scope="snap"):
         self.N = N; self.sc = scale_rad; self.svd = svd
         if pre is not None:             # host arrays of snapshot.prepare_samples (same values as below)
             self.flip = cp.asarray(pre["flip"])
@@ -311,7 +332,7 @@ class SampleSet:
             self.w = w
         self.wt = cp.asarray(wt, dtype=cp.float32)
         self.npts = int(self.w.size)
-        self.plans = get_plans(N, eps)
+        self.plans = get_plans(N, eps, scope)
         self.token = next(_TOKENS)
         self.a = None
         if svd is not None and precompute:
