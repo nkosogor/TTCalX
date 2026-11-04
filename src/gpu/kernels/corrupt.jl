@@ -204,34 +204,8 @@ end
 #                           High-Level Functions                               #
 #==============================================================================#
 
-"""
-    gpu_corrupt!(vis::GPUVisibilities, cal::GPUCalibration, meta::GPUMetadata)
-
-GPU-accelerated corruption of visibilities.
-Computes V = J₁ * V * J₂' for each baseline.
-Falls back to CPU if CUDA is not available.
-"""
-function gpu_corrupt!(vis::GPUVisibilities, cal::GPUCalibration, meta::GPUMetadata)
-    # Use CPU fallback if CUDA is not available OR if data is on CPU
-    if !CUDA.functional() || !data_on_gpu(vis)
-        return cpu_corrupt!(vis, cal, meta)
-    end
-    
-    Nb = Nbase(vis)
-    Nf = Nfreq(vis)
-    
-    blocks, threads = kernel_config_1d(Nb * Nf)
-    
-    @cuda blocks=blocks threads=threads corrupt_kernel!(
-        vis.xx, vis.xy, vis.yx, vis.yy,
-        cal.xx, cal.xy, cal.yx, cal.yy, cal.flags,
-        meta.baselines,
-        Nb, Nf, cal.is_diagonal
-    )
-    
-    CUDA.synchronize()
-    vis
-end
+# gpu_corrupt!(vis, cal, meta): defined in gpu/peel_gpu.jl (a former definition here was always overwritten by
+# that one when TTCalX loads; removed so TTCalX has no method overwrite, which a sysimage build does not allow)
 
 """
     gpu_applycal!(vis::GPUVisibilities, cal::GPUCalibration, meta::GPUMetadata)
@@ -267,61 +241,8 @@ end
 #                           CPU Fallback Functions                             #
 #==============================================================================#
 
-"""
-CPU fallback for corrupt!
-"""
-function cpu_corrupt!(vis::GPUVisibilities, cal::GPUCalibration, meta::GPUMetadata)
-    Nb = Nbase(vis)
-    Nf = Nfreq(vis)
-    baselines = meta.baselines
-    
-    @inbounds for β in 1:Nf
-        for α in 1:Nb
-            ant1 = baselines[1, α]
-            ant2 = baselines[2, α]
-            
-            j1_xx = cal.xx[ant1, β]
-            j1_yy = cal.yy[ant1, β]
-            j2_xx = cal.xx[ant2, β]
-            j2_yy = cal.yy[ant2, β]
-            
-            if cal.is_diagonal
-                vxx = vis.xx[α, β]
-                vxy = vis.xy[α, β]
-                vyx = vis.yx[α, β]
-                vyy = vis.yy[α, β]
-                
-                vis.xx[α, β] = j1_xx * vxx * conj(j2_xx)
-                vis.xy[α, β] = j1_xx * vxy * conj(j2_yy)
-                vis.yx[α, β] = j1_yy * vyx * conj(j2_xx)
-                vis.yy[α, β] = j1_yy * vyy * conj(j2_yy)
-            else
-                j1_xy = cal.xy[ant1, β]
-                j1_yx = cal.yx[ant1, β]
-                j2_xy = cal.xy[ant2, β]
-                j2_yx = cal.yx[ant2, β]
-                
-                vxx = vis.xx[α, β]
-                vxy = vis.xy[α, β]
-                vyx = vis.yx[α, β]
-                vyy = vis.yy[α, β]
-                
-                # J₁ * V
-                t_xx = j1_xx*vxx + j1_xy*vyx
-                t_xy = j1_xx*vxy + j1_xy*vyy
-                t_yx = j1_yx*vxx + j1_yy*vyx
-                t_yy = j1_yx*vxy + j1_yy*vyy
-                
-                # (J₁ * V) * J₂'
-                vis.xx[α, β] = t_xx*conj(j2_xx) + t_xy*conj(j2_xy)
-                vis.xy[α, β] = t_xx*conj(j2_yx) + t_xy*conj(j2_yy)
-                vis.yx[α, β] = t_yx*conj(j2_xx) + t_yy*conj(j2_xy)
-                vis.yy[α, β] = t_yx*conj(j2_yx) + t_yy*conj(j2_yy)
-            end
-        end
-    end
-    vis
-end
+# cpu_corrupt!(vis, cal, meta): defined in gpu/peel_gpu.jl (the former definition here was always overwritten)
+
 """
 CPU fallback for applycal!
 """
