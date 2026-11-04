@@ -294,6 +294,13 @@ def get_plans(N, eps=1e-4, scope="snap"):
     return _PLAN_CACHE[key]
 
 
+def fused_wacc() -> bool:
+    """TTCALX_FUSED_WACC=1 (default 0; pruned plans only): SampleSet.grid accumulates each w-term inside the last
+    gather of the pruned type-1 transform (PrunedPlan.execute_acc) instead of materialising the N x N modes and
+    re-reading them in SvdWTerm.acc_re (the same float operations)."""
+    return os.environ.get("TTCALX_FUSED_WACC", "0") == "1"
+
+
 def clear_caches():
     _SVD_CACHE.clear(); _PLAN_CACHE.clear(); _FACTOR_CACHE.clear(); _GEOM_CACHE.clear()
     if pruned_on("snap") or pruned_on("hour"):
@@ -366,7 +373,13 @@ class SampleSet:
         c = c * self._eph()
         acc = cp.zeros((self.N, self.N), cp.float32)
         idx = self._aidx(); nocopy = idx is not None
+        # TTCALX_FUSED_WACC=1 (pruned plans): each term accumulated inside the transform's last gather
+        fuse = hasattr(self.plans[0], "execute_acc") and fused_wacc()
         for k in range(self.svd.K):
+            if fuse:
+                self.plans[0].execute_acc((c * self._ak(k, idx)).astype(cp.complex64, copy=not nocopy), acc,
+                                          self.svd.jx, self.svd.tx, self.svd.Br[k], self.svd.Bi[k])
+                continue
             f = self.plans[0].execute((c * self._ak(k, idx)).astype(cp.complex64, copy=not nocopy))
             self.svd.acc_re(acc, f, k)
         del idx

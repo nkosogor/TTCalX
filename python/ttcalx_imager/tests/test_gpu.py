@@ -533,3 +533,26 @@ def test_pruned_switch_scopes(monkeypatch):
     assert gridder.pruned_on("snap") and gridder.pruned_on("hour")
     monkeypatch.delenv("TTCALX_NUFFT_PRUNED")
     assert not gridder.pruned_on("hour")
+
+
+def test_fused_wacc_equals_acc_re(monkeypatch):
+    """TTCALX_FUSED_WACC: SampleSet.grid with the w-term accumulated in the pruned transform's last gather = the
+    gather + SvdWTerm.acc_re path (the same float operations)."""
+    from ttcalx_imager import gridder
+    rng = np.random.default_rng(7)
+    N, sc = 512, math.radians(0.25)
+    M = 20000
+    u = rng.uniform(-60, 60, M); v = rng.uniform(-60, 60, M); w = rng.uniform(-8, 8, M)
+    wt = np.ones(M, np.float32)
+    vis = cp.asarray(rng.normal(size=M) + 1j * rng.normal(size=M), cp.complex64)
+    monkeypatch.setenv("TTCALX_NUFFT_PRUNED", "1")
+    gridder.clear_caches()
+    svd = gridder.get_svd(N, sc, float(np.abs(w).max()), 1e-4, quantum=0.25, nw=600, pad=0.0)
+    S = gridder.SampleSet(u, v, w, wt, N, sc, svd=svd)
+    monkeypatch.setenv("TTCALX_FUSED_WACC", "0")
+    a = S.grid(vis)
+    monkeypatch.setenv("TTCALX_FUSED_WACC", "1")
+    b = S.grid(vis)
+    assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 1e-6
+    monkeypatch.delenv("TTCALX_FUSED_WACC")
+    gridder.clear_caches()

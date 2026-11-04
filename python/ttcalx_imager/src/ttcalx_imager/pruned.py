@@ -63,6 +63,43 @@ extern "C" __global__ void ttcalx_tgather(const float2* __restrict__ in, float2*
 """
 _tg = cp.RawKernel(_TSRC, "ttcalx_tgather")
 
+# TTCALX_FUSED_WACC=1 (default 0): the last gather of a type-1 transform fused with gridder.SvdWTerm.acc_re --
+# acc[ix * N + iy] += Re(f[ix, iy] * b_k(ix, iy)) with f[ix, iy] = U[iy, bin(kx_ix)] d[ix] d[iy] (the same float
+# operations as the gather + the "wgrid_acc" kernel, without writing and re-reading the N x N modes)
+_FSRC = r"""
+extern "C" __global__ void ttcalx_tgather_wacc(const float2* __restrict__ in, float* __restrict__ acc,
+    const int N, const int nf, const long long ild, const float2* __restrict__ d,
+    const short* __restrict__ jj, const float* __restrict__ tt, const float* __restrict__ br,
+    const float* __restrict__ bi)
+{
+    __shared__ float2 tile[32][33];
+    const int q0 = blockIdx.x * 32, p0 = blockIdx.y * 32;
+    for (int k = threadIdx.y; k < 32; k += blockDim.y) {
+        const int p = p0 + k, q = q0 + threadIdx.x;
+        if (p < N && q < N) {
+            float2 v = in[(long long)p * ild + (long long)((q - N / 2 + nf) % nf)];
+            const float2 a = d[p], b = d[q];
+            const float2 s = make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+            v = make_float2(v.x * s.x - v.y * s.y, v.x * s.y + v.y * s.x);
+            tile[k][threadIdx.x] = v;
+        }
+    }
+    __syncthreads();
+    for (int k = threadIdx.y; k < 32; k += blockDim.y) {
+        const int q = q0 + k, p = p0 + threadIdx.x;
+        if (p < N && q < N) {
+            const long long i = (long long)q * N + p;
+            const float2 f = tile[threadIdx.x][k];
+            const int j = jj[i]; const float t = tt[i];
+            const float b_re = br[j] + t * (br[j + 1] - br[j]), b_im = bi[j] + t * (bi[j + 1] - bi[j]);
+            const float o = f.x * b_re - f.y * b_im;
+            acc[i] = __fadd_rn(acc[i], o);
+        }
+    }
+}
+"""
+_tgw = cp.RawKernel(_FSRC, "ttcalx_tgather_wacc")
+
 
 def _tgather(inp, out, P, Q, N, nf, ir, ic, orr, oc, d=None):
     """out[orow(q), ocol(p)] = inp[irow(p), icol(q)] (* d[p] d[q]); maps (mode, base) as in the kernel."""
@@ -133,22 +170,30 @@ class PrunedPlan:
         xmin, xmax = (float(v) for v in cp.stack([x.min(), x.max()]).get())
         self._set_band(int(math.floor(xmin * s)), int(math.ceil(xmax * s)))
 
-    def execute(self, data):
+    def _type1_U(self, data):
+        """type 1 up to U (N x nf: the x transform of the N needed ky columns)."""
         N, nf = self.N, self.nf
         B = _bufs(nf, N); G, T, U = B["G"], B["T"], B["U"]
         r0, r1 = self.band; R = r1 - r0; dr = self._dir()
+        self.sp.execute(data, out=G); B["Gs"] = "spread"       # spread (cuFINUFFT clears the grid first)
+        _fft_rows(G, r0, r1, dr)                               # y -> ky along the band rows
+        if B["Ts"] != ("t1", self.band):                       # T: zero outside the band columns
+            T.fill(0); B["Ts"] = ("t1", self.band)
+        # T[j, r0 + a] = G[r0 + a, bin(ky_j)]
+        _tgather(G, T, R, N, N, nf, (0, r0), (1, 0), (0, 0), (0, r0))
+        _fft_rows(T, 0, N, dr, out=U)                          # x -> kx (rows of T = columns of G)
+        return U
+
+    def execute(self, data):
+        N, nf = self.N, self.nf
         if self.t == 1:
-            self.sp.execute(data, out=G); B["Gs"] = "spread"   # spread (cuFINUFFT clears the grid first)
-            _fft_rows(G, r0, r1, dr)                           # y -> ky along the band rows
-            if B["Ts"] != ("t1", self.band):                   # T: zero outside the band columns
-                T.fill(0); B["Ts"] = ("t1", self.band)
-            # T[j, r0 + a] = G[r0 + a, bin(ky_j)]
-            _tgather(G, T, R, N, N, nf, (0, r0), (1, 0), (0, 0), (0, r0))
-            _fft_rows(T, 0, N, dr, out=U)                      # x -> kx (rows of T = columns of G)
+            U = self._type1_U(data)
             f = cp.empty((N, N), cp.complex64)
             # f[ix, iy] = U[iy, bin(kx_ix)] d[ix] d[iy]
             _tgather(U, f, N, N, N, nf, (0, 0), (1, 0), (0, 0), (0, 0), self.d)
             return f
+        B = _bufs(nf, N); G, T, U = B["G"], B["T"], B["U"]
+        r0, r1 = self.band; R = r1 - r0; dr = self._dir()
         f = cp.ascontiguousarray(data, dtype=cp.complex64)
         if B["Ts"] != "t2":                                    # T: zero outside the mode columns
             T.fill(0); B["Ts"] = "t2"
@@ -163,6 +208,16 @@ class PrunedPlan:
         _tgather(U, G, N, R, N, nf, (0, 0), (0, r0), (0, r0), (1, 0))
         _fft_rows(G, r0, r1, dr)                               # ky -> y along the band rows
         return self.sp.execute(G)
+
+    def execute_acc(self, data, acc, jx, tx, br, bi):
+        """TTCALX_FUSED_WACC: type 1 with the result accumulated into acc (float32 [N, N], raw orientation) as
+        gridder.SvdWTerm.acc_re(acc, execute(data), k) does (jx / tx: the w-term table cell / fraction per pixel,
+        br / bi: the b_k table), without materialising the modes."""
+        assert self.t == 1
+        N, nf = self.N, self.nf
+        U = self._type1_U(data)
+        grid = ((N + 31) // 32, (N + 31) // 32)
+        _tgw(grid, (32, 8), (U, acc, np.int32(N), np.int32(nf), np.int64(U.shape[1]), self.d, jx, tx, br, bi))
 
 
 def _nf_of(N, up):
