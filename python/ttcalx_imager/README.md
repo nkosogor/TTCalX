@@ -50,6 +50,7 @@ run-to-run GPU floor (82 MHz MS hour job vs 748884a, 2026-11-02; 2026-10-27 regr
 | `TTCALX_SVD_PREFETCH` | `0` | | snapshot: w-term factors of the neighbouring 0.25-lambda keys computed in a background thread (the same factors). |
 | `TTCALX_FAST_COORDS` | `0` | | reprojection coordinates in one kernel with the same float64 operations (each rounded separately: same bits). |
 | `TTCALX_FIT_WINDOW` | `0` | | restoring-beam fit on a centred window of this many pixels (even) instead of copying the whole PSF; falls back to the whole PSF if a fitting box reaches the window (same fit). |
+| `TTCALX_FAST_UPSAMPLE` | `0` | | hour: the 2x band-limited model upsampling as four N-point inverse FFTs (polyphase identity) instead of one zero-padded 2N transform, a slow Bluestein one at the hour sizes (values to float32 rounding; 82 MHz hour -13 s). |
 
 `SnapshotImager.image_many` reads with a spawned helper process: scripts calling it need an
 `if __name__ == "__main__":` guard (or `reader="thread"`). Set `CUPY_CACHE_DIR` if the home

@@ -480,3 +480,21 @@ def test_fast_coords_bitwise(monkeypatch):
             b = P.coords(R)
             for x, y in zip(a, b):
                 assert x.dtype == y.dtype and x.shape == y.shape and cp.asnumpy(x).tobytes() == cp.asnumpy(y).tobytes()
+
+
+@pytest.mark.parametrize("N", [96, 250, 1508])
+def test_fast_upsample_polyphase(N, monkeypatch):
+    """TTCALX_FAST_UPSAMPLE: the 2x upsampling as four N-point inverse FFTs = the zero-padded 2N transform to
+    float32 FFT rounding, with and without a taper."""
+    from ttcalx_imager.reproject import fft_upsample
+    rng = np.random.default_rng(11)
+    img = cp.asarray(rng.normal(size=(N, N)), cp.float32)
+    f = cp.fft.fftfreq(N)
+    taper = cp.exp(-(f[:, None] ** 2 + f[None, :] ** 2) * 8.0).astype(cp.float32)
+    for T in (None, taper):
+        monkeypatch.setenv("TTCALX_FAST_UPSAMPLE", "0")
+        a = fft_upsample(img, 2, T)
+        monkeypatch.setenv("TTCALX_FAST_UPSAMPLE", "1")
+        b = fft_upsample(img, 2, T)
+        assert a.shape == b.shape == (2 * N, 2 * N) and a.dtype == b.dtype
+        assert float(cp.abs(a - b).max()) <= 1e-5 * float(cp.abs(a).max())

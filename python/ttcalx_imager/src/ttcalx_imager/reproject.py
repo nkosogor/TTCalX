@@ -8,6 +8,8 @@ Flux convention: dirty/residual images are surface brightness (Jy/beam) and are 
 as-is; a *model* (Jy/pixel) moved from frame A to frame B is multiplied by the SIN pixel
 solid-angle Jacobian n_A / n_B (a pixel covers dl dm / n steradian).
 """
+import os
+
 import numpy as np
 import cupy as cp
 from cupyx.scipy import ndimage as cnd
@@ -48,7 +50,6 @@ class Reprojector:
     def coords(self, R):
         """For each pixel of the target grid: (y, x) pixel position in the source frame, validity
         and n in the source frame, where uvw_target = R uvw_source."""
-        import os
         if os.environ.get("TTCALX_FAST_COORDS", "0") == "1":
             N = self.N
             yx = cp.empty((2, N, N), cp.float32); ok = cp.empty((N, N), cp.bool_); ns = cp.empty((N, N), cp.float64)
@@ -94,7 +95,27 @@ def fft_upsample(img, up=2, taper=None):
     F = cp.fft.fft2(img.astype(cp.complex64))
     if taper is not None:
         F *= taper
+    if up == 2 and N % 2 == 0 and img.shape[1] == N and os.environ.get("TTCALX_FAST_UPSAMPLE", "0") == "1":
+        return _upsample2_polyphase(F)
     F = cp.fft.fftshift(F)
     M = N * up; o = (M - N) // 2
     G = cp.zeros((M, M), cp.complex64); G[o:o + N, o:o + N] = F
     return (cp.fft.ifft2(cp.fft.ifftshift(G)).real * (up * up)).astype(cp.float32)
+
+
+def _upsample2_polyphase(F):
+    """fft_upsample(up=2) from the (tapered) N x N spectrum F (fftfreq order, N even) with four N x N inverse FFTs
+    instead of one 2N x 2N: the zero-padded 2N-point inverse DFT at the even / odd output samples is the N-point
+    inverse DFT of F times exp(i pi f / N) ** parity along each axis (f = the fftfreq bin in [-N/2, N/2), as the
+    zero padding places it).  The same values to FFT rounding (TTCALX_FAST_UPSAMPLE=1, default 0): at the hour sizes
+    (2N = 2 x 3122, 2 x 2358, 2 x 1508) the 2N transform is a slow Bluestein one."""
+    N = F.shape[0]
+    f = cp.fft.fftfreq(N, d=1.0 / N)                          # bins -N/2 .. N/2 - 1 (float64)
+    ph = cp.exp(1j * cp.pi * f / N).astype(cp.complex64)
+    out = cp.empty((2 * N, 2 * N), cp.float32)
+    for sy in (0, 1):
+        Fy = F * ph[:, None] if sy else F
+        for sx in (0, 1):
+            out[sy::2, sx::2] = cp.fft.ifft2(Fy * ph[None, :] if sx else Fy).real
+        del Fy
+    return out
