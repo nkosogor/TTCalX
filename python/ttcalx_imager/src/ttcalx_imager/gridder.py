@@ -94,7 +94,10 @@ def _svd_factors(wmax, tol, nw, nx, method=None):
             K += 1
         res = (K, wg, U[:, :K] * S[:K], Vh[:K].copy())
     if len(_FACTOR_CACHE) >= _FACTOR_CACHE_MAX:
-        _FACTOR_CACHE.pop(next(iter(_FACTOR_CACHE)))
+        try:                                  # (snapshot.TTCALX_SVD_PREFETCH fills the cache from a thread)
+            _FACTOR_CACHE.pop(next(iter(_FACTOR_CACHE)))
+        except (RuntimeError, StopIteration, KeyError):
+            pass
     _FACTOR_CACHE[key] = res
     return res
 
@@ -152,9 +155,13 @@ _complex64_of = cp.ElementwiseKernel("float64 re, float64 im", "complex64 out",
 
 # cupy_interp (cupy/_math/misc.py, CuPy 13: x float32, idx int64, xp / fp float32, output double) for the real and
 # the imaginary table at once, then the complex64 cast of cp.interp(re) + 1j * cp.interp(im)
+# (the slope of each table cell is precomputed with cupy_interp's expression, _interp_slope)
+_interp_slope = cp.ElementwiseKernel(
+    "float32 fx1, float32 fx0, float32 fy1, float32 fy0", "float64 slope",
+    "slope = (double)(fy1 - fy0) / ((double)fx1 - (double)fx0);", "ttcalx_interp_slope")
 _AK_INTERP = r"""
 __device__ double ttcalx_interp1(const float x, const long long ix, const float* fx, const float* fy,
-                                 const long long len) {
+                                 const double* sl, const long long len) {
     const long long x_idx = ix - 1;
     double y;
     if (x != x) { y = x; }
@@ -162,7 +169,7 @@ __device__ double ttcalx_interp1(const float x, const long long ix, const float*
     else if (x == fx[len - 1]) { y = fy[len - 1]; }
     else if (x_idx >= len - 1) { y = fy[len - 1]; }
     else {
-        const double slope = (double)(fy[x_idx+1] - fy[x_idx]) / ((double)fx[x_idx+1] - (double)fx[x_idx]);
+        const double slope = sl[x_idx];
         double out = slope * ((double)x - (double)fx[x_idx]) + (double)fy[x_idx];
         if (out != out) {
             out = slope * ((double)x - (double)fx[x_idx+1]) + (double)fy[x_idx+1];
@@ -174,9 +181,10 @@ __device__ double ttcalx_interp1(const float x, const long long ix, const float*
 }
 """
 _ak_fused = cp.ElementwiseKernel(
-    "float32 x, int64 ix, raw float32 fx, raw float32 fr, raw float32 fi, int64 len", "complex64 out",
-    "out = complex<float>((float)ttcalx_interp1(x, ix, &fx[0], &fr[0], len), "
-    "(float)ttcalx_interp1(x, ix, &fx[0], &fi[0], len));",
+    "float32 x, int64 ix, raw float32 fx, raw float32 fr, raw float32 fi, raw float64 sr, raw float64 si, int64 len",
+    "complex64 out",
+    "out = complex<float>((float)ttcalx_interp1(x, ix, &fx[0], &fr[0], &sr[0], len), "
+    "(float)ttcalx_interp1(x, ix, &fx[0], &fi[0], &si[0], len));",
     "ttcalx_ak_fused", preamble=_AK_INTERP)
 
 
@@ -221,10 +229,22 @@ class SvdWTerm:
                 self.wg.dtype == cp.float32 and idx.dtype == cp.int64:
             # both interpolations and the cast in one kernel: cupy_interp's arithmetic, real and imaginary part
             out = cp.empty(w.shape, cp.complex64)
-            _ak_fused(w, idx, self.wg, self.Ar[k], self.Ai[k], self.wg.size, out)
+            sr, si = self._slopes(k)
+            _ak_fused(w, idx, self.wg, self.Ar[k], self.Ai[k], sr, si, self.wg.size, out)
             return out
         re, im = (_interp_on(w, idx, self.wg, f) for f in (self.Ar[k], self.Ai[k]))
         return _complex64_of(re, im)
+
+    def _slopes(self, k):
+        """cupy_interp's per-cell slopes of the a_k tables (real, imaginary), float64, computed with its expression."""
+        sl = getattr(self, "_sl", None)
+        if sl is None:
+            sl = self._sl = {}
+        if k not in sl:
+            n = self.wg.size
+            sl[k] = tuple(_interp_slope(self.wg[1:], self.wg[:-1], f[1:], f[:-1]) for f in (self.Ar[k], self.Ai[k]))
+            assert sl[k][0].size == n - 1
+        return sl[k]
 
     def a_index(self, w):
         """The cp.interp index of w on the a_k table grid (shared by every term)."""
@@ -295,7 +315,9 @@ class SampleSet:
         self.token = next(_TOKENS)
         self.a = None
         if svd is not None and precompute:
-            self.a = [svd.a(k, self.w) for k in range(svd.K)]
+            idx = svd.a_index(self.w) if fast_ak() else None
+            self.a = [svd.a(k, self.w, idx) for k in range(svd.K)]
+            del idx
             self.ephase = cp.exp(1j * cp.pi * self.w).astype(cp.complex64)
 
     def _setpts(self, t):

@@ -14,6 +14,7 @@ geometry (the first snapshot of a geometry costs ~1-2 s extra).
 """
 import json
 import math
+import os
 import time
 import traceback
 from collections import deque
@@ -51,7 +52,28 @@ def snapshot_svd(N, sc, wf, tol):
     if key not in gridder._SVD_CACHE:
         for k in [k for k in gridder._SVD_CACHE if k[4] == 600]:
             del gridder._SVD_CACHE[k]
+        if os.environ.get("TTCALX_SVD_PREFETCH", "0") == "1":
+            _prefetch_factors(wq, tol)
     return get_svd(N, sc, float(wf) * 1.0001 + 1e-6, tol, quantum=0.25, nw=600, pad=0.0)
+
+
+_PREFETCH = {}
+
+
+def _prefetch_factors(wq, tol):
+    """TTCALX_SVD_PREFETCH=1 (default 0): the w-term factors (gridder._svd_factors, host) of the neighbouring
+    0.25-lambda keys are computed in a background thread, so the next snapshot whose w range moves to one of
+    them finds them in gridder's factor cache (the same function and arguments, so the same factors)."""
+    from concurrent.futures import ThreadPoolExecutor
+    ex = _PREFETCH.get("ex")
+    if ex is None:
+        ex = _PREFETCH["ex"] = ThreadPoolExecutor(1, thread_name_prefix="ttcalx-svd-prefetch")
+    for w in (wq + 0.25, wq - 0.25):
+        if w > 0 and (float(w), float(tol), 600, 2001) not in _PREFETCH:
+            _PREFETCH[(float(w), float(tol), 600, 2001)] = ex.submit(gridder._svd_factors, float(w), tol, 600, 2001)
+    if len(_PREFETCH) > 64:              # forget old futures (their factors stay in gridder's cache)
+        for k in [k for k in _PREFETCH if k != "ex"][:32]:
+            _PREFETCH.pop(k, None)
 
 
 
