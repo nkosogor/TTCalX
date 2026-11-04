@@ -525,6 +525,49 @@ def test_pruned_nufft_equals_cufinufft(N):
         assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 2e-6
 
 
+@pytest.mark.parametrize("N", [96, 1508])
+def test_pruned_nufft_edge_wrap(N):
+    """TTCALX_NUFFT_PRUNED with points only near x = -pi (one-sided): cuFINUFFT's spreading wraps them into the
+    last rows of the fine grid, which a band clamped at row 0 would drop; the plan keeps every row then."""
+    import cufinufft
+    from ttcalx_imager.pruned import PrunedPlan
+    rng = np.random.default_rng(11)
+    M = 3000
+    x = cp.asarray(rng.uniform(-np.pi, -0.7 * np.pi, M), cp.float32)
+    y = cp.asarray(rng.uniform(-0.5, 0.5, M), cp.float32)
+    c = cp.asarray(rng.normal(size=M) + 1j * rng.normal(size=M), cp.complex64)
+    f = cp.asarray(rng.normal(size=(N, N)) + 1j * rng.normal(size=(N, N)), cp.complex64)
+    R1 = cufinufft.Plan(1, (N, N), n_trans=1, eps=1e-4, isign=1, dtype="complex64"); R1.setpts(x, y)
+    R2 = cufinufft.Plan(2, (N, N), n_trans=1, eps=1e-4, isign=-1, dtype="complex64"); R2.setpts(x, y)
+    P1 = PrunedPlan(1, N, 1e-4, 1); P1.setpts(x, y)
+    P2 = PrunedPlan(2, N, 1e-4, -1); P2.setpts(x, y)
+    assert P1.band == (0, P1.nf)
+    a, b = R1.execute(c), P1.execute(c)
+    assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 2e-6
+    a, b = R2.execute(f), P2.execute(f)
+    assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 2e-6
+
+
+def test_hour_memos_dropped_after_call(monkeypatch):
+    """image_hour_snaps drops the density memo and the snapshots' PSF memo after the call, also when it raises."""
+    from ttcalx_imager import hour
+
+    class S(dict):
+        pass
+    snaps = [S(stem="a"), S(stem="b")]
+    shared = {("psf_vis", b"R"): 1, "uvmax": 2.0}
+    for s in snaps:
+        s._memo = shared
+
+    def boom(*a, **k):
+        hour._DENSITY_MEMO["k"] = "grid"
+        raise RuntimeError("boom")
+    monkeypatch.setattr(hour, "_image_hour_snaps", boom)
+    with pytest.raises(RuntimeError):
+        hour.image_hour_snaps(snaps, 55, "/nonexistent/x", 0.0, 0.0)
+    assert hour._DENSITY_MEMO == {} and shared == {"uvmax": 2.0}
+
+
 def test_pruned_switch_scopes(monkeypatch):
     from ttcalx_imager import gridder
     monkeypatch.setenv("TTCALX_NUFFT_PRUNED", "hour")

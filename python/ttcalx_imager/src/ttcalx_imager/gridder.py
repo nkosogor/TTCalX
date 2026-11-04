@@ -136,10 +136,22 @@ _wdegrid_in = cp.ElementwiseKernel(
        out = complex<float>(m, 0.f) * conj(b);""", "wdegrid_in")
 
 
+# the CuPy versions whose cupy.interp arithmetic the fused FAST_AK kernel reproduces bitwise (tests/test_gpu.py
+# test_fast_ak_equals_interp); with another version FAST_AK still works but run that test before trusting it
+FAST_AK_TESTED_CUPY = ("13.6.0",)
+_FAST_AK_WARNED = [False]
+
+
 def fast_ak() -> bool:
     """TTCALX_FAST_AK=1 (default 0): SampleSet a_k(w) with one searchsorted per (de)gridding call instead of two per
     term, the a_k complex64 formed in one kernel, and no copy of the already complex64 NUFFT input."""
-    return os.environ.get("TTCALX_FAST_AK", "0") == "1"
+    on = os.environ.get("TTCALX_FAST_AK", "0") == "1"
+    if on and not _FAST_AK_WARNED[0] and cp.__version__ not in FAST_AK_TESTED_CUPY:
+        _FAST_AK_WARNED[0] = True
+        import warnings
+        warnings.warn(f"TTCALX_FAST_AK reproduces cupy.interp of CuPy {', '.join(FAST_AK_TESTED_CUPY)}; this is "
+                      f"CuPy {cp.__version__}: run test_fast_ak_equals_interp before relying on bitwise equality")
+    return on
 
 
 def _interp_on(x, idx, xp, fp):

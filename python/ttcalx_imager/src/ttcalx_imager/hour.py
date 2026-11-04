@@ -536,9 +536,25 @@ def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, b
                             write_aux=write_aux, verbose=verbose, timing=T, t0=t0)
 
 
-def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands.DEEP_I),), mode="wsnap",
-                     block=6, pols="IV", qa="auto", qa_dir=None, exclude=(), exclude_stems=(), beam=None,
-                     write_aux=True, verbose=False, timing=None, t0=None):
+def image_hour_snaps(snaps, *args, **kwargs):
+    """Image one band-hour (:func:`_image_hour_snaps`).  The per-call memos (TTCALX_HOUR_SETUP_FAST density grid,
+    TTCALX_PSF_MEMO PSF visibilities on the snapshots) are dropped before and after the call, also when it
+    raises, so a later call can never see another call's state and the host RAM of the PSF memo is freed."""
+    _DENSITY_MEMO.clear()
+    try:
+        return _image_hour_snaps(snaps, *args, **kwargs)
+    finally:
+        _DENSITY_MEMO.clear()
+        for s in snaps:
+            memo = getattr(s, "_memo", None)
+            if memo:
+                for k in [k for k in memo if isinstance(k, tuple) and k[:1] == ("psf_vis",)]:
+                    del memo[k]
+
+
+def _image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands.DEEP_I),), mode="wsnap",
+                      block=6, pols="IV", qa="auto", qa_dir=None, exclude=(), exclude_stems=(), beam=None,
+                      write_aux=True, verbose=False, timing=None, t0=None):
     """Image one band-hour from loaded snapshots: msio.load_samples dicts (:func:`image_hour`)
     or gsiv.LazySnap mappings (an archive / the gsi v3 hour store), any order.
 
@@ -705,7 +721,6 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
             summary["products"][prod.v_tag] = [dict(name=o["name"], n_snap=o["n_snap"],
                                                     files=[f for f in o.get("files", []) if prod.v_tag in os.path.basename(f)])
                                                for o in outs]
-    _DENSITY_MEMO.clear()
     T["TOTAL"] = time.perf_counter() - t0
     json.dump(summary, open(f"{out_prefix}-summary.json", "w"), indent=1, default=float)
     return summary

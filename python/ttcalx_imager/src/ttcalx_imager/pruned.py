@@ -158,9 +158,13 @@ class PrunedPlan:
 
     def _set_band(self, lo, hi):
         nf = self.nf
-        r0 = max(0, (nf // 2 + lo - self.h) // _Q * _Q)
-        r1 = min(nf, -(-(nf // 2 + hi + self.h) // _Q) * _Q)
-        self.band = (r0, r1)
+        a, b = nf // 2 + lo - self.h, nf // 2 + hi + self.h
+        if a < 0 or b > nf:
+            # the spreading wraps periodically across the grid edge (cuFINUFFT): rows on the other side are
+            # occupied too, so keep every row (the unpruned transform)
+            self.band = (0, nf)
+            return
+        self.band = (a // _Q * _Q, min(nf, -(-b // _Q) * _Q))
 
     def setpts(self, x, y):
         if self.d is None:
