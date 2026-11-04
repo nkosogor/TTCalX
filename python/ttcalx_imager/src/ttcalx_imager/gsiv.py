@@ -691,6 +691,28 @@ class RecordWriter:
 
 # END shared section
 
+# imager-only helpers (TTCALX_FAST_EXPAND), outside the section shared with gsi v3 hourstore.py
+
+_UNPACK_GPU = None
+
+
+def fast_expand() -> bool:
+    """TTCALX_FAST_EXPAND=1 (default 0): LazySnap expansions on the GPU unpack the kept mask there (from the
+    packed bits, 1/8 of the bytes) and :meth:`LazySnap.expand_uvw` uploads uvw / the mask once for u, v, w;
+    the expanded arrays are the same values (the same bits, the same float64 multiply and cast)."""
+    return os.environ.get("TTCALX_FAST_EXPAND", "0") == "1"
+
+
+def unpack_mask_gpu(bits: np.ndarray, shape: Sequence[int], cp):
+    """:func:`unpack_mask` on the GPU (bit i of the little-endian packed bits -> element i)."""
+    global _UNPACK_GPU
+    if _UNPACK_GPU is None:
+        _UNPACK_GPU = cp.ElementwiseKernel("raw uint8 b", "bool ok", "ok = (b[i >> 3] >> (i & 7)) & 1;",
+                                           "gsiv_unpack_little")
+    out = cp.empty(int(np.prod(shape, dtype=np.int64)), dtype=cp.bool_)
+    _UNPACK_GPU(cp.asarray(bits), out)
+    return out.reshape(tuple(shape))
+
 
 # ----------------------------------------------------------------------------- records <-> samples
 def record_from_samples(c: Dict[str, Any], peel: Optional[Dict[str, Any]] = None
@@ -770,8 +792,16 @@ class LazySnap(Mapping):
         return int(self.meta["n"])
 
     def ok(self, xp=np):
+        if xp is not np and fast_expand() and hasattr(xp, "ElementwiseKernel"):
+            return unpack_mask_gpu(self.arrays["ok_bits"], self.meta["ok_shape"], xp)
         m = unpack_mask(self.arrays["ok_bits"], self.meta["ok_shape"])
         return m if xp is np else xp.asarray(m)
+
+    def expand_uvw(self, xp=np):
+        """(u, v, w) = expand("u"), expand("v"), expand("w") with one mask and one uvw transfer."""
+        ok = self.ok(xp)
+        uvw, f = xp.asarray(self.arrays["uvw"]), xp.asarray(self.arrays["freqs"])
+        return tuple(expand_coord(uvw, k, f, ok, xp) for k in range(3))
 
     def expand(self, k: str, xp=np):
         ok = self.ok(xp)

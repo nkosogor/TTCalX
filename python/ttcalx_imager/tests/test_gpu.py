@@ -400,3 +400,50 @@ def test_fast_settings_agree_with_defaults_to_rounding(monkeypatch):
     monkeypatch.setenv("TTCALX_RMS_FILTER", "circulant")
     r1 = clean.rms_image(img, 3.0)
     assert float(cp.abs(r1 - r0).max()) < 1e-4 * float(r0.max())
+
+
+def test_gsiv_gpu_unpack_and_expand_uvw(monkeypatch):
+    """TTCALX_FAST_EXPAND: the GPU mask unpack equals gsiv.unpack_mask and expand_uvw on the GPU equals
+    the host expansion bit for bit."""
+    from ttcalx_imager import gsiv
+    rng = np.random.default_rng(3)
+    for shape in ((7, 3), (1000, 48), (61776, 48)):
+        ok = rng.uniform(size=shape) < 0.6
+        bits = gsiv.pack_mask(ok)
+        assert np.array_equal(cp.asnumpy(gsiv.unpack_mask_gpu(bits, shape, cp)), gsiv.unpack_mask(bits, shape))
+    nrow, nchan = 500, 48
+    ok = rng.uniform(size=(nrow, nchan)) < 0.6
+    meta = dict(path="x", stem="s", time=1.0, tstart=1.0, nrow=nrow, nchan=nchan, flagfrac=0.4, zero_frac=0.0,
+                telescope="OVRO_LWA", observer="", field_name="", pd=(0.0, 0.0), n=int(ok.sum()), ok_shape=[nrow, nchan])
+    arrays = dict(uvw=rng.normal(scale=300, size=(nrow, 3)), freqs=np.linspace(50e6, 55e6, nchan),
+                  chan_width=np.full(nchan, 1e5), natw=rng.uniform(size=nrow).astype(np.float32),
+                  ok_bits=gsiv.pack_mask(ok))
+    s = gsiv.LazySnap(meta, arrays, np.eye(3), None)
+    monkeypatch.setenv("TTCALX_FAST_EXPAND", "1")
+    for a, k in zip(s.expand_uvw(cp), "uvw"):
+        b = s.expand(k)
+        assert a.dtype == b.dtype and np.array_equal(cp.asnumpy(a), b), k
+    assert np.array_equal(cp.asnumpy(s.expand("nw", cp)), s.expand("nw"))
+
+
+def test_fast_ak_equals_interp(monkeypatch):
+    """TTCALX_FAST_AK: a_k(w) from one shared searchsorted equals cp.interp's (values bit for bit), and the
+    gridded / degridded results equal the default path."""
+    rng = np.random.default_rng(7)
+    N, sc = 96, 0.015
+    u, v, w = _samples(20000, 20.0, 40.0, seed=5)
+    svd = SvdWTerm(N, sc, np.abs(w).max() + 1e-3, tol=1e-4)
+    S = SampleSet(u, v, w, rng.uniform(0.5, 1.5, u.size).astype(np.float32), N, sc, svd=svd, precompute=False)
+    wd = S.w
+    idx = svd.a_index(wd)
+    for k in range(svd.K):
+        a0, a1 = svd.a(k, wd), svd.a(k, wd, idx)
+        assert a1.dtype == a0.dtype and bool((a0 == a1).all()), k
+    vis = cp.asarray((rng.normal(size=u.size) + 1j * rng.normal(size=u.size)).astype(np.complex64))
+    model = cp.zeros((N, N), cp.float32); model[30, 70] = 2.0; model[60, 20] = -0.7
+    monkeypatch.setenv("TTCALX_FAST_AK", "0")
+    g0, d0 = cp.asnumpy(S.grid(vis)), cp.asnumpy(S.degrid(model))
+    monkeypatch.setenv("TTCALX_FAST_AK", "1")
+    g1, d1 = cp.asnumpy(S.grid(vis)), cp.asnumpy(S.degrid(model))
+    # cuFINUFFT's atomics make repeated gridding equal to rounding only; the inputs are the same
+    assert np.abs(g1 - g0).max() <= 1e-5 * np.abs(g0).max() and np.abs(d1 - d0).max() <= 1e-5 * np.abs(d0).max()

@@ -133,6 +133,53 @@ _wdegrid_in = cp.ElementwiseKernel(
        out = complex<float>(m, 0.f) * conj(b);""", "wdegrid_in")
 
 
+def fast_ak() -> bool:
+    """TTCALX_FAST_AK=1 (default 0): SampleSet a_k(w) with one searchsorted per (de)gridding call instead of two per
+    term, the a_k complex64 formed in one kernel, and no copy of the already complex64 NUFFT input."""
+    return os.environ.get("TTCALX_FAST_AK", "0") == "1"
+
+
+def _interp_on(x, idx, xp, fp):
+    """cp.interp(x, xp, fp) (real fp) with its searchsorted index given: CuPy's own interpolation kernel."""
+    from cupy._math.misc import _get_interp_kernel
+    out = cp.empty(x.shape, dtype=cp.float64)
+    _get_interp_kernel(False)(x, idx, xp, fp, xp.size, fp[0], fp[-1], out)
+    return out
+
+
+_complex64_of = cp.ElementwiseKernel("float64 re, float64 im", "complex64 out",
+                                     "out = complex<float>((float)re, (float)im);", "ttcalx_complex64_of")
+
+# cupy_interp (cupy/_math/misc.py, CuPy 13: x float32, idx int64, xp / fp float32, output double) for the real and
+# the imaginary table at once, then the complex64 cast of cp.interp(re) + 1j * cp.interp(im)
+_AK_INTERP = r"""
+__device__ double ttcalx_interp1(const float x, const long long ix, const float* fx, const float* fy,
+                                 const long long len) {
+    const long long x_idx = ix - 1;
+    double y;
+    if (x != x) { y = x; }
+    else if (x_idx < 0) { y = fy[0]; }
+    else if (x == fx[len - 1]) { y = fy[len - 1]; }
+    else if (x_idx >= len - 1) { y = fy[len - 1]; }
+    else {
+        const double slope = (double)(fy[x_idx+1] - fy[x_idx]) / ((double)fx[x_idx+1] - (double)fx[x_idx]);
+        double out = slope * ((double)x - (double)fx[x_idx]) + (double)fy[x_idx];
+        if (out != out) {
+            out = slope * ((double)x - (double)fx[x_idx+1]) + (double)fy[x_idx+1];
+            if ((out != out) && (fy[x_idx] == fy[x_idx+1])) { out = fy[x_idx]; }
+        }
+        y = out;
+    }
+    return y;
+}
+"""
+_ak_fused = cp.ElementwiseKernel(
+    "float32 x, int64 ix, raw float32 fx, raw float32 fr, raw float32 fi, int64 len", "complex64 out",
+    "out = complex<float>((float)ttcalx_interp1(x, ix, &fx[0], &fr[0], len), "
+    "(float)ttcalx_interp1(x, ix, &fx[0], &fi[0], len));",
+    "ttcalx_ak_fused", preamble=_AK_INTERP)
+
+
 class SvdWTerm:
     """exp(-2 pi i w x') ~= sum_k a_k(w) b_k(x'),  w in [0, wmax], x' in [-1/2, 1/2]."""
 
@@ -163,8 +210,25 @@ class SvdWTerm:
         _wdegrid_in(m.ravel(), self.jx, self.tx, self.Br[k], self.Bi[k], out.ravel())
         return out
 
-    def a(self, k, w):
-        return (cp.interp(w, self.wg, self.Ar[k]) + 1j * cp.interp(w, self.wg, self.Ai[k])).astype(cp.complex64)
+    def a(self, k, w, idx=None):
+        """a_k(w) as complex64.  idx (TTCALX_FAST_AK): cp.searchsorted(self.wg, w, side='right'), computed once for
+        all terms; the interpolation is then CuPy's own cp.interp kernel on that index (the same values) and the
+        complex64 result is formed in one kernel (the cast of cp.interp(re) + 1j * cp.interp(im), to the sign of a
+        zero)."""
+        if idx is None:
+            return (cp.interp(w, self.wg, self.Ar[k]) + 1j * cp.interp(w, self.wg, self.Ai[k])).astype(cp.complex64)
+        if os.environ.get("TTCALX_FAST_AK_FUSED", "1") == "1" and w.dtype == cp.float32 and \
+                self.wg.dtype == cp.float32 and idx.dtype == cp.int64:
+            # both interpolations and the cast in one kernel: cupy_interp's arithmetic, real and imaginary part
+            out = cp.empty(w.shape, cp.complex64)
+            _ak_fused(w, idx, self.wg, self.Ar[k], self.Ai[k], self.wg.size, out)
+            return out
+        re, im = (_interp_on(w, idx, self.wg, f) for f in (self.Ar[k], self.Ai[k]))
+        return _complex64_of(re, im)
+
+    def a_index(self, w):
+        """The cp.interp index of w on the a_k table grid (shared by every term)."""
+        return cp.searchsorted(self.wg, w, side="right")
 
 
 _SVD_CACHE = {}
@@ -240,8 +304,12 @@ class SampleSet:
             self.plans[t - 1].setpts(self.x, self.y)
             self.plans[t + 1] = self.token
 
-    def _ak(self, k):
-        return self.a[k] if self.a is not None else self.svd.a(k, self.w)
+    def _ak(self, k, idx=None):
+        return self.a[k] if self.a is not None else self.svd.a(k, self.w, idx)
+
+    def _aidx(self):
+        """The a_k table index of this set's w for one (de)gridding call (TTCALX_FAST_AK), else None."""
+        return self.svd.a_index(self.w) if (self.a is None and fast_ak()) else None
 
     def _eph(self):
         return self.ephase if self.a is not None else cp.exp(1j * cp.pi * self.w).astype(cp.complex64)
@@ -254,9 +322,11 @@ class SampleSet:
             return self.plans[0].execute(c.astype(cp.complex64)).real
         c = c * self._eph()
         acc = cp.zeros((self.N, self.N), cp.float32)
+        idx = self._aidx(); nocopy = idx is not None
         for k in range(self.svd.K):
-            f = self.plans[0].execute((c * self._ak(k)).astype(cp.complex64))
+            f = self.plans[0].execute((c * self._ak(k, idx)).astype(cp.complex64, copy=not nocopy))
             self.svd.acc_re(acc, f, k)
+        del idx
         return cp.where(self.svd.inside, acc, 0)
 
     def grid_psf(self):
@@ -269,8 +339,10 @@ class SampleSet:
         self._setpts(2)
         m = cp.ascontiguousarray(from_ws(model_ws).astype(cp.float32))
         q = cp.zeros(self.npts, cp.complex64)
+        idx = self._aidx()
         for k in range(self.svd.K):
-            q += cp.conj(self._ak(k)) * self.plans[1].execute(self.svd.model_conj_b(m, k))
+            q += cp.conj(self._ak(k, idx)) * self.plans[1].execute(self.svd.model_conj_b(m, k))
+        del idx
         q *= cp.conj(self._eph())
         return cp.where(self.flip, cp.conj(q), q)
 

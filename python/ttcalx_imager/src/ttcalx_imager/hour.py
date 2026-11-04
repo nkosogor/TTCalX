@@ -37,6 +37,7 @@ from . import bands
 from .clean import deconvolve_multiscale
 from .fits import make_header, write_image
 from .gridder import SampleSet, get_svd, to_ws
+from .gsiv import fast_expand
 from .msio import load_samples
 from .qa import qa_reject
 from .reproject import Reprojector, fft_upsample, prefilter
@@ -82,6 +83,9 @@ def _uvmax(s):
     if hasattr(s, "uvmax"):
         return s.uvmax()
     return float(np.sqrt(s["u"] ** 2 + s["v"] ** 2 + s["w"] ** 2).max())
+
+
+_DENSITY_MEMO = {}      # TTCALX_HOUR_SETUP_FAST: (snapshot set, geometry) -> WeightGrid density grid (one entry)
 
 
 # ----------------------------------------------------------------------------- chunk cache control
@@ -165,23 +169,40 @@ class HourGrid:
         t0 = time.perf_counter()
 
         def rot_uvw(i):
-            u, v, w, _ = self._rot([i], self._dev(i, "u"), self._dev(i, "v"), self._dev(i, "w"))
+            u, v, w, _ = self._rot([i], *self._dev3(i))
             return u, v, w
 
+        # TTCALX_HOUR_SETUP_FAST=1 (default 0): the density grid of a snapshot set is computed once and re-used by
+        # every product with the same snapshots (it depends on u, v and the natural weights only; robust and the
+        # taper enter in finalize / weights), and the weights, their sum and wmax come from one rotation pass
+        fast = os.environ.get("TTCALX_HOUR_SETUP_FAST", "0") == "1"
+        sw = 0.0; wmax = 0.0; done = False
         if weights is None:
             WG = WeightGrid(N, self.sc, robust, tukey_inner)
-            for i, s in enumerate(snaps):
-                u, v, _ = rot_uvw(i); WG.add(u, v, self._dev(i, "nw"))
+            key = None
+            if fast:
+                key = (tuple(s["stem"] for s in snaps), N, round(self.sc, 15), WG.npix,
+                       b"".join(np.asarray(s["R"], np.float64).tobytes() for s in snaps))
+            if key is not None and key in _DENSITY_MEMO:
+                WG.grid = _DENSITY_MEMO[key]
+            else:
+                for i, s in enumerate(snaps):
+                    u, v, _ = rot_uvw(i); WG.add(u, v, self._dev(i, "nw"))
+                if key is not None:
+                    _DENSITY_MEMO.clear(); _DENSITY_MEMO[key] = WG.grid
             WG.finalize()
             self.iw = []
             for i, s in enumerate(snaps):
-                u, v, _ = rot_uvw(i); self.iw.append(cp.asnumpy(WG.weights(u, v, self._dev(i, "nw"))))
+                u, v, w = rot_uvw(i); self.iw.append(cp.asnumpy(WG.weights(u, v, self._dev(i, "nw"))))
+                if fast:
+                    sw += float(self.iw[i].sum()); wmax = max(wmax, float(cp.abs(w).max()))
+            done = fast
         else:
             self.iw = weights
-        sw = 0.0; wmax = 0.0
-        for i in range(len(snaps)):
-            _, _, w = rot_uvw(i)
-            sw += float(self.iw[i].sum()); wmax = max(wmax, float(cp.abs(w).max()))
+        if not done:
+            for i in range(len(snaps)):
+                _, _, w = rot_uvw(i)
+                sw += float(self.iw[i].sum()); wmax = max(wmax, float(cp.abs(w).max()))
         self.sumw = sw
         self.svd = get_svd(N, self.sc, wmax, svd_tol) if need_svd else None
         self.chunks = self._subchunks(range(len(snaps)))
@@ -205,6 +226,17 @@ class HourGrid:
 
     def _cat_dev(self, ids, k):
         return cp.concatenate([self._dev(i, k) for i in ids])
+
+    def _dev3(self, i):
+        """(u, v, w) of snapshot i on the GPU (= _dev(i, 'u'), ...; TTCALX_FAST_EXPAND: one transfer)."""
+        s = self.snaps[i]
+        if hasattr(s, "expand_uvw") and fast_expand():
+            return s.expand_uvw(cp)
+        return tuple(self._dev(i, k) for k in ("u", "v", "w"))
+
+    def _cat_dev3(self, ids):
+        parts = [self._dev3(i) for i in ids]
+        return tuple(cp.concatenate([p[k] for p in parts]) for k in range(3))
 
     def _subchunks(self, ids):
         out = []; cur = []; n = 0
@@ -236,9 +268,18 @@ class HourGrid:
         1 in the hour frame (exp(2 pi i (w_hour - w_block)) in a w-snapshot block frame)."""
         s = self.snaps[i]
         Rh = s.get("R_hour", s["R"])
-        u, v, w = (self._dev(i, k).astype(cp.float64) for k in ("u", "v", "w"))
+        memo = getattr(s, "_memo", None) if os.environ.get("TTCALX_PSF_MEMO", "0") == "1" else None
+        key = ("psf_vis", np.asarray(Rh, np.float64).tobytes())
+        if memo is not None and key in memo:
+            # TTCALX_PSF_MEMO=1 (default 0): the snapshot's PSF visibilities depend only on its samples and R_hour,
+            # so every product / interval re-uses the first computation (kept on the host, ~8 B per sample)
+            return cp.asarray(memo[key])
+        u, v, w = (x.astype(cp.float64) for x in self._dev3(i))
         wh = Rh[2, 0] * u + Rh[2, 1] * v + Rh[2, 2] * w
-        return cp.exp(2j * np.pi * (wh - w)).astype(cp.complex64)
+        out = cp.exp(2j * np.pi * (wh - w)).astype(cp.complex64)
+        if memo is not None:
+            memo[key] = cp.asnumpy(out)
+        return out
 
     def _chunk(self, ids, col):
         """(SampleSet, rotated visibilities of ``col``) of the snapshots ``ids``.
@@ -284,8 +325,8 @@ class HourGrid:
         if store:
             vis = cp.concatenate([self._psf_vis(i) for i in ids]) if col == "PSF" else (
                 self._cat_dev(ids, col) if col else None)
-            w0 = self._cat_dev(ids, "w")
-            u, v, w, vis = self._rot(ids, self._cat_dev(ids, "u"), self._cat_dev(ids, "v"), w0, vis)
+            u0, v0, w0 = self._cat_dev3(ids)
+            u, v, w, vis = self._rot(ids, u0, v0, w0, vis)
             wt = cp.concatenate([cp.asarray(self.iw[i]) for i in ids])
         else:
             if col == "PSF":
@@ -319,6 +360,43 @@ class HourGrid:
             elif not store:
                 self._cache[key] = dict(host=hc)
         return S, vis
+
+    def _vis_for(self, ids, col, S, w0):
+        """Rotated visibilities of column ``col`` for the SampleSet S of snapshots ``ids`` (w0: their
+        stored-frame w): the expressions of _chunk's device-cache branch, so the values are the ones
+        _chunk(ids, col) returns."""
+        if col == "PSF":
+            vis = cp.concatenate([self._psf_vis(i) for i in ids])
+        elif os.environ.get("TTCALX_CHUNK_CACHE", "off") == "store":
+            vis = self._cat_dev(ids, col)
+        else:
+            vis = cp.asarray(np.concatenate([self.snaps[i][col] for i in ids]))
+        if self.rotate:      # rotate_samples: vis * exp(2 pi i (w - w')), w' = unfolded S.w
+            wn = cp.where(S.flip, -S.w, S.w)
+            vis = vis * cp.exp(2j * np.pi * (w0 - wn)).astype(vis.dtype)
+        return vis
+
+    def image_multi(self, cols):
+        """[image(c) for c in cols] (dirty images, no model) with one SampleSet per chunk: the chunk is
+        built (or taken from the cache) and its points set once for all columns."""
+        accs = [cp.zeros((self.N, self.N), cp.float32) for _ in cols]; sumw = 0.0
+        for chunk in self.chunks:
+            S, vis = self._chunk(chunk, cols[0])
+            sumw += float(S.wt.sum())
+            accs[0] += S.grid(vis); del vis
+            if len(cols) > 1:
+                c = self._cache.get(tuple(chunk))
+                if c is not None and "S" in c:
+                    w0 = c["w0"]
+                elif os.environ.get("TTCALX_CHUNK_CACHE", "off") == "store":
+                    w0 = self._cat_dev(chunk, "w")
+                else:
+                    w0 = cp.asarray(np.concatenate([self.snaps[i]["w"] for i in chunk]))
+                for j, col in enumerate(cols[1:], 1):
+                    vis = self._vis_for(chunk, col, S, w0)
+                    accs[j] += S.grid(vis); del vis
+            del S
+        return [to_ws(a) / sumw for a in accs]
 
     def image(self, col="I", model=None, psf=False, ids=None):
         """Weighted dirty (model=None) or residual image / sum of weights, WSClean orientation.
@@ -367,6 +445,20 @@ class WSnap:
             t = cp.clip((q - umax) / max(qn - umax, 1), 0, 1)
             self._T = cp.where(q <= umax, 1.0, 0.5 * (1 + cp.cos(cp.pi * t))).astype(cp.float32)
         return fft_upsample(M, self.up, self._T)
+
+    def image_multi(self, cols):
+        """[image(c) for c in cols] (dirty images) in one pass over the blocks (HourGrid.image_multi),
+        each block image reprojected with the same coordinates as image() computes for it."""
+        accs = [cp.zeros((self.N, self.N), cp.float32) for _ in cols]; wsum = 0.0
+        for g, R in zip(self.sub, self.Rb):
+            ds = g.image_multi(cols)
+            co = self.P.coords(R)
+            for j, d in enumerate(ds):
+                r, _ = self.P(d, R, self.order, coords=co)
+                accs[j] += g.sumw * r
+            wsum += g.sumw
+            del ds
+        return [a / wsum for a in accs]
 
     def image(self, col="I", model=None):
         acc = cp.zeros((self.N, self.N), cp.float32); wsum = 0.0
@@ -473,6 +565,9 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
     # (raise, as 86afd89) for MS hour jobs; the archive / in-memory entry points (cli --archive,
     # run_hour_snaps: gsi v3) turn it on
     oom_fallback = os.environ.get("TTCALX_CACHE_OOM_FALLBACK", "0") == "1"
+    # TTCALX_HOUR_MULTI=1 (default 0): an I product's dirty I, PSF and (if made) dirty V are gridded in one
+    # pass over the chunks (one SampleSet / setpts per chunk instead of three), the same images
+    multi = os.environ.get("TTCALX_HOUR_MULTI", "0") == "1"
     if keep_plans:
         cp.fft.config.get_plan_cache().set_memsize(int(float(os.environ.get("TTCALX_FFT_PLAN_CACHE_GB", "1.5")) * 1e9))
     N, sdeg = bands.geometry(band)
@@ -513,7 +608,9 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
                 imgfn = W.image
             else:
                 imgfn = G.image
+            multi_fn = W.image_multi if mode == "wsnap" else G.image_multi
             lap(f"{key}: weights + gridder setup")
+            vpre = None
             s0 = sn[0]
             hist = (f"ttcalx-image hour ({mode}, block {block}): {key} multiscale={params.multiscale} "
                     f"bias {params.multiscale_scale_bias} niter={params.niter} mgain={params.mgain} "
@@ -525,9 +622,16 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
                                         history=[hist])
             files = []; di = {}; theo = theoretical_beam_pix(sn, G.sc)
             if prod.image_i:
-                dirty = imgfn("I"); lap(f"{tag}: dirty I")
-                # PSF with the w-term in the hour frame, as WSClean (w-snapshot gridded like the data)
-                psf = imgfn("PSF"); psf = psf / psf[N // 2, N // 2]; lap(f"{tag}: psf")
+                if multi:
+                    # TTCALX_HOUR_MULTI: dirty I, the PSF and dirty V in one pass over the chunks (the same images)
+                    out3 = multi_fn(["I", "PSF"] + (["V"] if prod.v_tag else []))
+                    dirty, psf = out3[0], out3[1]; vpre = out3[2] if prod.v_tag else None
+                    del out3
+                    psf = psf / psf[N // 2, N // 2]; lap(f"{tag}: dirty I + psf" + (" + dirty V" if prod.v_tag else ""))
+                else:
+                    dirty = imgfn("I"); lap(f"{tag}: dirty I")
+                    # PSF with the w-term in the hour frame, as WSClean (w-snapshot gridded like the data)
+                    psf = imgfn("PSF"); psf = psf / psf[N // 2, N // 2]; lap(f"{tag}: psf")
                 restored, R, M, di = deconvolve_multiscale(dirty, psf, sdeg, theo, params,
                                                            residual_fn=lambda m: imgfn("I", model=m), beam=beam, log=log)
                 lap(f"{tag}: deconvolution (incl. major cycles)")
@@ -540,7 +644,10 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
                 del dirty, psf, restored, R, M
             if prod.v_tag:
                 vkey = prod.v_tag if prod.naming == "orca" else tag
-                v = imgfn("V"); lap(f"{vkey}: dirty V")
+                if vpre is not None:
+                    v = vpre; vpre = None
+                else:
+                    v = imgfn("V"); lap(f"{vkey}: dirty V")
                 h = hdr(di.get("beam"))
                 vname = fn["V"] if prod.naming == "legacy" else f"{out_prefix}-{prod.v_tag}{tsfx}-image.fits"
                 files.append(write_image(vname, v, h, "V"))
@@ -550,7 +657,7 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
                        K=sorted(set(g.svd.K for g in W.sub)) if mode == "wsnap" else G.svd.K, **di)
             # imgfn (a bound method of W / G) and the residual closure keep the gridders alive:
             # drop every reference before the next interval allocates its own (82 MHz 10-min OOM)
-            del G, imgfn
+            del G, imgfn, multi_fn, vpre
             if mode == "wsnap":
                 del W
             gc.collect()
@@ -598,6 +705,7 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
             summary["products"][prod.v_tag] = [dict(name=o["name"], n_snap=o["n_snap"],
                                                     files=[f for f in o.get("files", []) if prod.v_tag in os.path.basename(f)])
                                                for o in outs]
+    _DENSITY_MEMO.clear()
     T["TOTAL"] = time.perf_counter() - t0
     json.dump(summary, open(f"{out_prefix}-summary.json", "w"), indent=1, default=float)
     return summary

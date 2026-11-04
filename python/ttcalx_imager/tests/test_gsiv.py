@@ -318,6 +318,56 @@ def test_image_hour_snaps_cpu_archive_equals_dicts(tmp_path, cache, free_gb):
         assert same(got.images[k], ref.images[k]), k
 
 
+@pytest.mark.parametrize("cache,free_gb", [("store", 1000), ("store", 0)])
+def test_fast_expand_same_gridder_inputs(tmp_path, monkeypatch, cache, free_gb):
+    """TTCALX_FAST_EXPAND=1 (u, v, w with one transfer) + TTCALX_PSF_MEMO=1 (PSF visibilities kept per snapshot) +
+    TTCALX_HOUR_SETUP_FAST=1 (density grid re-used, one weights pass): the gridder gets the same inputs, the same images."""
+    hour_cpu = pytest.importorskip("hour_cpu")
+    prods = bands.hour_products(["I-Deep-Taper-Robust-0", "V-Taper-Deep", "I-Taper-10min", "V-Taper-10min",
+                                 "I-Deep-NoTaper-Robust-0.75"])
+    dicts, p = _hour_snaps(tmp_path)
+    kw = dict(N=64, exclude_stems=(dicts[3]["stem"],), qa="none")
+    runs = []
+    for v in ("0", "1"):
+        monkeypatch.setenv("TTCALX_FAST_EXPAND", v)
+        monkeypatch.setenv("TTCALX_PSF_MEMO", v)
+        monkeypatch.setenv("TTCALX_HOUR_SETUP_FAST", v)
+        runs.append(hour_cpu.run(gsiv.load_archive(p, 1.3, 0.65), "41MHz", str(tmp_path / "ref"), 1.3, 0.65, prods,
+                                 cache=cache, free_gb=free_gb, **kw))
+    (s0, r0), (s1, r1) = runs
+    assert hour_cpu.comparable(s0) == hour_cpu.comparable(s1)
+    key = lambda c: [x for x in c if x[0] in ("grid", "degrid", "grid_psf")]
+    assert key(r1.calls) == key(r0.calls) and len(r0.images) > 0
+    for k in r0.images:
+        assert same(r1.images[k], r0.images[k]), k
+    s = gsiv.load_archive(p, 1.3, 0.65)[0]
+    for a, b in zip(s.expand_uvw(np), (s.expand(k) for k in "uvw")):
+        assert a.dtype == b.dtype and np.array_equal(a, b)
+
+
+@pytest.mark.parametrize("cache,free_gb", [("store", 1000), ("store", 0), ("auto", 1000), ("off", 0)])
+def test_hour_multi_same_gridder_inputs(tmp_path, monkeypatch, cache, free_gb):
+    """TTCALX_HOUR_MULTI=1 (dirty I, PSF, dirty V in one pass): the gridder gets the same visibility vectors
+    (in another order) and the products are the same."""
+    hour_cpu = pytest.importorskip("hour_cpu")
+    prods = bands.hour_products(["I-Deep-Taper-Robust-0", "V-Taper-Deep", "I-Taper-10min", "V-Taper-10min",
+                                 "I-Deep-NoTaper-Robust-0"])
+    dicts, p = _hour_snaps(tmp_path)
+    kw = dict(N=64, exclude_stems=(dicts[3]["stem"],), qa="none")
+    runs = []
+    for v in ("0", "1"):
+        monkeypatch.setenv("TTCALX_HOUR_MULTI", v)
+        runs.append(hour_cpu.run(gsiv.load_archive(p, 1.3, 0.65), "41MHz", str(tmp_path / "ref"), 1.3, 0.65, prods,
+                                 cache=cache, free_gb=free_gb, **kw))
+    (s0, r0), (s1, r1) = runs
+    assert hour_cpu.comparable(s0) == hour_cpu.comparable(s1)
+    key = lambda c: sorted(x for x in c if x[0] in ("grid", "degrid", "grid_psf"))
+    assert key(r1.calls) == key(r0.calls) and len(r0.images) > 0
+    assert sorted(r1.images) == sorted(r0.images)
+    for k in r0.images:
+        assert same(r1.images[k], r0.images[k]), k
+
+
 def test_ms_hour_default_keeps_no_chunk_cache(tmp_path):
     """TTCALX_CHUNK_CACHE unset (the MS hour job): as 748884a, every call rebuilds its chunk (no device or
     host cache), the same calls and images as cache=off."""
