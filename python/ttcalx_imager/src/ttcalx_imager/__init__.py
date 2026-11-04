@@ -18,7 +18,9 @@ import os as _os
 # --archive``, ``cli.run_hour_snaps``, the gsi v3 engine) switch them on together, as validated
 # (with the device-cache reserve and the GPU OOM fallback).  The rest of the patch (compact w-term
 # factors with float32 interpolation, the Hogbom kernels) is always on: same images to float32
-# rounding, validated by the 2026-10-27 regression set.
+# rounding, validated by the 2026-10-27 regression set.  The gsi v4 speed switches (2026-11 speed rounds 1-4,
+# each default off) are on in FAST_ENV too: the same images (bitwise, or the same transform / float operations
+# to float32 rounding, at the GPU rerun floor).
 FAST_ENV = {
     "TTCALX_CHUNK_CACHE": "store",
     "TTCALX_KEEP_FFT_PLANS": "1",
@@ -28,6 +30,17 @@ FAST_ENV = {
     "TTCALX_RMS_FILTER": "circulant",
     "TTCALX_SCALE_FFT": "small",
     "TTCALX_SPARSE_UPDATE_MAX": "64",
+    "TTCALX_FAST_EXPAND": "1",
+    "TTCALX_FAST_AK": "1",
+    "TTCALX_HOUR_MULTI": "1",
+    "TTCALX_PSF_MEMO": "1",
+    "TTCALX_HOUR_SETUP_FAST": "1",
+    "TTCALX_SVD_PREFETCH": "1",
+    "TTCALX_FAST_COORDS": "1",
+    "TTCALX_FIT_WINDOW": "512",
+    "TTCALX_FAST_UPSAMPLE": "1",
+    "TTCALX_NUFFT_PRUNED": "1",
+    "TTCALX_FUSED_WACC": "1",
 }
 
 
