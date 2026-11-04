@@ -136,18 +136,25 @@ def _fit_box(img, beam_est, wrap=WRAP):
     return maj * s, mnr * s, pa
 
 
-def fit_psf_wsclean(psf, beam_est_px, box_scale=10.0, wrap=WRAP):
-    """WSClean Fit2DGaussianCentred: (major_px, minor_px, pa_rad) of a peak-normalised PSF."""
+def fit_psf_wsclean(psf, beam_est_px, box_scale=10.0, wrap=WRAP, info=None):
+    """WSClean Fit2DGaussianCentred: (major_px, minor_px, pa_rad) of a peak-normalised PSF.
+    info (dict): gets "max_box", the largest fitting box used."""
     psf = np.asarray(psf)
     H, W = psf.shape
+    if info is not None:
+        info["max_box"] = 0
     pref = max(int(math.ceil(box_scale)), int(math.ceil(beam_est_px * box_scale)))
     pref += pref % 2
     if not (pref < W or pref < H):
+        if info is not None:
+            info["max_box"] = max(W, H)
         return _fit_box(psf, beam_est_px, wrap)
     for _ in range(5):
         bw, bh = min(pref, W), min(pref, H)
         x0, y0 = (W - bw) // 2, (H - bh) // 2
         maj, mnr, pa = _fit_box(psf[y0:(H + bh) // 2, x0:x0 + bw], beam_est_px, wrap)
+        if info is not None:
+            info["max_box"] = max(info["max_box"], bw, bh)
         ok = ((maj * box_scale * 0.8 < bw or bw >= W) and (maj * box_scale * 0.8 < bh or bh >= H))
         if ok:
             break
@@ -164,11 +171,21 @@ def strict_beam():
     return os.environ.get("TTCALX_STRICT_BEAM", "0") == "1"
 
 
-def fit_beam(psf, scale_deg, theoretical_beam_px, wrap=WRAP, strict=None):
+def fit_beam(psf, scale_deg, theoretical_beam_px, wrap=WRAP, strict=None, window=None):
     """Restoring beam (BMAJ, BMIN, BPA) in degrees, as written by WSClean.
 
     psf: [y, x] array (numpy or cupy), normalised here by its centre pixel (H/2, W/2) as WSClean.
     theoretical_beam_px: 1 / max|uvw| / scale (WSClean's initial value; >= 1 pixel)."""
+    full = psf
+    win = int(os.environ.get("TTCALX_FIT_WINDOW", "0")) if window is None else int(window)
+    H0, W0 = psf.shape
+    if win and win % 2 == 0 and win < min(H0, W0) and H0 % 2 == 0 and W0 % 2 == 0:
+        # TTCALX_FIT_WINDOW=<even px> (default 0): only the centred win x win part of the PSF is copied and
+        # normalised (the fitting boxes are centred and much smaller; a fit whose box reaches the window is
+        # redone on the whole PSF), so the fit sees the same pixels
+        psf = psf[H0 // 2 - win // 2:H0 // 2 + win // 2, W0 // 2 - win // 2:W0 // 2 + win // 2]
+    else:
+        win = 0
     if hasattr(psf, "get"):
         psf = psf.get()
     psf = np.asarray(psf, dtype=np.float32)
@@ -179,7 +196,10 @@ def fit_beam(psf, scale_deg, theoretical_beam_px, wrap=WRAP, strict=None):
     strict = strict_beam() if strict is None else strict
     if strict and not (c != 0 and math.isfinite(float(c))):
         raise DegeneratePSFError(f"degenerate PSF: centre pixel is {float(c)!r} (no usable uv samples)")
-    maj, mnr, pa = fit_psf_wsclean(psf, max(float(theoretical_beam_px), 1.0), wrap=wrap)
+    info = {}
+    maj, mnr, pa = fit_psf_wsclean(psf, max(float(theoretical_beam_px), 1.0), wrap=wrap, info=info)
+    if win and info["max_box"] >= win:
+        return fit_beam(full, scale_deg, theoretical_beam_px, wrap=wrap, strict=strict, window=0)
     if strict and not (math.isfinite(maj) and math.isfinite(mnr) and math.isfinite(pa) and maj > 0 and mnr > 0):
         raise DegeneratePSFError(f"degenerate restoring beam: fit gave major {maj!r} px, minor {mnr!r} px, "
                                  f"PA {pa!r} rad (theoretical beam {float(theoretical_beam_px):.3g} px)")

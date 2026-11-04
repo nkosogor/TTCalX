@@ -447,3 +447,36 @@ def test_fast_ak_equals_interp(monkeypatch):
     g1, d1 = cp.asnumpy(S.grid(vis)), cp.asnumpy(S.degrid(model))
     # cuFINUFFT's atomics make repeated gridding equal to rounding only; the inputs are the same
     assert np.abs(g1 - g0).max() <= 1e-5 * np.abs(g0).max() and np.abs(d1 - d0).max() <= 1e-5 * np.abs(d0).max()
+
+
+def test_fit_window_same_beam(monkeypatch):
+    """TTCALX_FIT_WINDOW: the beam fitted on the centred window equals the full-PSF fit (and a window
+    smaller than the fitting box falls back to the full PSF)."""
+    from ttcalx_imager.beam import fit_beam
+    N = 1508
+    y, x = np.mgrid[:N, :N].astype(np.float64)
+    c = N // 2
+    a = ((x - c) * math.cos(0.3) + (y - c) * math.sin(0.3)) / 2.1
+    b = (-(x - c) * math.sin(0.3) + (y - c) * math.cos(0.3)) / 1.4
+    rng = np.random.default_rng(2)
+    psf = (np.exp(-0.5 * (a * a + b * b)) + 0.01 * rng.standard_normal((N, N))).astype(np.float32)
+    psf[c, c] = 1.0
+    ref = fit_beam(cp.asarray(psf), 0.0767, 2.0, window=0)
+    assert fit_beam(cp.asarray(psf), 0.0767, 2.0, window=512) == ref
+    assert fit_beam(cp.asarray(psf), 0.0767, 2.0, window=8) == ref
+
+
+def test_fast_coords_bitwise(monkeypatch):
+    """TTCALX_FAST_COORDS: the fused Reprojector.coords kernel gives the same bits as the CuPy expression."""
+    from ttcalx_imager.reproject import Reprojector
+    from ttcalx_imager.rotate import analytic_rotation
+    for N, sc in ((256, 0.0076), (1508, math.radians(0.0767))):
+        P = Reprojector(N, sc)
+        for k, (d0, d1) in enumerate(((0.01, 0.02), (0.2, -0.1), (-0.4, 0.3))):
+            R = analytic_rotation(1.0, 0.65, 1.0 + d0, 0.65 + d1)
+            monkeypatch.setenv("TTCALX_FAST_COORDS", "0")
+            a = P.coords(R)
+            monkeypatch.setenv("TTCALX_FAST_COORDS", "1")
+            b = P.coords(R)
+            for x, y in zip(a, b):
+                assert x.dtype == y.dtype and x.shape == y.shape and cp.asnumpy(x).tobytes() == cp.asnumpy(y).tobytes()

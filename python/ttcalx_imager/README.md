@@ -48,6 +48,8 @@ run-to-run GPU floor (82 MHz MS hour job vs 748884a, 2026-11-02; 2026-10-27 regr
 | `TTCALX_PSF_MEMO` | `0` | | hour: each snapshot's PSF visibilities computed once per band-hour and kept on the host (~8 B/sample). |
 | `TTCALX_HOUR_SETUP_FAST` | `0` | | hour: the density grid of a snapshot set re-used by products with the same snapshots; weights, their sum and wmax from one pass. |
 | `TTCALX_SVD_PREFETCH` | `0` | | snapshot: w-term factors of the neighbouring 0.25-lambda keys computed in a background thread (the same factors). |
+| `TTCALX_FAST_COORDS` | `0` | | reprojection coordinates in one kernel with the same float64 operations (each rounded separately: same bits). |
+| `TTCALX_FIT_WINDOW` | `0` | | restoring-beam fit on a centred window of this many pixels (even) instead of copying the whole PSF; falls back to the whole PSF if a fitting box reaches the window (same fit). |
 
 `SnapshotImager.image_many` reads with a spawned helper process: scripts calling it need an
 `if __name__ == "__main__":` guard (or `reader="thread"`). Set `CUPY_CACHE_DIR` if the home
