@@ -599,3 +599,12 @@ def test_fused_wacc_equals_acc_re(monkeypatch):
     assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 1e-6
     monkeypatch.delenv("TTCALX_FUSED_WACC")
     gridder.clear_caches()
+
+
+def test_is_gpu_oom_cufinufft_messages():
+    from ttcalx_imager.hour import _is_gpu_oom
+    assert _is_gpu_oom(RuntimeError("Error setting non-uniform points."))
+    assert _is_gpu_oom(RuntimeError("Error creating plan."))
+    assert _is_gpu_oom(RuntimeError("cudaErrorMemoryAllocation"))
+    assert not _is_gpu_oom(RuntimeError("an illegal memory access was encountered"))
+    assert not _is_gpu_oom(ValueError("shape mismatch"))

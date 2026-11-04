@@ -148,8 +148,12 @@ def _is_gpu_oom(e):
     if oom is not None and isinstance(e, oom):
         return True
     m = str(e)
-    return ("CUFFT_ALLOC_FAILED" in m or "cudaErrorMemoryAllocation" in m or "out of memory" in m.lower()) and \
-        "illegal" not in m.lower()
+    # cuFINUFFT reports a failed device allocation in setpts / makeplan only as a generic error (the CUDA error
+    # goes to stderr), e.g. 2024-12-20 LST 05h 18 and 27 MHz with the v4 switches; the fallback recomputes the
+    # product without the device chunk cache (the same images) and raises if that fails too
+    cufinufft_alloc = m.startswith(("Error setting non-uniform points", "Error creating plan"))
+    return ("CUFFT_ALLOC_FAILED" in m or "cudaErrorMemoryAllocation" in m or "out of memory" in m.lower()
+            or cufinufft_alloc) and "illegal" not in m.lower()
 
 
 # ----------------------------------------------------------------------------- gridding
