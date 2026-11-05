@@ -710,6 +710,12 @@ def _image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, band
                 # booked under "<key>: OOM fallback" instead of its steps
                 dev_ok = False
                 gc.collect()
+                # the gridder's caches too (cuFINUFFT plans with their fine grids, pruned-NUFFT buffers, w-term
+                # tables / factors): cuFINUFFT allocates outside the CuPy pool, so what they hold is not given
+                # back by free_all_blocks (2024-12-20 LST 05h 18 MHz: the retry without the cache still ran out
+                # of memory although that path needs ~6.5 GB); the retry rebuilds them
+                from . import gridder as _gridder
+                _gridder.clear_caches()
                 cp.fft.config.get_plan_cache().clear()
                 cp.get_default_memory_pool().free_all_blocks()
                 spent = sum(T.get(k, 0) - T0.get(k, 0) for k in T)
