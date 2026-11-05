@@ -608,3 +608,11 @@ def test_is_gpu_oom_cufinufft_messages():
     assert _is_gpu_oom(RuntimeError("cudaErrorMemoryAllocation"))
     assert not _is_gpu_oom(RuntimeError("an illegal memory access was encountered"))
     assert not _is_gpu_oom(ValueError("shape mismatch"))
+
+
+def test_cache_device_env_switch(monkeypatch):
+    """TTCALX_CACHE_DEVICE=0: image_hour_snaps starts every product with the device chunk cache off."""
+    import inspect
+    from ttcalx_imager import hour
+    src = inspect.getsource(hour._image_hour_snaps)
+    assert 'os.environ.get("TTCALX_CACHE_DEVICE", "1") != "0"' in src

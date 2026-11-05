@@ -618,7 +618,9 @@ def _image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, band
         groups = [[s for s in snaps if bnd[k] <= s["tidx"] < bnd[k + 1]] for k in range(nint)]
         t0s = [min(tstart_all[bnd[k]:bnd[k + 1]], default=None) for k in range(nint)]
         outs = []
-        dev_ok = True        # device chunk cache allowed (off for the rest of the product after an OOM fallback)
+        # device chunk cache allowed (off for the rest of the product after an OOM fallback); TTCALX_CACHE_DEVICE=0
+        # keeps it off from the start (gsi v3: the fresh-engine retry of an hour that ran out of GPU memory)
+        dev_ok = os.environ.get("TTCALX_CACHE_DEVICE", "1") != "0"
 
         def interval(gi, sn, name, fn, tsfx, ctl):
             G = HourGrid(sn, N, sdeg, robust=params.robust, tukey_inner=params.taper_inner_tukey or None,
