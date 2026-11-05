@@ -709,23 +709,28 @@ def _image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, band
                 # gets the same arrays (bit-identical inputs), only slower; the failed attempt's time is
                 # booked under "<key>: OOM fallback" instead of its steps
                 dev_ok = False
+                dev_gb = ctl.dev_bytes / 1e9
+                # drop the failed attempt's device chunk cache BEFORE freeing: while `ctl` held it, free_all_blocks
+                # could not return it and it went back to the CuPy pool only at the next CacheCtl, where cuFINUFFT
+                # (which allocates outside the pool) cannot use it -- the retry then failed in its first plan
+                # (2024-12-20 LST 05h 18 / 27 MHz).  The gridder caches (cuFINUFFT plans with their fine grids,
+                # pruned-NUFFT buffers, w-term tables) and CLEAN's circulant matrices go as well; the retry
+                # rebuilds them (same inputs, same images)
+                ctl = None
                 gc.collect()
-                # the gridder's caches too (cuFINUFFT plans with their fine grids, pruned-NUFFT buffers, w-term
-                # tables / factors): cuFINUFFT allocates outside the CuPy pool, so what they hold is not given
-                # back by free_all_blocks (2024-12-20 LST 05h 18 MHz: the retry without the cache still ran out
-                # of memory although that path needs ~6.5 GB); the retry rebuilds them
                 from . import gridder as _gridder
+                from . import clean as _clean
                 _gridder.clear_caches()
+                getattr(_clean, "_CIRC_CACHE", {}).clear()
                 cp.fft.config.get_plan_cache().clear()
                 cp.get_default_memory_pool().free_all_blocks()
                 spent = sum(T.get(k, 0) - T0.get(k, 0) for k in T)
                 T.clear(); T.update(T0); lap(f"{key}: OOM fallback")
                 T[f"{key}: OOM fallback"] += spent
-                msg = (f"hour {os.path.basename(name)}: GPU out of memory with {ctl.dev_bytes / 1e9:.2f} GB of device "
+                msg = (f"hour {os.path.basename(name)}: GPU out of memory with {dev_gb:.2f} GB of device "
                        f"chunk cache ({err}); again without the device chunk cache")
                 print(f"WARNING: {msg}", file=sys.stderr, flush=True); log(msg)
-                summary.setdefault("cache_fallback", []).append(dict(name=name, error=err,
-                                                                     device_cache_GB=ctl.dev_bytes / 1e9))
+                summary.setdefault("cache_fallback", []).append(dict(name=name, error=err, device_cache_GB=dev_gb))
         summary["products"][key] = outs
         if prod.image_i and prod.v_tag and prod.naming == "orca":
             summary["products"][prod.v_tag] = [dict(name=o["name"], n_snap=o["n_snap"],
