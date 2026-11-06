@@ -42,6 +42,17 @@ run-to-run GPU floor (82 MHz MS hour job vs 748884a, 2026-11-02; 2026-10-27 regr
 | `TTCALX_STRICT_BEAM` | `0` | | `1`: the restoring-beam fit raises `DegeneratePSFError` for a zero / non-finite PSF centre or fit (default: the fit's values as before). A degenerate snapshot is caught before the fit by `check_psf_support` either way. |
 | `TTCALX_HOGBOM_MB_BPS` | `2` | | blocks per SM of the cooperative Hogbom kernel (a refused launch or a compile error falls back to the single-block kernel, same components). |
 | `TTCALX_HOGBOM_MATRIX_MAX_K` | `4096` | | largest candidate set for the G-matrix Hogbom path. |
+| `TTCALX_FAST_EXPAND` | `0` | `1` | archive / v3 records: kept mask unpacked on the GPU, u, v, w expanded with one transfer (same arrays). |
+| `TTCALX_FAST_AK` | `0` | `1` | a_k(w) of the w-term with one `searchsorted` per (de)gridding call and one fused kernel (cupy_interp's arithmetic, per-cell slopes precomputed; equal to `cp.interp`). `TTCALX_FAST_AK_FUSED=0`: CuPy's own interp kernel on the shared index. |
+| `TTCALX_HOUR_MULTI` | `0` | `1` | hour: dirty I, PSF and dirty V of an I product in one pass over the chunks (same images). |
+| `TTCALX_PSF_MEMO` | `0` | `1` | hour: each snapshot's PSF visibilities computed once per band-hour and kept on the host (~8 B/sample). |
+| `TTCALX_HOUR_SETUP_FAST` | `0` | `1` | hour: the density grid of a snapshot set re-used by products with the same snapshots; weights, their sum and wmax from one pass. |
+| `TTCALX_SVD_PREFETCH` | `0` | `1` | snapshot: w-term factors of the neighbouring 0.25-lambda keys computed in a background thread (the same factors). |
+| `TTCALX_FAST_COORDS` | `0` | `1` | reprojection coordinates in one kernel with the same float64 operations (each rounded separately: same bits). |
+| `TTCALX_FIT_WINDOW` | `0` | `512` | restoring-beam fit on a centred window of this many pixels (even) instead of copying the whole PSF; falls back to the whole PSF if a fitting box reaches the window (same fit). |
+| `TTCALX_FAST_UPSAMPLE` | `0` | `1` | hour: the 2x band-limited model upsampling as four N-point inverse FFTs (polyphase identity) instead of one zero-padded 2N transform, a slow Bluestein one at the hour sizes (values to float32 rounding; 82 MHz hour -13 s). |
+| `TTCALX_NUFFT_PRUNED` | unset | `1` | `1` (every scope) or a list of `snap,hour`: NUFFTs as cuFINUFFT spread / interpolation only plus our own fine-grid FFT (row FFTs of the occupied band, tiled transposes, contiguous row FFTs; `pruned.py`). Same transform to float32 rounding (5e-7); 82 MHz 8.2 -> 3.4 ms (type 1), 7.7 -> 2.3 ms (type 2); 82 MHz band-hour -29 %. |
+| `TTCALX_FUSED_WACC` | `0` | `1` | pruned type-1 transforms (`TTCALX_NUFFT_PRUNED`): each w-term accumulated inside the last mode gather (`PrunedPlan.execute_acc`) instead of writing the N x N modes and re-reading them in `acc_re`. The same float operations (images at the rerun floor, 0 CLEAN flips in 60 snapshots); 82 MHz snapshot imaging -8 %, 82 MHz band-hour snapshot stage -4.4 % (2026-11-04). |
 
 `SnapshotImager.image_many` reads with a spawned helper process: scripts calling it need an
 `if __name__ == "__main__":` guard (or `reader="thread"`). Set `CUPY_CACHE_DIR` if the home

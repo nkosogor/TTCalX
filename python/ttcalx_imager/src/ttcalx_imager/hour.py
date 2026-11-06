@@ -37,6 +37,7 @@ from . import bands
 from .clean import deconvolve_multiscale
 from .fits import make_header, write_image
 from .gridder import SampleSet, get_svd, to_ws
+from .gsiv import fast_expand
 from .msio import load_samples
 from .qa import qa_reject
 from .reproject import Reprojector, fft_upsample, prefilter
@@ -82,6 +83,9 @@ def _uvmax(s):
     if hasattr(s, "uvmax"):
         return s.uvmax()
     return float(np.sqrt(s["u"] ** 2 + s["v"] ** 2 + s["w"] ** 2).max())
+
+
+_DENSITY_MEMO = {}      # TTCALX_HOUR_SETUP_FAST: (snapshot set, geometry) -> WeightGrid density grid (one entry)
 
 
 # ----------------------------------------------------------------------------- chunk cache control
@@ -144,8 +148,12 @@ def _is_gpu_oom(e):
     if oom is not None and isinstance(e, oom):
         return True
     m = str(e)
-    return ("CUFFT_ALLOC_FAILED" in m or "cudaErrorMemoryAllocation" in m or "out of memory" in m.lower()) and \
-        "illegal" not in m.lower()
+    # cuFINUFFT reports a failed device allocation in setpts / makeplan only as a generic error (the CUDA error
+    # goes to stderr), e.g. 2024-12-20 LST 05h 18 and 27 MHz with the v4 switches; the fallback recomputes the
+    # product without the device chunk cache (the same images) and raises if that fails too
+    cufinufft_alloc = m.startswith(("Error setting non-uniform points", "Error creating plan"))
+    return ("CUFFT_ALLOC_FAILED" in m or "cudaErrorMemoryAllocation" in m or "out of memory" in m.lower()
+            or cufinufft_alloc) and "illegal" not in m.lower()
 
 
 # ----------------------------------------------------------------------------- gridding
@@ -165,23 +173,40 @@ class HourGrid:
         t0 = time.perf_counter()
 
         def rot_uvw(i):
-            u, v, w, _ = self._rot([i], self._dev(i, "u"), self._dev(i, "v"), self._dev(i, "w"))
+            u, v, w, _ = self._rot([i], *self._dev3(i))
             return u, v, w
 
+        # TTCALX_HOUR_SETUP_FAST=1 (default 0): the density grid of a snapshot set is computed once and re-used by
+        # every product with the same snapshots (it depends on u, v and the natural weights only; robust and the
+        # taper enter in finalize / weights), and the weights, their sum and wmax come from one rotation pass
+        fast = os.environ.get("TTCALX_HOUR_SETUP_FAST", "0") == "1"
+        sw = 0.0; wmax = 0.0; done = False
         if weights is None:
             WG = WeightGrid(N, self.sc, robust, tukey_inner)
-            for i, s in enumerate(snaps):
-                u, v, _ = rot_uvw(i); WG.add(u, v, self._dev(i, "nw"))
+            key = None
+            if fast:
+                key = (tuple(s["stem"] for s in snaps), N, round(self.sc, 15), WG.npix,
+                       b"".join(np.asarray(s["R"], np.float64).tobytes() for s in snaps))
+            if key is not None and key in _DENSITY_MEMO:
+                WG.grid = _DENSITY_MEMO[key]
+            else:
+                for i, s in enumerate(snaps):
+                    u, v, _ = rot_uvw(i); WG.add(u, v, self._dev(i, "nw"))
+                if key is not None:
+                    _DENSITY_MEMO.clear(); _DENSITY_MEMO[key] = WG.grid
             WG.finalize()
             self.iw = []
             for i, s in enumerate(snaps):
-                u, v, _ = rot_uvw(i); self.iw.append(cp.asnumpy(WG.weights(u, v, self._dev(i, "nw"))))
+                u, v, w = rot_uvw(i); self.iw.append(cp.asnumpy(WG.weights(u, v, self._dev(i, "nw"))))
+                if fast:
+                    sw += float(self.iw[i].sum()); wmax = max(wmax, float(cp.abs(w).max()))
+            done = fast
         else:
             self.iw = weights
-        sw = 0.0; wmax = 0.0
-        for i in range(len(snaps)):
-            _, _, w = rot_uvw(i)
-            sw += float(self.iw[i].sum()); wmax = max(wmax, float(cp.abs(w).max()))
+        if not done:
+            for i in range(len(snaps)):
+                _, _, w = rot_uvw(i)
+                sw += float(self.iw[i].sum()); wmax = max(wmax, float(cp.abs(w).max()))
         self.sumw = sw
         self.svd = get_svd(N, self.sc, wmax, svd_tol) if need_svd else None
         self.chunks = self._subchunks(range(len(snaps)))
@@ -205,6 +230,17 @@ class HourGrid:
 
     def _cat_dev(self, ids, k):
         return cp.concatenate([self._dev(i, k) for i in ids])
+
+    def _dev3(self, i):
+        """(u, v, w) of snapshot i on the GPU (= _dev(i, 'u'), ...; TTCALX_FAST_EXPAND: one transfer)."""
+        s = self.snaps[i]
+        if hasattr(s, "expand_uvw") and fast_expand():
+            return s.expand_uvw(cp)
+        return tuple(self._dev(i, k) for k in ("u", "v", "w"))
+
+    def _cat_dev3(self, ids):
+        parts = [self._dev3(i) for i in ids]
+        return tuple(cp.concatenate([p[k] for p in parts]) for k in range(3))
 
     def _subchunks(self, ids):
         out = []; cur = []; n = 0
@@ -236,9 +272,18 @@ class HourGrid:
         1 in the hour frame (exp(2 pi i (w_hour - w_block)) in a w-snapshot block frame)."""
         s = self.snaps[i]
         Rh = s.get("R_hour", s["R"])
-        u, v, w = (self._dev(i, k).astype(cp.float64) for k in ("u", "v", "w"))
+        memo = getattr(s, "_memo", None) if os.environ.get("TTCALX_PSF_MEMO", "0") == "1" else None
+        key = ("psf_vis", np.asarray(Rh, np.float64).tobytes())
+        if memo is not None and key in memo:
+            # TTCALX_PSF_MEMO=1 (default 0): the snapshot's PSF visibilities depend only on its samples and R_hour,
+            # so every product / interval re-uses the first computation (kept on the host, ~8 B per sample)
+            return cp.asarray(memo[key])
+        u, v, w = (x.astype(cp.float64) for x in self._dev3(i))
         wh = Rh[2, 0] * u + Rh[2, 1] * v + Rh[2, 2] * w
-        return cp.exp(2j * np.pi * (wh - w)).astype(cp.complex64)
+        out = cp.exp(2j * np.pi * (wh - w)).astype(cp.complex64)
+        if memo is not None:
+            memo[key] = cp.asnumpy(out)
+        return out
 
     def _chunk(self, ids, col):
         """(SampleSet, rotated visibilities of ``col``) of the snapshots ``ids``.
@@ -284,8 +329,8 @@ class HourGrid:
         if store:
             vis = cp.concatenate([self._psf_vis(i) for i in ids]) if col == "PSF" else (
                 self._cat_dev(ids, col) if col else None)
-            w0 = self._cat_dev(ids, "w")
-            u, v, w, vis = self._rot(ids, self._cat_dev(ids, "u"), self._cat_dev(ids, "v"), w0, vis)
+            u0, v0, w0 = self._cat_dev3(ids)
+            u, v, w, vis = self._rot(ids, u0, v0, w0, vis)
             wt = cp.concatenate([cp.asarray(self.iw[i]) for i in ids])
         else:
             if col == "PSF":
@@ -297,7 +342,7 @@ class HourGrid:
             if "wt" not in hc:
                 hc["wt"] = np.concatenate([self.iw[i] for i in ids])
             wt = cp.asarray(hc["wt"])
-        S = SampleSet(u, v, w, wt, self.N, self.sc, svd=self.svd, eps=self.eps, precompute=False)
+        S = SampleSet(u, v, w, wt, self.N, self.sc, svd=self.svd, eps=self.eps, precompute=False, scope="hour")
         if mode != "off" and c is None:
             npts = int(S.npts)
             need = npts * (S.x.itemsize + S.y.itemsize + S.w.itemsize + S.wt.itemsize + 1 + w0.itemsize + 8)
@@ -319,6 +364,43 @@ class HourGrid:
             elif not store:
                 self._cache[key] = dict(host=hc)
         return S, vis
+
+    def _vis_for(self, ids, col, S, w0):
+        """Rotated visibilities of column ``col`` for the SampleSet S of snapshots ``ids`` (w0: their
+        stored-frame w): the expressions of _chunk's device-cache branch, so the values are the ones
+        _chunk(ids, col) returns."""
+        if col == "PSF":
+            vis = cp.concatenate([self._psf_vis(i) for i in ids])
+        elif os.environ.get("TTCALX_CHUNK_CACHE", "off") == "store":
+            vis = self._cat_dev(ids, col)
+        else:
+            vis = cp.asarray(np.concatenate([self.snaps[i][col] for i in ids]))
+        if self.rotate:      # rotate_samples: vis * exp(2 pi i (w - w')), w' = unfolded S.w
+            wn = cp.where(S.flip, -S.w, S.w)
+            vis = vis * cp.exp(2j * np.pi * (w0 - wn)).astype(vis.dtype)
+        return vis
+
+    def image_multi(self, cols):
+        """[image(c) for c in cols] (dirty images, no model) with one SampleSet per chunk: the chunk is
+        built (or taken from the cache) and its points set once for all columns."""
+        accs = [cp.zeros((self.N, self.N), cp.float32) for _ in cols]; sumw = 0.0
+        for chunk in self.chunks:
+            S, vis = self._chunk(chunk, cols[0])
+            sumw += float(S.wt.sum())
+            accs[0] += S.grid(vis); del vis
+            if len(cols) > 1:
+                c = self._cache.get(tuple(chunk))
+                if c is not None and "S" in c:
+                    w0 = c["w0"]
+                elif os.environ.get("TTCALX_CHUNK_CACHE", "off") == "store":
+                    w0 = self._cat_dev(chunk, "w")
+                else:
+                    w0 = cp.asarray(np.concatenate([self.snaps[i]["w"] for i in chunk]))
+                for j, col in enumerate(cols[1:], 1):
+                    vis = self._vis_for(chunk, col, S, w0)
+                    accs[j] += S.grid(vis); del vis
+            del S
+        return [to_ws(a) / sumw for a in accs]
 
     def image(self, col="I", model=None, psf=False, ids=None):
         """Weighted dirty (model=None) or residual image / sum of weights, WSClean orientation.
@@ -368,6 +450,20 @@ class WSnap:
             self._T = cp.where(q <= umax, 1.0, 0.5 * (1 + cp.cos(cp.pi * t))).astype(cp.float32)
         return fft_upsample(M, self.up, self._T)
 
+    def image_multi(self, cols):
+        """[image(c) for c in cols] (dirty images) in one pass over the blocks (HourGrid.image_multi),
+        each block image reprojected with the same coordinates as image() computes for it."""
+        accs = [cp.zeros((self.N, self.N), cp.float32) for _ in cols]; wsum = 0.0
+        for g, R in zip(self.sub, self.Rb):
+            ds = g.image_multi(cols)
+            co = self.P.coords(R)
+            for j, d in enumerate(ds):
+                r, _ = self.P(d, R, self.order, coords=co)
+                accs[j] += g.sumw * r
+            wsum += g.sumw
+            del ds
+        return [a / wsum for a in accs]
+
     def image(self, col="I", model=None):
         acc = cp.zeros((self.N, self.N), cp.float32); wsum = 0.0
         Mb = prefilter(self._bandlimit(model), self.order) if model is not None else None
@@ -399,7 +495,7 @@ def snapshot_qa(snaps, N, sdeg, params, qa="auto", qa_dir=None, log=None):
             if os.path.exists(p):
                 r = json.load(open(p)).get("V_rms_box")
         if r is None and qa in ("auto", "compute"):
-            r = v_rms_from_samples(s, N, sdeg, params.robust, params.taper_inner_tukey)
+            r = v_rms_from_samples(s, N, sdeg, params.robust, params.taper_inner_tukey, scope="hour")
         out.append(float("nan") if r is None else float(r))
     return out
 
@@ -444,9 +540,25 @@ def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, b
                             write_aux=write_aux, verbose=verbose, timing=T, t0=t0)
 
 
-def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands.DEEP_I),), mode="wsnap",
-                     block=6, pols="IV", qa="auto", qa_dir=None, exclude=(), exclude_stems=(), beam=None,
-                     write_aux=True, verbose=False, timing=None, t0=None):
+def image_hour_snaps(snaps, *args, **kwargs):
+    """Image one band-hour (:func:`_image_hour_snaps`).  The per-call memos (TTCALX_HOUR_SETUP_FAST density grid,
+    TTCALX_PSF_MEMO PSF visibilities on the snapshots) are dropped before and after the call, also when it
+    raises, so a later call can never see another call's state and the host RAM of the PSF memo is freed."""
+    _DENSITY_MEMO.clear()
+    try:
+        return _image_hour_snaps(snaps, *args, **kwargs)
+    finally:
+        _DENSITY_MEMO.clear()
+        for s in snaps:
+            memo = getattr(s, "_memo", None)
+            if memo:
+                for k in [k for k in memo if isinstance(k, tuple) and k[:1] == ("psf_vis",)]:
+                    del memo[k]
+
+
+def _image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands.DEEP_I),), mode="wsnap",
+                      block=6, pols="IV", qa="auto", qa_dir=None, exclude=(), exclude_stems=(), beam=None,
+                      write_aux=True, verbose=False, timing=None, t0=None):
     """Image one band-hour from loaded snapshots: msio.load_samples dicts (:func:`image_hour`)
     or gsiv.LazySnap mappings (an archive / the gsi v3 hour store), any order.
 
@@ -473,6 +585,9 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
     # (raise, as 86afd89) for MS hour jobs; the archive / in-memory entry points (cli --archive,
     # run_hour_snaps: gsi v3) turn it on
     oom_fallback = os.environ.get("TTCALX_CACHE_OOM_FALLBACK", "0") == "1"
+    # TTCALX_HOUR_MULTI=1 (default 0): an I product's dirty I, PSF and (if made) dirty V are gridded in one
+    # pass over the chunks (one SampleSet / setpts per chunk instead of three), the same images
+    multi = os.environ.get("TTCALX_HOUR_MULTI", "0") == "1"
     if keep_plans:
         cp.fft.config.get_plan_cache().set_memsize(int(float(os.environ.get("TTCALX_FFT_PLAN_CACHE_GB", "1.5")) * 1e9))
     N, sdeg = bands.geometry(band)
@@ -503,7 +618,9 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
         groups = [[s for s in snaps if bnd[k] <= s["tidx"] < bnd[k + 1]] for k in range(nint)]
         t0s = [min(tstart_all[bnd[k]:bnd[k + 1]], default=None) for k in range(nint)]
         outs = []
-        dev_ok = True        # device chunk cache allowed (off for the rest of the product after an OOM fallback)
+        # device chunk cache allowed (off for the rest of the product after an OOM fallback); TTCALX_CACHE_DEVICE=0
+        # keeps it off from the start (gsi v3: the fresh-engine retry of an hour that ran out of GPU memory)
+        dev_ok = os.environ.get("TTCALX_CACHE_DEVICE", "1") != "0"
 
         def interval(gi, sn, name, fn, tsfx, ctl):
             G = HourGrid(sn, N, sdeg, robust=params.robust, tukey_inner=params.taper_inner_tukey or None,
@@ -513,7 +630,9 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
                 imgfn = W.image
             else:
                 imgfn = G.image
+            multi_fn = W.image_multi if mode == "wsnap" else G.image_multi
             lap(f"{key}: weights + gridder setup")
+            vpre = None
             s0 = sn[0]
             hist = (f"ttcalx-image hour ({mode}, block {block}): {key} multiscale={params.multiscale} "
                     f"bias {params.multiscale_scale_bias} niter={params.niter} mgain={params.mgain} "
@@ -525,9 +644,16 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
                                         history=[hist])
             files = []; di = {}; theo = theoretical_beam_pix(sn, G.sc)
             if prod.image_i:
-                dirty = imgfn("I"); lap(f"{tag}: dirty I")
-                # PSF with the w-term in the hour frame, as WSClean (w-snapshot gridded like the data)
-                psf = imgfn("PSF"); psf = psf / psf[N // 2, N // 2]; lap(f"{tag}: psf")
+                if multi:
+                    # TTCALX_HOUR_MULTI: dirty I, the PSF and dirty V in one pass over the chunks (the same images)
+                    out3 = multi_fn(["I", "PSF"] + (["V"] if prod.v_tag else []))
+                    dirty, psf = out3[0], out3[1]; vpre = out3[2] if prod.v_tag else None
+                    del out3
+                    psf = psf / psf[N // 2, N // 2]; lap(f"{tag}: dirty I + psf" + (" + dirty V" if prod.v_tag else ""))
+                else:
+                    dirty = imgfn("I"); lap(f"{tag}: dirty I")
+                    # PSF with the w-term in the hour frame, as WSClean (w-snapshot gridded like the data)
+                    psf = imgfn("PSF"); psf = psf / psf[N // 2, N // 2]; lap(f"{tag}: psf")
                 restored, R, M, di = deconvolve_multiscale(dirty, psf, sdeg, theo, params,
                                                            residual_fn=lambda m: imgfn("I", model=m), beam=beam, log=log)
                 lap(f"{tag}: deconvolution (incl. major cycles)")
@@ -540,7 +666,10 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
                 del dirty, psf, restored, R, M
             if prod.v_tag:
                 vkey = prod.v_tag if prod.naming == "orca" else tag
-                v = imgfn("V"); lap(f"{vkey}: dirty V")
+                if vpre is not None:
+                    v = vpre; vpre = None
+                else:
+                    v = imgfn("V"); lap(f"{vkey}: dirty V")
                 h = hdr(di.get("beam"))
                 vname = fn["V"] if prod.naming == "legacy" else f"{out_prefix}-{prod.v_tag}{tsfx}-image.fits"
                 files.append(write_image(vname, v, h, "V"))
@@ -550,7 +679,7 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
                        K=sorted(set(g.svd.K for g in W.sub)) if mode == "wsnap" else G.svd.K, **di)
             # imgfn (a bound method of W / G) and the residual closure keep the gridders alive:
             # drop every reference before the next interval allocates its own (82 MHz 10-min OOM)
-            del G, imgfn
+            del G, imgfn, multi_fn, vpre
             if mode == "wsnap":
                 del W
             gc.collect()
@@ -582,17 +711,28 @@ def image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, bands
                 # gets the same arrays (bit-identical inputs), only slower; the failed attempt's time is
                 # booked under "<key>: OOM fallback" instead of its steps
                 dev_ok = False
+                dev_gb = ctl.dev_bytes / 1e9
+                # drop the failed attempt's device chunk cache BEFORE freeing: while `ctl` held it, free_all_blocks
+                # could not return it and it went back to the CuPy pool only at the next CacheCtl, where cuFINUFFT
+                # (which allocates outside the pool) cannot use it -- the retry then failed in its first plan
+                # (2024-12-20 LST 05h 18 / 27 MHz).  The gridder caches (cuFINUFFT plans with their fine grids,
+                # pruned-NUFFT buffers, w-term tables) and CLEAN's circulant matrices go as well; the retry
+                # rebuilds them (same inputs, same images)
+                ctl = None
                 gc.collect()
+                from . import gridder as _gridder
+                from . import clean as _clean
+                _gridder.clear_caches()
+                getattr(_clean, "_CIRC_CACHE", {}).clear()
                 cp.fft.config.get_plan_cache().clear()
                 cp.get_default_memory_pool().free_all_blocks()
                 spent = sum(T.get(k, 0) - T0.get(k, 0) for k in T)
                 T.clear(); T.update(T0); lap(f"{key}: OOM fallback")
                 T[f"{key}: OOM fallback"] += spent
-                msg = (f"hour {os.path.basename(name)}: GPU out of memory with {ctl.dev_bytes / 1e9:.2f} GB of device "
+                msg = (f"hour {os.path.basename(name)}: GPU out of memory with {dev_gb:.2f} GB of device "
                        f"chunk cache ({err}); again without the device chunk cache")
                 print(f"WARNING: {msg}", file=sys.stderr, flush=True); log(msg)
-                summary.setdefault("cache_fallback", []).append(dict(name=name, error=err,
-                                                                     device_cache_GB=ctl.dev_bytes / 1e9))
+                summary.setdefault("cache_fallback", []).append(dict(name=name, error=err, device_cache_GB=dev_gb))
         summary["products"][key] = outs
         if prod.image_i and prod.v_tag and prod.naming == "orca":
             summary["products"][prod.v_tag] = [dict(name=o["name"], n_snap=o["n_snap"],

@@ -400,3 +400,219 @@ def test_fast_settings_agree_with_defaults_to_rounding(monkeypatch):
     monkeypatch.setenv("TTCALX_RMS_FILTER", "circulant")
     r1 = clean.rms_image(img, 3.0)
     assert float(cp.abs(r1 - r0).max()) < 1e-4 * float(r0.max())
+
+
+def test_gsiv_gpu_unpack_and_expand_uvw(monkeypatch):
+    """TTCALX_FAST_EXPAND: the GPU mask unpack equals gsiv.unpack_mask and expand_uvw on the GPU equals
+    the host expansion bit for bit."""
+    from ttcalx_imager import gsiv
+    rng = np.random.default_rng(3)
+    for shape in ((7, 3), (1000, 48), (61776, 48)):
+        ok = rng.uniform(size=shape) < 0.6
+        bits = gsiv.pack_mask(ok)
+        assert np.array_equal(cp.asnumpy(gsiv.unpack_mask_gpu(bits, shape, cp)), gsiv.unpack_mask(bits, shape))
+    nrow, nchan = 500, 48
+    ok = rng.uniform(size=(nrow, nchan)) < 0.6
+    meta = dict(path="x", stem="s", time=1.0, tstart=1.0, nrow=nrow, nchan=nchan, flagfrac=0.4, zero_frac=0.0,
+                telescope="OVRO_LWA", observer="", field_name="", pd=(0.0, 0.0), n=int(ok.sum()), ok_shape=[nrow, nchan])
+    arrays = dict(uvw=rng.normal(scale=300, size=(nrow, 3)), freqs=np.linspace(50e6, 55e6, nchan),
+                  chan_width=np.full(nchan, 1e5), natw=rng.uniform(size=nrow).astype(np.float32),
+                  ok_bits=gsiv.pack_mask(ok))
+    s = gsiv.LazySnap(meta, arrays, np.eye(3), None)
+    monkeypatch.setenv("TTCALX_FAST_EXPAND", "1")
+    for a, k in zip(s.expand_uvw(cp), "uvw"):
+        b = s.expand(k)
+        assert a.dtype == b.dtype and np.array_equal(cp.asnumpy(a), b), k
+    assert np.array_equal(cp.asnumpy(s.expand("nw", cp)), s.expand("nw"))
+
+
+def test_fast_ak_equals_interp(monkeypatch):
+    """TTCALX_FAST_AK: a_k(w) from one shared searchsorted equals cp.interp's (values bit for bit), and the
+    gridded / degridded results equal the default path."""
+    rng = np.random.default_rng(7)
+    N, sc = 96, 0.015
+    u, v, w = _samples(20000, 20.0, 40.0, seed=5)
+    svd = SvdWTerm(N, sc, np.abs(w).max() + 1e-3, tol=1e-4)
+    S = SampleSet(u, v, w, rng.uniform(0.5, 1.5, u.size).astype(np.float32), N, sc, svd=svd, precompute=False)
+    wd = S.w
+    idx = svd.a_index(wd)
+    for k in range(svd.K):
+        a0, a1 = svd.a(k, wd), svd.a(k, wd, idx)
+        assert a1.dtype == a0.dtype and bool((a0 == a1).all()), k
+    vis = cp.asarray((rng.normal(size=u.size) + 1j * rng.normal(size=u.size)).astype(np.complex64))
+    model = cp.zeros((N, N), cp.float32); model[30, 70] = 2.0; model[60, 20] = -0.7
+    monkeypatch.setenv("TTCALX_FAST_AK", "0")
+    g0, d0 = cp.asnumpy(S.grid(vis)), cp.asnumpy(S.degrid(model))
+    monkeypatch.setenv("TTCALX_FAST_AK", "1")
+    g1, d1 = cp.asnumpy(S.grid(vis)), cp.asnumpy(S.degrid(model))
+    # cuFINUFFT's atomics make repeated gridding equal to rounding only; the inputs are the same
+    assert np.abs(g1 - g0).max() <= 1e-5 * np.abs(g0).max() and np.abs(d1 - d0).max() <= 1e-5 * np.abs(d0).max()
+
+
+def test_fit_window_same_beam(monkeypatch):
+    """TTCALX_FIT_WINDOW: the beam fitted on the centred window equals the full-PSF fit (and a window
+    smaller than the fitting box falls back to the full PSF)."""
+    from ttcalx_imager.beam import fit_beam
+    N = 1508
+    y, x = np.mgrid[:N, :N].astype(np.float64)
+    c = N // 2
+    a = ((x - c) * math.cos(0.3) + (y - c) * math.sin(0.3)) / 2.1
+    b = (-(x - c) * math.sin(0.3) + (y - c) * math.cos(0.3)) / 1.4
+    rng = np.random.default_rng(2)
+    psf = (np.exp(-0.5 * (a * a + b * b)) + 0.01 * rng.standard_normal((N, N))).astype(np.float32)
+    psf[c, c] = 1.0
+    ref = fit_beam(cp.asarray(psf), 0.0767, 2.0, window=0)
+    assert fit_beam(cp.asarray(psf), 0.0767, 2.0, window=512) == ref
+    assert fit_beam(cp.asarray(psf), 0.0767, 2.0, window=8) == ref
+
+
+def test_fast_coords_bitwise(monkeypatch):
+    """TTCALX_FAST_COORDS: the fused Reprojector.coords kernel gives the same bits as the CuPy expression."""
+    from ttcalx_imager.reproject import Reprojector
+    from ttcalx_imager.rotate import analytic_rotation
+    for N, sc in ((256, 0.0076), (1508, math.radians(0.0767))):
+        P = Reprojector(N, sc)
+        for k, (d0, d1) in enumerate(((0.01, 0.02), (0.2, -0.1), (-0.4, 0.3))):
+            R = analytic_rotation(1.0, 0.65, 1.0 + d0, 0.65 + d1)
+            monkeypatch.setenv("TTCALX_FAST_COORDS", "0")
+            a = P.coords(R)
+            monkeypatch.setenv("TTCALX_FAST_COORDS", "1")
+            b = P.coords(R)
+            for x, y in zip(a, b):
+                assert x.dtype == y.dtype and x.shape == y.shape and cp.asnumpy(x).tobytes() == cp.asnumpy(y).tobytes()
+
+
+@pytest.mark.parametrize("N", [96, 250, 1508])
+def test_fast_upsample_polyphase(N, monkeypatch):
+    """TTCALX_FAST_UPSAMPLE: the 2x upsampling as four N-point inverse FFTs = the zero-padded 2N transform to
+    float32 FFT rounding, with and without a taper."""
+    from ttcalx_imager.reproject import fft_upsample
+    rng = np.random.default_rng(11)
+    img = cp.asarray(rng.normal(size=(N, N)), cp.float32)
+    f = cp.fft.fftfreq(N)
+    taper = cp.exp(-(f[:, None] ** 2 + f[None, :] ** 2) * 8.0).astype(cp.float32)
+    for T in (None, taper):
+        monkeypatch.setenv("TTCALX_FAST_UPSAMPLE", "0")
+        a = fft_upsample(img, 2, T)
+        monkeypatch.setenv("TTCALX_FAST_UPSAMPLE", "1")
+        b = fft_upsample(img, 2, T)
+        assert a.shape == b.shape == (2 * N, 2 * N) and a.dtype == b.dtype
+        assert float(cp.abs(a - b).max()) <= 1e-5 * float(cp.abs(a).max())
+
+
+@pytest.mark.parametrize("N", [96, 250, 3122])
+def test_pruned_nufft_equals_cufinufft(N):
+    """TTCALX_NUFFT_PRUNED: spread-only cuFINUFFT + pruned FFT = cuFINUFFT's own type 1 / type 2 to float32 rounding,
+    for points that fill part of the fine grid (as at the all-sky geometries) and for the full grid."""
+    import cufinufft
+    from ttcalx_imager.pruned import PrunedPlan
+    rng = np.random.default_rng(3)
+    for frac in (0.6, 1.0):
+        M = 4000
+        x = cp.asarray(rng.uniform(-np.pi * frac, np.pi * frac * 0.999, M), cp.float32)
+        y = cp.asarray(rng.uniform(-np.pi * frac, np.pi * frac * 0.999, M) * 0.8, cp.float32)
+        c = cp.asarray(rng.normal(size=M) + 1j * rng.normal(size=M), cp.complex64)
+        f = cp.asarray(rng.normal(size=(N, N)) + 1j * rng.normal(size=(N, N)), cp.complex64)
+        R1 = cufinufft.Plan(1, (N, N), n_trans=1, eps=1e-4, isign=1, dtype="complex64"); R1.setpts(x, y)
+        R2 = cufinufft.Plan(2, (N, N), n_trans=1, eps=1e-4, isign=-1, dtype="complex64"); R2.setpts(x, y)
+        P1 = PrunedPlan(1, N, 1e-4, 1); P1.setpts(x, y)
+        P2 = PrunedPlan(2, N, 1e-4, -1); P2.setpts(x, y)
+        a, b = R1.execute(c), P1.execute(c)
+        assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 2e-6
+        b2 = P1.execute(c)                                      # the fine grid is cleared between calls
+        assert float(cp.abs(b2 - b).max() / cp.abs(b).max()) < 1e-6   # (spreading atomics: not bitwise)
+        a, b = R2.execute(f), P2.execute(f)
+        assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 2e-6
+
+
+@pytest.mark.parametrize("N", [96, 1508])
+def test_pruned_nufft_edge_wrap(N):
+    """TTCALX_NUFFT_PRUNED with points only near x = -pi (one-sided): cuFINUFFT's spreading wraps them into the
+    last rows of the fine grid, which a band clamped at row 0 would drop; the plan keeps every row then."""
+    import cufinufft
+    from ttcalx_imager.pruned import PrunedPlan
+    rng = np.random.default_rng(11)
+    M = 3000
+    x = cp.asarray(rng.uniform(-np.pi, -0.7 * np.pi, M), cp.float32)
+    y = cp.asarray(rng.uniform(-0.5, 0.5, M), cp.float32)
+    c = cp.asarray(rng.normal(size=M) + 1j * rng.normal(size=M), cp.complex64)
+    f = cp.asarray(rng.normal(size=(N, N)) + 1j * rng.normal(size=(N, N)), cp.complex64)
+    R1 = cufinufft.Plan(1, (N, N), n_trans=1, eps=1e-4, isign=1, dtype="complex64"); R1.setpts(x, y)
+    R2 = cufinufft.Plan(2, (N, N), n_trans=1, eps=1e-4, isign=-1, dtype="complex64"); R2.setpts(x, y)
+    P1 = PrunedPlan(1, N, 1e-4, 1); P1.setpts(x, y)
+    P2 = PrunedPlan(2, N, 1e-4, -1); P2.setpts(x, y)
+    assert P1.band == (0, P1.nf)
+    a, b = R1.execute(c), P1.execute(c)
+    assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 2e-6
+    a, b = R2.execute(f), P2.execute(f)
+    assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 2e-6
+
+
+def test_hour_memos_dropped_after_call(monkeypatch):
+    """image_hour_snaps drops the density memo and the snapshots' PSF memo after the call, also when it raises."""
+    from ttcalx_imager import hour
+
+    class S(dict):
+        pass
+    snaps = [S(stem="a"), S(stem="b")]
+    shared = {("psf_vis", b"R"): 1, "uvmax": 2.0}
+    for s in snaps:
+        s._memo = shared
+
+    def boom(*a, **k):
+        hour._DENSITY_MEMO["k"] = "grid"
+        raise RuntimeError("boom")
+    monkeypatch.setattr(hour, "_image_hour_snaps", boom)
+    with pytest.raises(RuntimeError):
+        hour.image_hour_snaps(snaps, 55, "/nonexistent/x", 0.0, 0.0)
+    assert hour._DENSITY_MEMO == {} and shared == {"uvmax": 2.0}
+
+
+def test_pruned_switch_scopes(monkeypatch):
+    from ttcalx_imager import gridder
+    monkeypatch.setenv("TTCALX_NUFFT_PRUNED", "hour")
+    assert gridder.pruned_on("hour") and not gridder.pruned_on("snap")
+    monkeypatch.setenv("TTCALX_NUFFT_PRUNED", "1")
+    assert gridder.pruned_on("snap") and gridder.pruned_on("hour")
+    monkeypatch.delenv("TTCALX_NUFFT_PRUNED")
+    assert not gridder.pruned_on("hour")
+
+
+def test_fused_wacc_equals_acc_re(monkeypatch):
+    """TTCALX_FUSED_WACC: SampleSet.grid with the w-term accumulated in the pruned transform's last gather = the
+    gather + SvdWTerm.acc_re path (the same float operations)."""
+    from ttcalx_imager import gridder
+    rng = np.random.default_rng(7)
+    N, sc = 512, math.radians(0.25)
+    M = 20000
+    u = rng.uniform(-60, 60, M); v = rng.uniform(-60, 60, M); w = rng.uniform(-8, 8, M)
+    wt = np.ones(M, np.float32)
+    vis = cp.asarray(rng.normal(size=M) + 1j * rng.normal(size=M), cp.complex64)
+    monkeypatch.setenv("TTCALX_NUFFT_PRUNED", "1")
+    gridder.clear_caches()
+    svd = gridder.get_svd(N, sc, float(np.abs(w).max()), 1e-4, quantum=0.25, nw=600, pad=0.0)
+    S = gridder.SampleSet(u, v, w, wt, N, sc, svd=svd)
+    monkeypatch.setenv("TTCALX_FUSED_WACC", "0")
+    a = S.grid(vis)
+    monkeypatch.setenv("TTCALX_FUSED_WACC", "1")
+    b = S.grid(vis)
+    assert float(cp.abs(a - b).max() / cp.abs(a).max()) < 1e-6
+    monkeypatch.delenv("TTCALX_FUSED_WACC")
+    gridder.clear_caches()
+
+
+def test_is_gpu_oom_cufinufft_messages():
+    from ttcalx_imager.hour import _is_gpu_oom
+    assert _is_gpu_oom(RuntimeError("Error setting non-uniform points."))
+    assert _is_gpu_oom(RuntimeError("Error creating plan."))
+    assert _is_gpu_oom(RuntimeError("cudaErrorMemoryAllocation"))
+    assert not _is_gpu_oom(RuntimeError("an illegal memory access was encountered"))
+    assert not _is_gpu_oom(ValueError("shape mismatch"))
+
+
+def test_cache_device_env_switch(monkeypatch):
+    """TTCALX_CACHE_DEVICE=0: image_hour_snaps starts every product with the device chunk cache off."""
+    import inspect
+    from ttcalx_imager import hour
+    src = inspect.getsource(hour._image_hour_snaps)
+    assert 'os.environ.get("TTCALX_CACHE_DEVICE", "1") != "0"' in src

@@ -94,7 +94,10 @@ def _svd_factors(wmax, tol, nw, nx, method=None):
             K += 1
         res = (K, wg, U[:, :K] * S[:K], Vh[:K].copy())
     if len(_FACTOR_CACHE) >= _FACTOR_CACHE_MAX:
-        _FACTOR_CACHE.pop(next(iter(_FACTOR_CACHE)))
+        try:                                  # (snapshot.TTCALX_SVD_PREFETCH fills the cache from a thread)
+            _FACTOR_CACHE.pop(next(iter(_FACTOR_CACHE)))
+        except (RuntimeError, StopIteration, KeyError):
+            pass
     _FACTOR_CACHE[key] = res
     return res
 
@@ -133,6 +136,70 @@ _wdegrid_in = cp.ElementwiseKernel(
        out = complex<float>(m, 0.f) * conj(b);""", "wdegrid_in")
 
 
+# the CuPy versions whose cupy.interp arithmetic the fused FAST_AK kernel reproduces bitwise (tests/test_gpu.py
+# test_fast_ak_equals_interp); with another version FAST_AK still works but run that test before trusting it
+FAST_AK_TESTED_CUPY = ("13.6.0",)
+_FAST_AK_WARNED = [False]
+
+
+def fast_ak() -> bool:
+    """TTCALX_FAST_AK=1 (default 0): SampleSet a_k(w) with one searchsorted per (de)gridding call instead of two per
+    term, the a_k complex64 formed in one kernel, and no copy of the already complex64 NUFFT input."""
+    on = os.environ.get("TTCALX_FAST_AK", "0") == "1"
+    if on and not _FAST_AK_WARNED[0] and cp.__version__ not in FAST_AK_TESTED_CUPY:
+        _FAST_AK_WARNED[0] = True
+        import warnings
+        warnings.warn(f"TTCALX_FAST_AK reproduces cupy.interp of CuPy {', '.join(FAST_AK_TESTED_CUPY)}; this is "
+                      f"CuPy {cp.__version__}: run test_fast_ak_equals_interp before relying on bitwise equality")
+    return on
+
+
+def _interp_on(x, idx, xp, fp):
+    """cp.interp(x, xp, fp) (real fp) with its searchsorted index given: CuPy's own interpolation kernel."""
+    from cupy._math.misc import _get_interp_kernel
+    out = cp.empty(x.shape, dtype=cp.float64)
+    _get_interp_kernel(False)(x, idx, xp, fp, xp.size, fp[0], fp[-1], out)
+    return out
+
+
+_complex64_of = cp.ElementwiseKernel("float64 re, float64 im", "complex64 out",
+                                     "out = complex<float>((float)re, (float)im);", "ttcalx_complex64_of")
+
+# cupy_interp (cupy/_math/misc.py, CuPy 13: x float32, idx int64, xp / fp float32, output double) for the real and
+# the imaginary table at once, then the complex64 cast of cp.interp(re) + 1j * cp.interp(im)
+# (the slope of each table cell is precomputed with cupy_interp's expression, _interp_slope)
+_interp_slope = cp.ElementwiseKernel(
+    "float32 fx1, float32 fx0, float32 fy1, float32 fy0", "float64 slope",
+    "slope = (double)(fy1 - fy0) / ((double)fx1 - (double)fx0);", "ttcalx_interp_slope")
+_AK_INTERP = r"""
+__device__ double ttcalx_interp1(const float x, const long long ix, const float* fx, const float* fy,
+                                 const double* sl, const long long len) {
+    const long long x_idx = ix - 1;
+    double y;
+    if (x != x) { y = x; }
+    else if (x_idx < 0) { y = fy[0]; }
+    else if (x == fx[len - 1]) { y = fy[len - 1]; }
+    else if (x_idx >= len - 1) { y = fy[len - 1]; }
+    else {
+        const double slope = sl[x_idx];
+        double out = slope * ((double)x - (double)fx[x_idx]) + (double)fy[x_idx];
+        if (out != out) {
+            out = slope * ((double)x - (double)fx[x_idx+1]) + (double)fy[x_idx+1];
+            if ((out != out) && (fy[x_idx] == fy[x_idx+1])) { out = fy[x_idx]; }
+        }
+        y = out;
+    }
+    return y;
+}
+"""
+_ak_fused = cp.ElementwiseKernel(
+    "float32 x, int64 ix, raw float32 fx, raw float32 fr, raw float32 fi, raw float64 sr, raw float64 si, int64 len",
+    "complex64 out",
+    "out = complex<float>((float)ttcalx_interp1(x, ix, &fx[0], &fr[0], &sr[0], len), "
+    "(float)ttcalx_interp1(x, ix, &fx[0], &fi[0], &si[0], len));",
+    "ttcalx_ak_fused", preamble=_AK_INTERP)
+
+
 class SvdWTerm:
     """exp(-2 pi i w x') ~= sum_k a_k(w) b_k(x'),  w in [0, wmax], x' in [-1/2, 1/2]."""
 
@@ -163,8 +230,37 @@ class SvdWTerm:
         _wdegrid_in(m.ravel(), self.jx, self.tx, self.Br[k], self.Bi[k], out.ravel())
         return out
 
-    def a(self, k, w):
-        return (cp.interp(w, self.wg, self.Ar[k]) + 1j * cp.interp(w, self.wg, self.Ai[k])).astype(cp.complex64)
+    def a(self, k, w, idx=None):
+        """a_k(w) as complex64.  idx (TTCALX_FAST_AK): cp.searchsorted(self.wg, w, side='right'), computed once for
+        all terms; the interpolation is then CuPy's own cp.interp kernel on that index (the same values) and the
+        complex64 result is formed in one kernel (the cast of cp.interp(re) + 1j * cp.interp(im), to the sign of a
+        zero)."""
+        if idx is None:
+            return (cp.interp(w, self.wg, self.Ar[k]) + 1j * cp.interp(w, self.wg, self.Ai[k])).astype(cp.complex64)
+        if os.environ.get("TTCALX_FAST_AK_FUSED", "1") == "1" and w.dtype == cp.float32 and \
+                self.wg.dtype == cp.float32 and idx.dtype == cp.int64:
+            # both interpolations and the cast in one kernel: cupy_interp's arithmetic, real and imaginary part
+            out = cp.empty(w.shape, cp.complex64)
+            sr, si = self._slopes(k)
+            _ak_fused(w, idx, self.wg, self.Ar[k], self.Ai[k], sr, si, self.wg.size, out)
+            return out
+        re, im = (_interp_on(w, idx, self.wg, f) for f in (self.Ar[k], self.Ai[k]))
+        return _complex64_of(re, im)
+
+    def _slopes(self, k):
+        """cupy_interp's per-cell slopes of the a_k tables (real, imaginary), float64, computed with its expression."""
+        sl = getattr(self, "_sl", None)
+        if sl is None:
+            sl = self._sl = {}
+        if k not in sl:
+            n = self.wg.size
+            sl[k] = tuple(_interp_slope(self.wg[1:], self.wg[:-1], f[1:], f[:-1]) for f in (self.Ar[k], self.Ai[k]))
+            assert sl[k][0].size == n - 1
+        return sl[k]
+
+    def a_index(self, w):
+        """The cp.interp index of w on the a_k table grid (shared by every term)."""
+        return cp.searchsorted(self.wg, w, side="right")
 
 
 _SVD_CACHE = {}
@@ -184,17 +280,44 @@ _PLAN_CACHE = {}
 _TOKENS = itertools.count()
 
 
-def get_plans(N, eps=1e-4):
-    """(type-1, type-2) single-transform complex64 cuFINUFFT plans for an N x N image."""
-    if (N, eps) not in _PLAN_CACHE:
-        _PLAN_CACHE[(N, eps)] = [cufinufft.Plan(1, (N, N), n_trans=1, eps=eps, isign=1, dtype="complex64"),
-                                 cufinufft.Plan(2, (N, N), n_trans=1, eps=eps, isign=-1, dtype="complex64"),
-                                 None, None]    # tokens of the SampleSets whose points are set
-    return _PLAN_CACHE[(N, eps)]
+def pruned_on(scope):
+    """TTCALX_NUFFT_PRUNED (default unset = off): "1" / "all" for every plan scope, or a comma list of scopes
+    (snap, hour): those plans are pruned.PrunedPlan (cuFINUFFT spread / interpolation only + a pruned
+    fine-grid FFT; the same NUFFT to float32 FFT rounding)."""
+    v = os.environ.get("TTCALX_NUFFT_PRUNED", "").strip().lower()
+    if v in ("", "0", "off", "none"):
+        return False
+    return v in ("1", "all", "on") or scope in {x.strip() for x in v.split(",")}
+
+
+def get_plans(N, eps=1e-4, scope="snap"):
+    """(type-1, type-2) single-transform complex64 cuFINUFFT plans for an N x N image.  scope: "snap" (snapshot
+    imager) or "hour" (hour stage), for TTCALX_NUFFT_PRUNED."""
+    pr = pruned_on(scope)
+    key = (N, eps, "pruned") if pr else (N, eps)
+    if key not in _PLAN_CACHE:
+        if pr:
+            from .pruned import PrunedPlan
+            _PLAN_CACHE[key] = [PrunedPlan(1, N, eps, 1), PrunedPlan(2, N, eps, -1), None, None]
+        else:
+            _PLAN_CACHE[key] = [cufinufft.Plan(1, (N, N), n_trans=1, eps=eps, isign=1, dtype="complex64"),
+                                cufinufft.Plan(2, (N, N), n_trans=1, eps=eps, isign=-1, dtype="complex64"),
+                                None, None]    # tokens of the SampleSets whose points are set
+    return _PLAN_CACHE[key]
+
+
+def fused_wacc() -> bool:
+    """TTCALX_FUSED_WACC=1 (default 0; pruned plans only): SampleSet.grid accumulates each w-term inside the last
+    gather of the pruned type-1 transform (PrunedPlan.execute_acc) instead of materialising the N x N modes and
+    re-reading them in SvdWTerm.acc_re (the same float operations)."""
+    return os.environ.get("TTCALX_FUSED_WACC", "0") == "1"
 
 
 def clear_caches():
     _SVD_CACHE.clear(); _PLAN_CACHE.clear(); _FACTOR_CACHE.clear(); _GEOM_CACHE.clear()
+    if pruned_on("snap") or pruned_on("hour"):
+        from . import pruned
+        pruned.clear()
 
 
 # ----------------------------------------------------------------------------- sample sets
@@ -202,9 +325,10 @@ class SampleSet:
     """Visibility samples resident on the GPU, folded to w >= 0, ready for (de)gridding.
 
     u, v, w: per-sample coordinates [lambda], either host float64 (numpy) or device float32
-    (cupy); wt: imaging weights (float32, 0 = not used).  ``svd`` = None disables the w-term."""
+    (cupy); wt: imaging weights (float32, 0 = not used).  ``svd`` = None disables the w-term.
+    scope: the get_plans scope of its NUFFT plans ("snap" / "hour")."""
 
-    def __init__(self, u, v, w, wt, N, scale_rad, svd=None, eps=1e-4, precompute=True, pre=None):
+    def __init__(self, u, v, w, wt, N, scale_rad, svd=None, eps=1e-4, precompute=True, pre=None, scope="snap"):
         self.N = N; self.sc = scale_rad; self.svd = svd
         if pre is not None:             # host arrays of snapshot.prepare_samples (same values as below)
             self.flip = cp.asarray(pre["flip"])
@@ -227,11 +351,13 @@ class SampleSet:
             self.w = w
         self.wt = cp.asarray(wt, dtype=cp.float32)
         self.npts = int(self.w.size)
-        self.plans = get_plans(N, eps)
+        self.plans = get_plans(N, eps, scope)
         self.token = next(_TOKENS)
         self.a = None
         if svd is not None and precompute:
-            self.a = [svd.a(k, self.w) for k in range(svd.K)]
+            idx = svd.a_index(self.w) if fast_ak() else None
+            self.a = [svd.a(k, self.w, idx) for k in range(svd.K)]
+            del idx
             self.ephase = cp.exp(1j * cp.pi * self.w).astype(cp.complex64)
 
     def _setpts(self, t):
@@ -240,8 +366,12 @@ class SampleSet:
             self.plans[t - 1].setpts(self.x, self.y)
             self.plans[t + 1] = self.token
 
-    def _ak(self, k):
-        return self.a[k] if self.a is not None else self.svd.a(k, self.w)
+    def _ak(self, k, idx=None):
+        return self.a[k] if self.a is not None else self.svd.a(k, self.w, idx)
+
+    def _aidx(self):
+        """The a_k table index of this set's w for one (de)gridding call (TTCALX_FAST_AK), else None."""
+        return self.svd.a_index(self.w) if (self.a is None and fast_ak()) else None
 
     def _eph(self):
         return self.ephase if self.a is not None else cp.exp(1j * cp.pi * self.w).astype(cp.complex64)
@@ -254,9 +384,17 @@ class SampleSet:
             return self.plans[0].execute(c.astype(cp.complex64)).real
         c = c * self._eph()
         acc = cp.zeros((self.N, self.N), cp.float32)
+        idx = self._aidx(); nocopy = idx is not None
+        # TTCALX_FUSED_WACC=1 (pruned plans): each term accumulated inside the transform's last gather
+        fuse = hasattr(self.plans[0], "execute_acc") and fused_wacc()
         for k in range(self.svd.K):
-            f = self.plans[0].execute((c * self._ak(k)).astype(cp.complex64))
+            if fuse:
+                self.plans[0].execute_acc((c * self._ak(k, idx)).astype(cp.complex64, copy=not nocopy), acc,
+                                          self.svd.jx, self.svd.tx, self.svd.Br[k], self.svd.Bi[k])
+                continue
+            f = self.plans[0].execute((c * self._ak(k, idx)).astype(cp.complex64, copy=not nocopy))
             self.svd.acc_re(acc, f, k)
+        del idx
         return cp.where(self.svd.inside, acc, 0)
 
     def grid_psf(self):
@@ -269,8 +407,10 @@ class SampleSet:
         self._setpts(2)
         m = cp.ascontiguousarray(from_ws(model_ws).astype(cp.float32))
         q = cp.zeros(self.npts, cp.complex64)
+        idx = self._aidx()
         for k in range(self.svd.K):
-            q += cp.conj(self._ak(k)) * self.plans[1].execute(self.svd.model_conj_b(m, k))
+            q += cp.conj(self._ak(k, idx)) * self.plans[1].execute(self.svd.model_conj_b(m, k))
+        del idx
         q *= cp.conj(self._eph())
         return cp.where(self.flip, cp.conj(q), q)
 
