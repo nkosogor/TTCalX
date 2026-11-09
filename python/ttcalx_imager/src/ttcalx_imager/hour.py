@@ -638,10 +638,10 @@ def _image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, band
                     f"bias {params.multiscale_scale_bias} niter={params.niter} mgain={params.mgain} "
                     f"auto-mask={params.auto_mask} auto-threshold={params.auto_threshold} local-rms "
                     f"horizon={params.horizon_deg}deg briggs {params.robust} tukey {params.taper_inner_tukey}")
-            hdr = lambda b: make_header(N, sdeg, ra, dec, s0["freqs"], s0["chan_width"], t0s[gi],
-                                        beam=b, telescope=s0["telescope"], observer=s0["observer"],
-                                        obj=s0["field_name"], extra=dict(NSNAP=(len(sn), "snapshots imaged")),
-                                        history=[hist])
+            hdr = lambda b, h=hist: make_header(N, sdeg, ra, dec, s0["freqs"], s0["chan_width"], t0s[gi],
+                                                beam=b, telescope=s0["telescope"], observer=s0["observer"],
+                                                obj=s0["field_name"], extra=dict(NSNAP=(len(sn), "snapshots imaged")),
+                                                history=[h])
             files = []; di = {}; theo = theoretical_beam_pix(sn, G.sc)
             if prod.image_i:
                 if multi:
@@ -670,7 +670,9 @@ def _image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, band
                     v = vpre; vpre = None
                 else:
                     v = imgfn("V"); lap(f"{vkey}: dirty V")
-                h = hdr(di.get("beam"))
+                # the V product is a dirty image (no CLEAN): its own HISTORY, not the I deconvolution line
+                h = hdr(di.get("beam"), f"ttcalx-image hour ({mode}, block {block}): {vkey} dirty V (no CLEAN) "
+                                        f"briggs {params.robust} tukey {params.taper_inner_tukey}")
                 vname = fn["V"] if prod.naming == "legacy" else f"{out_prefix}-{prod.v_tag}{tsfx}-image.fits"
                 files.append(write_image(vname, v, h, "V"))
                 lap(f"{vkey}: write")

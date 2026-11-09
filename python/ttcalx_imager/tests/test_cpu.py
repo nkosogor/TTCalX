@@ -286,6 +286,22 @@ def test_fits_header(tmp_path):
     assert ra1 > ra
 
 
+
+def test_write_images_header_per_stokes(tmp_path):
+    """A dirty V image is written with its own HISTORY (not the I CLEAN line), as the snapshot and hour writers do."""
+    from astropy.io import fits
+    from ttcalx_imager.fits import make_header, write_images
+    hdr = lambda hist: make_header(64, 1.0, 0.0, 0.6, [55e6], [1e5], 5.3e9, history=[hist])
+    h = {"I": hdr("ttcalx-image snapshot: clean I niter=50000"), "V": hdr("ttcalx-image snapshot: dirty V (no CLEAN)")}
+    pi, pv = write_images([(str(tmp_path / "x-I-image.fits"), np.zeros((64, 64)), "I"),
+                           (str(tmp_path / "x-V-image.fits"), np.zeros((64, 64)), "V")], h)
+    hi, hv = fits.getheader(pi), fits.getheader(pv)
+    assert hi["CRVAL4"] == 1.0 and "clean I" in str(hi["HISTORY"]) and "dirty V" not in str(hi["HISTORY"])
+    assert hv["CRVAL4"] == 4.0 and "dirty V (no CLEAN)" in str(hv["HISTORY"]) and "clean I" not in str(hv["HISTORY"])
+    # one header for every product still works (the MS hour job / older callers)
+    (p1,) = write_images([(str(tmp_path / "y-V-image.fits"), np.zeros((64, 64)), "V")], h["I"])
+    assert fits.getheader(p1)["CRVAL4"] == 4.0
+
 # ----------------------------------------------------------------------------- QA
 def test_qa_reject():
     r = np.r_[np.full(20, 0.89) + np.linspace(-0.005, 0.005, 20), 1.2, 0.3]

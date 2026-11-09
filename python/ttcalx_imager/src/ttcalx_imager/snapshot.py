@@ -239,11 +239,15 @@ class SnapshotImager:
                                   N, scale_deg, params, beam, timing=T, pre=L.get("pre"))
             info.update(r["info"])
             if out_prefix:
-                h = make_header(N, scale_deg, *ms.phase_dir, ms.freqs, ms.chan_width, ms.tstart, beam=info["beam"],
-                                telescope=ms.telescope, observer=ms.observer, obj=ms.field_name,
-                                history=[f"ttcalx-image snapshot: clean I niter={params.niter} auto-mask={params.auto_mask} "
-                                         f"auto-threshold={params.auto_threshold} local-rms horizon={params.horizon_deg}deg "
-                                         f"briggs {params.robust} tukey {params.taper_inner_tukey} nmajor={params.nmajor}"])
+                hdr = lambda hist: make_header(N, scale_deg, *ms.phase_dir, ms.freqs, ms.chan_width, ms.tstart,
+                                               beam=info["beam"], telescope=ms.telescope, observer=ms.observer,
+                                               obj=ms.field_name, history=[hist])
+                # the V image is the dirty image (no CLEAN): its own HISTORY, not the I CLEAN line
+                h = {"I": hdr(f"ttcalx-image snapshot: clean I niter={params.niter} auto-mask={params.auto_mask} "
+                              f"auto-threshold={params.auto_threshold} local-rms horizon={params.horizon_deg}deg "
+                              f"briggs {params.robust} tukey {params.taper_inner_tukey} nmajor={params.nmajor}"),
+                     "V": hdr(f"ttcalx-image snapshot: dirty V (no CLEAN) briggs {params.robust} "
+                              f"tukey {params.taper_inner_tukey}")}
                 prods = [("I-image", r["restored"], "I")]
                 if write_aux:
                     prods += [("I-residual", r["residual"], "I"), ("I-model", r["model"], "I")]
