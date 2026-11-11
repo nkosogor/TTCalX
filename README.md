@@ -4,463 +4,97 @@
 
 # TTCalX
 
-GPU-accelerated direction-dependent calibration developed for the OVRO LWA.
-TTCalX is an extended version of the previous TTCal package by Michael Eastwood (see https://github.com/mweastwood/TTCal.jl).
+GPU direction-dependent calibration (peeling) and a GPU CLEAN imager for the OVRO-LWA.
+TTCalX extends [TTCal](https://github.com/mweastwood/TTCal.jl) by Michael Eastwood.
+Documentation: <https://nkosogor.github.io/TTCalX/>.
 
-**Versions used by the OVRO-LWA GPU pipeline (gsi):** tag `gsi-v1` = as deployed until 2026-10-25;
-tag `gsi-v2` = 748884a (production with gsi v2); branch `exp/ttcalx-v3-all` = 0.3.0 peeler + gsi v3
-imager in one commit. Its defaults give 748884a's peel (bitwise) and images (GPU floor); the new
-speed paths are opt-in (`fast_kernels!`, `PeelWorkspace`, imager `FAST_ENV`).
+**Versions used by the OVRO-LWA GPU pipeline (gsi):** `gsi-v1` (deployed until 2026-10-25),
+`gsi-v2` = 748884a, `v0.3.1` (gsi v3; same code as `v0.3.0`, updated docs), `v0.4.0` = `main` (gsi v4: the
+imager's v4 speed switches in `ttcalx_imager.FAST_ENV`, turned on by the v3 engine; same images as 0.3.1). With
+default settings the peeler is bitwise like 748884a; the faster paths are opt-in.
 
+## Install
 
-## Table of Contents
-
-- [Overview](#overview)
-  - [Calibration Modes](#calibration-modes)
-- [Requirements](#requirements)
-  - [Server (Linux with NVIDIA GPU)](#server-linux-with-nvidia-gpu)
-- [Installation](#installation)
-  - [Using pre-installed version on calim servers](#using-pre-installed-version-on-calim-servers)
-  - [Installation from scratch](#installation-from-scratch)
-    - [1. Python environment with casacore](#1-python-environment-with-casacore)
-    - [2. Install Julia](#2-install-julia)
-    - [3. Clone and install Julia packages](#3-clone-and-install-julia-packages)
-    - [4. Verify installation](#4-verify-installation)
-- [Usage](#usage)
-  - [Basic Command](#basic-command)
-  - [Commands](#commands)
-  - [Options](#options)
-  - [Examples](#examples)
-  - [Batch Processing (Recommended)](#batch-processing-recommended)
-- [Tutorial](docs/TUTORIAL.md)
-- [Source File Format](#source-file-format)
-- [Sky and RFI peeling](#sky-and-rfi-peeling)
-- [GPU CLEAN imager (Python)](#gpu-clean-imager-python)
-- [Tests](#tests)
-- [Project Structure](#project-structure)
-- [Troubleshooting](#troubleshooting)
-  - [CUDA not found](#cuda-not-found)
-
-## Overview
-
-TTCalX performs direction-dependent calibration to remove bright radio sources from interferometric data. All heavy computation runs on CUDA when available.
-
-### Calibration Modes
-
-This software is under active development. Peel and zest have undergone limited testing; shave and prune are currently untested and should be used with caution. Supported modes: 
-
-| Mode | Jones Matrix | Frequency | Use Case |
-|------|-------------|-----------|----------|
-| **peel** | Diagonal (2 params) | Per-channel | Phase/amplitude calibration |
-| **zest** | Full (4 params) | Per-channel | + Polarization leakage |
-| **shave** | Diagonal | Wideband | Fast diagonal calibration |
-| **prune** | Full | Wideband | Fast full Jones calibration |
-
-
-
-## Requirements
-
-### Server (Linux with NVIDIA GPU)
-- **Julia 1.10+** (tested on 1.10.4)
-- **NVIDIA GPU** (tested on NVIDIA RTX A4000 16 GB)
-- **CUDA Toolkit 11+**
-- **Python 3** with `python-casacore` for MS I/O (via PyCall)
-
-## Installation 
-
-### Using pre-installed version on calim servers
-
-The package is pre-installed at `/opt/devel/nkosogor/nkosogor/TTCalX`.
+On the calim servers TTCalX is pre-installed at `/opt/devel/nkosogor/nkosogor/TTCalX` (the `gsi-v2`
+version; to run `main`, see [install.md](docs/src/install.md)):
 
 ```bash
-# Activate conda environment with casacore
 conda activate /opt/devel/pipeline/envs/py38_orca_nkosogor
-
-# Add Julia to PATH
 export PATH="/opt/devel/nkosogor/nkosogor/julia-1.10.4/bin:$PATH"
-
-# Run TTCalX (example: zest 3 sources from an MS file)
-julia --project=/opt/devel/nkosogor/nkosogor/TTCalX \
-    /opt/devel/nkosogor/nkosogor/TTCalX/bin/ttcal_gpu.jl \
-    zest /opt/devel/nkosogor/nkosogor/TTCalX/sources.json your_data.ms
+export JULIA_DEPOT_PATH="/tmp/julia_${USER}:/opt/devel/nkosogor/nkosogor/julia_depot"
+julia --project=/opt/devel/nkosogor/nkosogor/TTCalX /opt/devel/nkosogor/nkosogor/TTCalX/bin/ttcal_gpu.jl --help
 ```
 
-For convenience, you can add these to your `~/.bashrc`:
+Keep this Julia out of your global `PATH` if you also use the original TTCal (`julia060`); use a
+separate terminal for each. Installation from scratch: [docs/src/install.md](docs/src/install.md).
+Walkthrough (peel, then image): [tutorial](docs/src/tutorial.md).
+Requirements: Julia 1.10+, an NVIDIA GPU with CUDA 11+ (tested on RTX A4000), Python 3 with
+`python-casacore`.
+
+## Peeling
+
+Two command-line entry points:
+
+| | `bin/ttcal_gpu.jl` | `bin/zest_sky_rfi.jl` |
+|---|---|---|
+| peels | sky sources | sky sources, then near-field RFI emitters (or jointly) |
+| solver | damped StefCal | RK4 StefCal, as CPU TTCal |
+| model, UVW | kernel model, MS UVW | exact model, geometric UVW, divergence guard |
+| use | quick peeling | reproduces CPU TTCal (production gsi) |
 
 ```bash
-# TTCalX setup
-alias ttcalx_env='conda activate /opt/devel/pipeline/envs/py38_orca_nkosogor && export PATH="/opt/devel/nkosogor/nkosogor/julia-1.10.4/bin:$PATH" && export JULIA_DEPOT_PATH="/tmp/julia_${USER}:/opt/devel/nkosogor/nkosogor/julia_depot"'
-alias ttcalx='julia --project=/opt/devel/nkosogor/nkosogor/TTCalX /opt/devel/nkosogor/nkosogor/TTCalX/bin/ttcal_gpu.jl'
-
-# Then simply run:
-# ttcalx_env
-# ttcalx zest /opt/devel/nkosogor/nkosogor/TTCalX/sources.json data.ms
-
-```
-
-> **Note:** The `ttcalx_env` alias sets `JULIA_DEPOT_PATH` with two paths: `/tmp/julia_$USER` (writable, for compiled cache) and `/opt/devel/nkosogor/nkosogor/julia_depot` (read-only, for pre-installed packages). This way no per-user package installation is needed — only the maintainer needs to run `Pkg.instantiate()` once.
-
-> **Important:** Do **not** add Julia 1.10.4 to your PATH globally in `~/.bashrc`. Only the alias should set it. Running `ttcalx_env` modifies the current terminal session's PATH and `JULIA_DEPOT_PATH`, so if you also use original (https://github.com/mweastwood/TTCal.jl) TTCal (in `julia060`), use a **separate terminal** for each:
-> - **Terminal 1** (production): `conda activate julia060` → `ttcal.jl peel ...`
-> - **Terminal 2** (TTCalX): `ttcalx_env` → `ttcalx zest ...`
-
-### Installation from scratch
-
-#### 1. Python environment with casacore
-
-On OVRO-LWA servers you can use the existing environment (see https://github.com/ovro-lwa/distributed-pipeline/)
-
-```bash
-# Use existing conda environment with casacore
-conda activate <your_casacore_env>
-
-# Verify python-casacore works
-python -c "from casacore.tables import table; print('casacore OK')"
-```
-
-Or create a new environment:
-
-```bash
-# Create new conda environment
-conda create -n ttcal python=3.10 -y
-conda activate ttcal
-
-# Install python-casacore
-pip install python-casacore
-```
-
-#### 2. Install Julia
-
-Download and extract Julia 1.10+:
-
-```bash
-wget https://julialang-s3.julialang.org/bin/linux/x64/1.10/julia-1.10.4-linux-x86_64.tar.gz
-tar -xzf julia-1.10.4-linux-x86_64.tar.gz
-export PATH="$PWD/julia-1.10.4/bin:$PATH"
-```
-
-#### 3. Clone and install Julia packages
-
-```bash
-git clone https://github.com/nkosogor/TTCalX.git
-cd TTCalX
-
-# Install dependencies and build PyCall with current Python
-julia -e '
-using Pkg
-Pkg.activate(".")
-Pkg.instantiate()
-ENV["PYTHON"] = Sys.which("python")
-Pkg.build("PyCall")
-'
-```
-
-#### 4. Verify installation
-
-```bash
-# Check CUDA is working
-julia --project=. -e "using CUDA; println(\"CUDA functional: \", CUDA.functional())"
-
-# Test TTCalX loads and shows help
-julia --project=. bin/ttcal_gpu.jl --help
-```
-
-## Usage
-
-For a detailed walkthrough with example data, see the [Tutorial](docs/TUTORIAL.md).
-
-### Basic Command
-
-```bash
-julia bin/ttcal_gpu.jl <command> [options] <sources.json> <ms_file(s)>
-```
-
-### Commands
-
-- `peel` - Diagonal Jones, per-channel
-- `zest` - Full Jones, per-channel
-- `shave` - Diagonal Jones, wideband
-- `prune` - Full Jones, wideband
-
-### Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--maxiter=N` | 30 | Max StEFCal iterations |
-| `--tolerance=T` | 1e-4 | Convergence tolerance |
-| `--minuvw=M` | 10.0 | Min baseline length (wavelengths) |
-| `--peeliter=P` | 3 | Number of peeling iterations |
-| `--column=COL` | CORRECTED_DATA | MS data column |
-| `--verbose` | | Show detailed diagnostic output |
-| `--quiet` | | Suppress all output except errors |
-| `--help` | | Show help message |
-
-### Examples
-
-```bash
-# Peel sources from a single MS
-julia bin/ttcal_gpu.jl peel sources.json my_data.ms
-
-# Zest with custom parameters
-julia bin/ttcal_gpu.jl zest --maxiter=50 --minuvw=15 sources.json data.ms
-
-# Process multiple MS files (batch mode)
-julia bin/ttcal_gpu.jl peel sources.json *.ms
-
-# Use specific data column
-julia bin/ttcal_gpu.jl peel --column=DATA sources.json data.ms
-```
-
-### Batch Processing (Recommended)
-
-> **Performance Tip:** Always use batch mode when processing multiple MS files! The first MS file includes JIT compilation overhead (~0.5-1 min), but subsequent files run at full speed (~10-12s each). Processing files individually means paying the JIT cost every time.
-
-```bash
-# Process all MS files in a directory (RECOMMENDED)
-julia bin/ttcal_gpu.jl peel sources.json /path/to/*.ms
-```
-
-## Source File Format
-
-The sources file is a JSON array of source objects (see [sources.json](sources.json) in this repo).
-Also included:
-- [sources/sources_7src_tauA.json](sources/sources_7src_tauA.json): Cyg A, Cas A, Tau A, Vir A, Her A, Hya A, Per B
-- [sources/rfi_43.2_ver20251101.json](sources/rfi_43.2_ver20251101.json): near-field RFI model
-
-## Sky and RFI peeling
-
-> **Different solver from the commands above.** `bin/ttcal_gpu.jl` (Usage section) uses the
-> original damped StefCal, the kernel sky model and the MS UVW, and peels sky sources only.
-> `bin/zest_sky_rfi.jl` below uses RK4 StefCal, the exact sky model, geometric UVW and a
-> divergence guard, and also peels near-field RFI emitters. Results differ between the two.
-
-```bash
-# Sky sources, then the RFI emitter (defaults: rk4, maxiter 5, tol 1e-4, minuvw 5, peeliter 3)
+julia bin/ttcal_gpu.jl zest sources.json *.ms          # modes: peel, zest, shave, prune
 julia bin/zest_sky_rfi.jl --column=DATA --rfi=sources/rfi_43.2_ver20251101.json sources.json *.ms
-
-# RFI as one more direction with the sky sources; regularised; diagonal Jones; on CPU threads
-julia bin/zest_sky_rfi.jl --rfi=rfi.json --rfi-mode=joint sources.json data.ms
-julia bin/zest_sky_rfi.jl --rfi=rfi.json --reg=0.5,0.5 sources.json data.ms
-julia bin/zest_sky_rfi.jl --peel --solver=damped --maxiter=30 sources.json data.ms
-julia -t 24 bin/zest_sky_rfi.jl --cpu --rfi=rfi.json sources.json data.ms
-
-# Do not peel sources that are not in the model (see below)
-julia bin/zest_sky_rfi.jl --rfi=rfi.json --smooth-flux=1000 \
-      --restore=jupiter.json --restore-below-mhz=41 --restore-offset=0.5 sources.json *.ms
 ```
 
-**Keeping unmodelled sources.** With a free gain per antenna and channel, a direction whose own
-signal is weak (a faint or low source, the RFI emitter outside its model band) bends its gains
-into the fringe of another bright source and subtracts that too. `--smooth-flux=S` ties each
-direction's per-channel gains to one gain per band with weight ρ = N_ant (S/2)², solved exactly
-in every StefCal step (`consensus_steps!`): directions much brighter than S Jy keep per-channel
-gains, much fainter ones get the band gain, which still fits their own model but cannot follow a
-fringe across channels (2024-12 tests: 3C134 kept 0.81-0.92 instead of 0.45-0.64 at 08h, peeled
-residuals within ~20 %, same speed). Jupiter is absorbed by the bright per-channel directions;
-`--restore=FILE` (point sources at their ephemeris positions; the name must not be exactly
-"Jupiter", which the parser treats as a placeholder; the CLI refuses it) fits what peeling took
-from them, jointly with the peeled models, and adds it back. `--rfi-smooth-flux` sets the RFI
-directions' value separately and `--smooth-exempt-flux=1e4` keeps per-channel gains for sources
-with that catalog flux (Cas A, Cyg A). For speed, `--precision=mixed` and `--warm-start`
-(consecutive snapshots of one band) cut the GPU zest from ~4 s to ~1 s per snapshot. `--restore-offset=0.5` first finds the source's position
-in the data on Stokes V (Jupiter's decametric emission is strongly circularly polarised); use 0 for
-unpolarised sources.
+Pass many MSes in one call: the first pays ~1 min of compilation, the rest take seconds each.
+`--help` lists every option. Main `bin/zest_sky_rfi.jl` options (all off by default):
 
-`--help` lists every option. The same in Julia: `zest_sky_rfi_ms!(ms, sky, rfi; kwargs...)`,
-or `zest_sky_rfi!` on visibilities already in memory. The building blocks:
-
-- Sky + RFI zesting that reproduces CPU TTCal, at a few seconds per snapshot on one GPU
-  (about 50x faster than CPU TTCal).
-- Near-field RFI sources, peeled after the sky sources or jointly with them.
-- Optional regularised (Tukey phase-prior) peeling; it stabilises joint RFI solves when Cas A is low.
-- Runs on CPU threads too (`julia -t N`), with the same results as the GPU.
-- Divergence guards: `flag_zero_visibilities!` (all-zero samples) and `guarded_zest!`, CPU TTCal's
-  peel loop that keeps a new solution only if it lowers the residual power.
-- Recommended settings: `solver=:rk4, maxiter=5, tolerance=1e-4, minuvw=5`, exact model,
-  `geometric_uvw!`, model flags copied from the data.
-
-| Piece | What it does |
+| option | what it does |
 |---|---|
-| `geometric_uvw!(meta, ms_mjd(ms))` | Replaces the MS UVW (OVRO-LWA: r₁−r₂, unprecessed) with precessed ITRF baselines, so the far-field model follows the apparent sky as in CPU TTCal |
-| `genvis_exact!(vis, meta, source, mjd)` | CPU TTCal's sky model: per-component horizon, 3-D Gaussian projection on the local north/east axes, `xy = U − iV` |
-| `GPURFISource` (JSON entries with `rfi-frequencies`) | Near-field RFI emitter, as ttcal_dev's `RFISource`; model via `gpu_genvis!` |
-| `solve_gains!(cal, data, model, meta; solver=:rk4)` | CPU TTCal's solver (RK4 of the StefCal step, per-channel convergence); `solver=:damped` is `gpu_stefcal!`'s iteration; optional Tukey phase prior `reg=phase_regularization(...)` |
-| `solve_gains!(...; smooth_flux=S)` | Per-channel gains tied to one band gain with weight N_ant (S/2)² (`consensus_steps!`) |
-| `restore_point_sources!(vis, before, meta, mjd, sources; others, offset_deg)` | Gives back what peeling took from known point sources (e.g. Jupiter) |
-| Host arrays (`read_ms_to_gpu(ms; gpu=false)`) | The same operations on CPU threads (`julia -t N`), same results as the GPU |
-| `read_ms_fast` / `write_ms_fast!` | Same results as `read_ms_to_gpu` / `write_gpu_to_ms!`, with the row gather/scatter in numpy |
+| `--rfi=FILE`, `--rfi-mode=after\|joint` | peel near-field RFI emitters after the sky, or as extra directions |
+| `--solver=rk4\|damped`, `--peel`, `--cpu` | solver; diagonal instead of full Jones; CPU threads (`julia -t N`, same results) |
+| `--reg=OFFSET,TAPER` | Tukey phase prior on the gains (degrees) |
+| `--smooth-flux=S` | directions much fainter than S Jy get one gain per band, so they cannot absorb other sources |
+| `--restore=FILE`, `--restore-offset=0.5` | give back what peeling took from known point sources (e.g. Jupiter; name must not be exactly "Jupiter"), position searched on Stokes V |
+| `--precision=mixed`, `--warm-start` | single-precision normal equations; start from the previous snapshot's gains (~4 s → ~1 s per snapshot) |
 
-A zest of one source with CPU TTCal's settings:
+From Julia: `zest_sky_rfi_ms!(ms, sky, rfi; kwargs...)`, or `zest_sky_rfi!` on visibilities in
+memory. Opt-in speed paths for long-running processes: `fast_kernels!(true)` (faster GPU kernels,
+equal to rounding) and `zest_sky_rfi!(...; workspace=PeelWorkspace())` (reuses ~2 GB of GPU buffers
+across calls, bitwise the same results). The building blocks (`solve_gains!`, `genvis_exact!`,
+`geometric_uvw!`, `restore_point_sources!`, `read_ms_fast`) are described in their docstrings and
+in the [documentation](https://nkosogor.github.io/TTCalX/).
 
-```julia
-vis, _, meta, bl, nrows = read_ms_fast(ms)
-mjd = ms_mjd(ms)
-geometric_uvw!(meta, mjd)
-model = GPUVisibilities(meta.Nbase, meta.Nfreq)
-genvis_exact!(model, meta, source, mjd)
-model.flags .= vis.flags                       # flagged data out of both sides of the solve
-cal = calibration_type(GPUZestingSource(source), meta.Nant, meta.Nfreq)
-solve_gains!(cal, vis, model, meta; solver=:rk4, maxiter=5, tolerance=1e-4, minuvw=5.0)
-gpu_corrupt!(model, cal, meta)
-gpu_subsrc!(vis, model)
-write_ms_fast!(ms, vis, bl, nrows)
-```
+Source models are JSON arrays ([sources.json](sources.json)). Included:
+[sources/sources_7src_tauA.json](sources/sources_7src_tauA.json) (Cyg A, Cas A, Tau A, Vir A, Her A,
+Hya A, Per B) and [sources/rfi_43.2_ver20251101.json](sources/rfi_43.2_ver20251101.json) (RFI
+emitters; entries with `rfi-frequencies`).
 
-Variations (same steps, change one line):
+## GPU CLEAN imager
 
-```julia
-# Damped solver (gpu_stefcal!'s iteration) instead of RK4
-solve_gains!(cal, vis, model, meta; solver=:damped, maxiter=30, tolerance=1e-2, minuvw=5.0)
-
-# Regularised peeling: Tukey phase prior allowing ~0.5 deg position error, tapering over 0.5 deg
-reg = phase_regularization(meta, 0.5, 0.5; lambda=1.0)
-solve_gains!(cal, vis, model, meta; solver=:rk4, maxiter=5, tolerance=1e-4, minuvw=5.0, reg=reg)
-
-# Diagonal gains (peel) instead of full Jones (zest)
-cal = calibration_type(GPUPeelingSource(source), meta.Nant, meta.Nfreq)
-
-# RFI emitter: sources.json entries with "rfi-frequencies" come back as GPURFISource
-sources = read_gpu_sources("sources_with_rfi.json")
-rfi = first(filter(is_rfi, sources))
-gpu_genvis!(model, meta, rfi, meta.phase_center_ra, meta.phase_center_dec, 0.0)
-# ...then solve/corrupt/subtract as above: after the sky sources,
-#    or as one more direction in the same peel loop (joint).
-
-# CPU threads instead of the GPU (run with julia -t 24)
-vis, _, meta, bl, nrows = read_ms_fast(ms; gpu=false)
-model = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=false)
-cal = calibration_type(GPUZestingSource(source), meta.Nant, meta.Nfreq; gpu=false)
-```
-
-**New in 0.3.0** (all off by default.  With none set, the production gsi peel on 4 OVRO-LWA 55 MHz
-snapshots gave bitwise the visibilities of 0.2.0 / 748884a on the GPU, 2026-11-02):
-- `fast_kernels!(true)` (gsi `peel.fast_kernels`, `ZEST_FAST_KERNELS=1`): tiled full-Jones normal
-  equations, RFI fringes on the device, fused corrupt-subtract.  Equal to the old kernels to rounding
-  (summation order), not bitwise.  Off by default: the GPU runs 0.2.0's (748884a's) kernels.
-- `smooth_flux` / `rfi_smooth_flux` / `smooth_exempt_flux` (`solve_gains!`, `zest_sky_rfi!`,
-  CLI `--smooth-flux` ...): per-channel gains tied to a band gain for faint directions.
-- `restore` / `restore_below_mhz` / `restore_offset_deg` and `restore_point_sources!`
-  (CLI `--restore` ...): give back what peeling took from known point sources such as Jupiter.
-- `precision = :mixed` (CLI `--precision=mixed`): normal equations in single precision,
-  the zest ~3-4x faster on GPUs with slow FP64; gains agree with double to ~1e-7.
-- `initial_gains` and the result's `gains` (CLI `--warm-start`): start from the previous
-  snapshot's gains (same channels, ≤ 60 s apart).
-- `zest_sky_rfi!` returns `restored` and `gains` as well; `zest_sky_rfi_ms!` logs read/zest/write
-  times at verbose level; `stefcal_steps!` takes `active` (channels to step);
-  `GPUSquareVisibilities` may hold ComplexF32.
-
-**Reusing buffers across calls** (off by default): a process that peels snapshot after
-snapshot can pass one `ws = PeelWorkspace()` as `zest_sky_rfi!(...; workspace=ws)`.  The models,
-square matrices, solver scratch, residual and restore buffers are then kept and reused while
-(Nant, Nbase, Nfreq, precision, device) stay the same, so a warm call allocates ~20 MB of device
-memory instead of ~10 GB (OVRO-LWA, 352 antennas, 48 channels, Jupiter restore) and CUDA.jl does
-not collect inside the solve under `JULIA_CUDA_SOFT_MEMORY_LIMIT`.  Results are bitwise identical
-to calls without it in the tests (`test_workspace.jl`, host and GPU, with the fast kernels off and on).  `workspace_bytes(ws)` is its size (~2.4 GB for 4 sky sources + 1 RFI
-emitter + restore; `cache_model_sq=false` keeps one square model instead of one per direction,
-~180 MB each); `free_workspace!(ws)` releases it.
-
-**Behaviour changes for all callers** (`sources.jl`):
-- `GPUPowerLaw` uses TTCal's base-10 logs. Natural logs agreed only for single-index
-  spectra, so curved spectra such as Cyg A's were several times too faint.
-- Source JSON entries with `rfi-frequencies` are now read as `GPURFISource` (near-field
-  RFI emitters) instead of failing to parse.
-
-## GPU CLEAN imager (Python)
-
-`python/ttcalx_imager` is a pip-installable Python package (CuPy + cuFINUFFT + python-casacore)
-that makes the main-pipeline imaging products from peeled snapshot MSes on one GPU, emulating
-WSClean with the orca settings:
-
-- `ttcalx-image snapshot`: 10-s CLEANed Stokes I (`SNAPSHOT_CLEAN_I_PARAMS`) + dirty Stokes V
-  (pilot snapshot) + QA JSON, 0.55 s (41 MHz) / 0.8 s (69 MHz) per snapshot on an RTX A4000;
-- `ttcalx-image hour`: 1-h and 6 x 10-min Stokes I (multiscale `I-Deep-Taper-Robust-0`,
-  `I-Taper-10min`) and dirty V, with chgcentre-exact phase rotation and the orca snapshot QA;
-  one 41 MHz band-hour (288 snapshots) in 2 min (1 h) / 3.6 min (1 h + 6 x 10 min), 0.073 sigma
-  from the main-pipeline WSClean image.
-
-The restoring beam is a port of WSClean's PSF fit: it returns WSClean's BMAJ/BMIN to ~1e-6 on
-WSClean's PSFs, and the beams fitted to our own PSFs are within 0.1 % of WSClean's.
+`python/ttcalx_imager` (CuPy + cuFINUFFT) makes the main-pipeline imaging products on one GPU,
+emulating WSClean with the orca settings: 10-s snapshots (CLEAN I, dirty V, QA) at 0.5-0.8 s each,
+and the 1-h / 10-min products of a band-hour in a few minutes, within 0.06-0.10 sigma of WSClean.
 
 ```bash
 pip install -e 'python/ttcalx_imager[gpu,test]'
 ttcalx-image snapshot /data/41MHz/*.ms --out-dir snap41/
 ttcalx-image hour @list41.txt --band 41 --out hour41/41MHz --lst-hour 2 --qa-dir snap41/
-pytest python/ttcalx_imager/tests          # GPU tests are skipped without CuPy/CUDA
 ```
 
-See [docs/src/gpu-clean-imager.md](docs/src/gpu-clean-imager.md) for the conventions, the
-mapping to WSClean options, validation numbers and limitations.
+Details, the mapping to WSClean options and validation: [docs/src/gpu-clean-imager.md](docs/src/gpu-clean-imager.md).
 
 ## Tests
 
 ```bash
-julia --project=. -t 4 test/runtests.jl     # unit tests (CPU; GPU checks run if CUDA works)
-julia --project=. test/quick_test.jl        # end-to-end smoke test on the example MS
-```
-
-## Project Structure
-
-```
-TTCalX/
-├── bin/
-│   └── ttcal_gpu.jl              # Main CLI script
-├── src/
-│   ├── TTCalX.jl                 # Main module entry point
-│   └── gpu/
-│       ├── types.jl              # GPU data types
-│       ├── sources.jl            # Source models
-│       ├── peel_gpu.jl           # Peeling implementation
-│       ├── pycall_ms_bridge.jl   # MS I/O via python-casacore
-│       ├── geometry.jl           # Precession/nutation/GAST, geometric UVW
-│       ├── rfi.jl                # Near-field RFI sources
-│       ├── genvis_exact.jl       # CPU-TTCal-exact sky model (GPU kernel + host threads)
-│       ├── regularization.jl     # Tukey phase prior
-│       ├── solver.jl             # solve_gains!: RK4 / damped StefCal, GPU + host
-│       ├── host_backend.jl       # Multithreaded CPU versions of the peel operations
-│       ├── ms_io.jl              # Faster MS read/write, ms_mjd
-│       ├── memory.jl             # Memory utilities
-│       ├── logging.jl            # Progress bars & verbosity
-│       └── kernels/              # CUDA kernels
-│           ├── utils.jl
-│           ├── stefcal.jl
-│           ├── corrupt.jl
-│           └── genvis.jl
-├── test/
-│   ├── runtests.jl               # Unit tests
-│   └── quick_test.jl             # Smoke test on the example MS
-├── python/ttcalx_imager/         # GPU CLEAN imager (Python package, `ttcalx-image` CLI)
-│   ├── src/ttcalx_imager/        # msio, weights, gridder, rotate, clean, beam, snapshot, hour, ...
-│   └── tests/                    # pytest (GPU tests skipped without CUDA)
-├── examples/
-│   ├── sources.json              # Example sources file
-│   └── 20240524_090003_73MHz_ch0to5.ms  # Test dataset (6 ch, ~22 MB)
-├── Project.toml                  # Julia dependencies
-├── README.md                     # This file
-└── LICENSE.md
+julia --project=. -t 4 test/runtests.jl     # GPU checks run when CUDA works
+pytest python/ttcalx_imager/tests           # GPU tests skipped without CuPy/CUDA
 ```
 
 ## Troubleshooting
 
-### CUDA not found
-
-```bash
-# Check GPU visibility
-nvidia-smi
-
-# In Julia, test CUDA
-julia --project=/opt/devel/nkosogor/nkosogor/TTCalX -e "using CUDA; println(CUDA.functional())"
-```
-
-### "Package CUDA is required but does not seem to be installed"
-
-Make sure `JULIA_DEPOT_PATH` includes the shared depot:
-
-```bash
-export JULIA_DEPOT_PATH="/tmp/julia_${USER}:/opt/devel/nkosogor/nkosogor/julia_depot"
-```
-
-This is already included in the `ttcalx_env` alias. The first path (`/tmp`) is writable for compiled cache, the second path reads pre-installed packages from the shared depot.
-
-
-
-
+- `CUDA.functional()` false: check `nvidia-smi`, then
+  `julia --project=. -e "using CUDA; println(CUDA.functional())"`.
+- "Package CUDA is required but does not seem to be installed": `JULIA_DEPOT_PATH` must include
+  the shared depot (see Install), and a clone needs a `Manifest.toml` ([install.md](docs/src/install.md)).

@@ -19,14 +19,13 @@ makedocs(
     ),
     pages = [
         "Home"            => "index.md",
+        "Installation"    => "install.md",
         "Tutorial"        => "tutorial.md",
-        "Calibration"     => "calibration.md",
-        "Source Models"    => "sources.md",
-        "GPU Kernels"     => "kernels.md",
-        "MS I/O"          => "msio.md",
+        "Peeling"         => "peeling.md",
         "GPU CLEAN Imager" => "gpu-clean-imager.md",
         "CLI Reference"   => "cli.md",
         "API Reference"   => "api.md",
+        "Internals"       => "internals.md",
     ],
     # No doctests — the module cannot be loaded without CUDA/PyCall
     doctest  = false,

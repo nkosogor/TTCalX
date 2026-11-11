@@ -8,6 +8,8 @@ Flux convention: dirty/residual images are surface brightness (Jy/beam) and are 
 as-is; a *model* (Jy/pixel) moved from frame A to frame B is multiplied by the SIN pixel
 solid-angle Jacobian n_A / n_B (a pixel covers dl dm / n steradian).
 """
+import os
+
 import numpy as np
 import cupy as cp
 from cupyx.scipy import ndimage as cnd
@@ -25,6 +27,21 @@ def target_dirs(N, sc):
     return l, m, n, inside
 
 
+# TTCALX_FAST_COORDS=1 (default 0): Reprojector.coords in one kernel with the float64 operations of the CuPy
+# expression below, each rounded on its own (__dmul_rn / __dadd_rn / __ddiv_rn: no fused multiply-add), so the
+# coordinates are the same bits; ~10x less memory traffic than the per-operation temporaries
+_coords_kernel = cp.ElementwiseKernel(
+    "float64 l, float64 m, float64 n, bool inside, raw float64 r, float64 sc, float64 half",
+    "float32 ys32, float32 xs32, bool ok, float64 ns",
+    """const double c = -n;
+       const double ls = __dadd_rn(__dadd_rn(__dmul_rn(r[0], l), __dmul_rn(r[1], m)), __dmul_rn(r[2], c));
+       const double ms = __dadd_rn(__dadd_rn(__dmul_rn(r[3], l), __dmul_rn(r[4], m)), __dmul_rn(r[5], c));
+       ns = -__dadd_rn(__dadd_rn(__dmul_rn(r[6], l), __dmul_rn(r[7], m)), __dmul_rn(r[8], c));
+       xs32 = (float)__dadd_rn(__ddiv_rn(ls, sc), half);
+       ys32 = (float)__dadd_rn(half, -__ddiv_rn(ms, sc));
+       ok = inside && (ns > 0);""", "ttcalx_reproject_coords")
+
+
 class Reprojector:
     def __init__(self, N, sc):
         self.N = N; self.sc = sc
@@ -33,6 +50,12 @@ class Reprojector:
     def coords(self, R):
         """For each pixel of the target grid: (y, x) pixel position in the source frame, validity
         and n in the source frame, where uvw_target = R uvw_source."""
+        if os.environ.get("TTCALX_FAST_COORDS", "0") == "1":
+            N = self.N
+            yx = cp.empty((2, N, N), cp.float32); ok = cp.empty((N, N), cp.bool_); ns = cp.empty((N, N), cp.float64)
+            r = cp.asarray(np.ascontiguousarray(np.asarray(R, np.float64).T).ravel())
+            _coords_kernel(self.l, self.m, self.n, self.inside, r, float(self.sc), float(N // 2), yx[0], yx[1], ok, ns)
+            return yx, ok, ns
         Rt = cp.asarray(np.asarray(R).T)
         a, b, c = self.l, self.m, -self.n
         ls = Rt[0, 0] * a + Rt[0, 1] * b + Rt[0, 2] * c
@@ -72,7 +95,27 @@ def fft_upsample(img, up=2, taper=None):
     F = cp.fft.fft2(img.astype(cp.complex64))
     if taper is not None:
         F *= taper
+    if up == 2 and N % 2 == 0 and img.shape[1] == N and os.environ.get("TTCALX_FAST_UPSAMPLE", "0") == "1":
+        return _upsample2_polyphase(F)
     F = cp.fft.fftshift(F)
     M = N * up; o = (M - N) // 2
     G = cp.zeros((M, M), cp.complex64); G[o:o + N, o:o + N] = F
     return (cp.fft.ifft2(cp.fft.ifftshift(G)).real * (up * up)).astype(cp.float32)
+
+
+def _upsample2_polyphase(F):
+    """fft_upsample(up=2) from the (tapered) N x N spectrum F (fftfreq order, N even) with four N x N inverse FFTs
+    instead of one 2N x 2N: the zero-padded 2N-point inverse DFT at the even / odd output samples is the N-point
+    inverse DFT of F times exp(i pi f / N) ** parity along each axis (f = the fftfreq bin in [-N/2, N/2), as the
+    zero padding places it).  The same values to FFT rounding (TTCALX_FAST_UPSAMPLE=1, default 0): at the hour sizes
+    (2N = 2 x 3122, 2 x 2358, 2 x 1508) the 2N transform is a slow Bluestein one."""
+    N = F.shape[0]
+    f = cp.fft.fftfreq(N, d=1.0 / N)                          # bins -N/2 .. N/2 - 1 (float64)
+    ph = cp.exp(1j * cp.pi * f / N).astype(cp.complex64)
+    out = cp.empty((2 * N, 2 * N), cp.float32)
+    for sy in (0, 1):
+        Fy = F * ph[:, None] if sy else F
+        for sx in (0, 1):
+            out[sy::2, sx::2] = cp.fft.ifft2(Fy * ph[None, :] if sx else Fy).real
+        del Fy
+    return out

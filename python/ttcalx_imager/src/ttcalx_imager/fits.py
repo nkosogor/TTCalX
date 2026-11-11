@@ -74,5 +74,7 @@ def write_image(path, arr, header, stokes=None):
 
 
 def write_images(prods, header):
-    """Write [(path, 2-D host or device array, stokes)] with one header; returns the paths."""
-    return [write_image(path, arr, header, stokes=st) for path, arr, st in prods]
+    """Write [(path, 2-D host or device array, stokes)] with one header, or with ``header[stokes]`` when
+    ``header`` is a dict (e.g. a dirty V image with its own HISTORY); returns the paths."""
+    pick = (lambda st: header[st]) if isinstance(header, dict) else (lambda st: header)
+    return [write_image(path, arr, pick(st), stokes=st) for path, arr, st in prods]

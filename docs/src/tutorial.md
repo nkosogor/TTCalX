@@ -1,270 +1,114 @@
 # [Tutorial](@id tutorial)
 
-A detailed walkthrough of using TTCalX for direction-dependent calibration, from quick verification to full production workflows.
+Peel the bright sources from OVRO-LWA snapshots with `bin/zest_sky_rfi.jl`, then image them.
+Paths in `<angle brackets>` are placeholders for your own data.
 
-## Table of Contents
-
-- [Quick Test (Example Dataset)](#Quick-Test-(Example-Dataset))
-- [Full Workflow on Calim (Single MS)](#Full-Workflow-on-Calim-(Single-MS))
-- [Batch Processing on Calim (Multiple MS)](#Batch-Processing-on-Calim-(Multiple-MS))
-- [Example Results](#Example-Results)
-
----
-
-## Quick Test (Example Dataset)
-
-A small test dataset (6 channels, ~22 MB) is included in `examples/` for quick verification. This MS was extracted from a calibrated OVRO-LWA observation at 73 MHz.
-
-**Set up a working directory and run the quick test on calim:**
+## Environment (calim servers)
 
 ```bash
-ttcalx_env
-
-# Create a working directory and copy the example MS (never modify originals)
-mkdir -p /lustre/$USER/ttcalx_test && cd /lustre/$USER/ttcalx_test
-cp -r /opt/devel/nkosogor/nkosogor/TTCalX/examples/20240524_090003_73MHz_ch0to5.ms test_zest.ms
-
-# Run zest (use --column=DATA for split data)
-ttcalx zest /home/pipeline/sources.json test_zest.ms \
-    --column=DATA --verbose --maxiter=30 --tolerance=1e-4 --minuvw=10
+conda activate /opt/devel/pipeline/envs/py38_orca_nkosogor
+export PATH="/opt/devel/nkosogor/nkosogor/julia-1.10.4/bin:$PATH"
+export JULIA_DEPOT_PATH="/tmp/julia_${USER}:/opt/devel/nkosogor/nkosogor/julia_depot"
+T=/opt/devel/nkosogor/nkosogor/TTCalX        # or your clone of TTCalX (see Installation)
+zest() { julia --project=$T $T/bin/zest_sky_rfi.jl "$@"; }
 ```
 
-**Image the peeled data with wsclean (dirty image):**
+The shared install is the version the production pipeline runs (tag `gsi-v2`); see
+[Installation](install.md) to run `main` (0.3) with the same environment.
 
-After peeling, TTCalX writes the calibrated visibilities back to the `DATA` column. Make a quick dirty image to verify using the `orca` Python wrapper:
+## 1. Quick test (example MS)
 
-```python
-from pathlib import Path
-from orca.wrapper.wsclean import wsclean
-
-ms = Path("test_zest.ms").resolve()
-out_dir = Path("images").resolve()
-out_dir.mkdir(parents=True, exist_ok=True)
-
-wsclean(
-    ms_list=[str(ms)],
-    out_dir=str(out_dir),
-    filename_prefix="peeled_73MHz_test",
-    extra_arg_list=[
-        "-pol", "IV",
-        "-size", "4096", "4096",
-        "-scale", "0.03125",
-        "-niter", "0",
-        "-weight", "briggs", "0",
-        "-horizon-mask", "10deg",
-        "-taper-inner-tukey", "30",
-    ],
-    num_threads=4,
-    mem_gb=50,
-)
-```
-
----
-
-## Full Workflow on Calim (Single MS)
-
-A typical OVRO-LWA calibration workflow: copy data → apply bandpass/delay calibration → peel/zest bright sources → image.
-
-### Step 1: Copy data to working directory
-
-Always work on a copy — never modify pipeline originals.
+`examples/20240524_090003_73MHz_ch0to5.ms` (6 channels at 73 MHz, ~22 MB, already calibrated,
+data in `DATA`). Always work on a copy.
 
 ```bash
-mkdir -p /lustre/$USER/ttcalx_test && cd /lustre/$USER/ttcalx_test
-cp -r /lustre/pipeline/night-time/averaged/73MHz/2024-05-24/09/20240524_090003_73MHz_averaged.ms .
-ls -ld 20240524_090003_73MHz_averaged.ms
+mkdir -p <work dir> && cd <work dir>
+cp -r $T/examples/20240524_090003_73MHz_ch0to5.ms test.ms
+zest --column=DATA --rfi=$T/sources/rfi_43.2_ver20251101.json $T/sources/sources_7src_tauA.json test.ms
 ```
 
-### Step 2: Apply bandpass and delay calibration
+These are the production settings: the defaults of `zest_sky_rfi.jl` (RK4 StefCal, `maxiter=5`,
+`tolerance=1e-4`, `minuvw=5`, `peeliter=3`, `max-gain=100`, exact model, geometric UVW, residual
+guard) plus the RFI emitters peeled after the sky (`--rfi-mode=after`). The sky model has Cyg A,
+Cas A, Tau A, Vir A, Her A, Hya A and Per B. `--help` lists the other options; see
+[CLI Reference](cli.md).
+
+## 2. Full snapshots: calibrate, peel, image
 
 ```bash
-ttcalx_env
-cd /lustre/$USER/ttcalx_test
-
-python3 -c "
+cp -r <night-time averaged MS dir>/20240524_*_73MHz_averaged.ms .
+python3 - <<'EOF'
+import glob
 from casatasks import applycal
-
-MS = '20240524_090003_73MHz_averaged.ms'
-DELAY_TABLE  = '/lustre/pipeline/calibration/delay/2024-05-24/20240524_delay.delay'
-BANDPASS_TBL = '/lustre/pipeline/calibration/bandpass/73MHz/2024-05-24/11/bandpass_concat.73MHz_11.bandpass'
-
-applycal(
-    vis=MS,
-    gaintable=[DELAY_TABLE, BANDPASS_TBL],
-    calwt=[False],
-    flagbackup=True,
-)
-"
+for ms in sorted(glob.glob("20240524_*_73MHz_averaged.ms")):
+    applycal(vis=ms, gaintable=["<delay table>", "<bandpass table>"], calwt=[False], flagbackup=True)
+EOF
 ```
 
-### Step 3: Peel/zest bright sources with TTCalX
+`applycal` writes `CORRECTED_DATA`, the default column of both CLIs. Peel all MSes in one call,
+so that only the first one pays the ~1 min of Julia compilation:
 
 ```bash
-ttcalx zest /home/pipeline/sources.json 20240524_090003_73MHz_averaged.ms \
-    --verbose --maxiter=30 --tolerance=1e-4 --minuvw=10
+zest --rfi=$T/sources/rfi_43.2_ver20251101.json $T/sources/sources_7src_tauA.json 20240524_*_73MHz_averaged.ms
 ```
 
-### Step 4: Image with wsclean
+Opt-in options for consecutive snapshots of one band: `--precision=mixed --warm-start`
+(single-precision normal equations; start from the previous snapshot's gains).
+
+**Alternative, `bin/ttcal_gpu.jl`** (damped StefCal, kernel model, MS UVW; modes peel, zest, shave,
+prune; defaults `maxiter=30`, `minuvw=10`):
+
+```bash
+julia --project=$T $T/bin/ttcal_gpu.jl zest $T/sources/sources_7src_tauA.json 20240524_*_73MHz_averaged.ms
+```
+
+### Image with the GPU imager
+
+`ttcalx-image snapshot` makes the orca snapshot products (CLEAN I, dirty V, QA JSON) on one GPU.
+It reads the `DATA` column, so peel into `DATA` (`--column=DATA`, as the pipeline does) or copy
+the peeled column there first. Installation: [GPU CLEAN imager](gpu-clean-imager.md).
+
+```bash
+ttcalx-image snapshot 20240524_*_73MHz_averaged.ms --out-dir images/
+#   -> images/<stem>-I-image.fits, <stem>-V-image.fits, <stem>-qa.json
+```
+
+### Alternative: WSClean through orca (dirty image)
 
 ```python
 from pathlib import Path
 from orca.wrapper.wsclean import wsclean
 
-ms = Path("20240524_090003_73MHz_averaged.ms").resolve()
-out_dir = Path("images").resolve()
-out_dir.mkdir(parents=True, exist_ok=True)
-
-wsclean(
-    ms_list=[str(ms)],
-    out_dir=str(out_dir),
-    filename_prefix="zested_73MHz",
-    extra_arg_list=[
-        "-pol", "IV",
-        "-size", "4096", "4096",
-        "-scale", "0.03125",
-        "-niter", "0",
-        "-weight", "briggs", "0",
-        "-horizon-mask", "10deg",
-        "-taper-inner-tukey", "30",
-    ],
-    num_threads=4,
-    mem_gb=50,
-)
+out_dir = Path("images").resolve(); out_dir.mkdir(exist_ok=True)
+for ms in sorted(Path(".").glob("20240524_*_73MHz_averaged.ms")):
+    wsclean(ms_list=[str(ms.resolve())], out_dir=str(out_dir),
+            filename_prefix=ms.stem.replace("_averaged", "_zested"),
+            extra_arg_list=["-pol", "IV", "-size", "4096", "4096", "-scale", "0.03125",
+                            "-niter", "0", "-weight", "briggs", "0",
+                            "-horizon-mask", "10deg", "-taper-inner-tukey", "30"],
+            num_threads=4, mem_gb=50)
 ```
 
----
+## Timing (February 2026)
 
-## Batch Processing on Calim (Multiple MS)
+`ttcal_gpu.jl zest`, version of 2026-02-06, on an RTX A4000 (16 GB); 73 MHz, 352 antennas,
+48 channels. For the 0.3.0 `zest_sky_rfi.jl` timings see the [README](https://github.com/nkosogor/TTCalX#peeling).
 
-Process multiple MS files end-to-end: copy → applycal → zest in batch.
+| MS | time |
+|---|---|
+| first | ~27 s (includes compilation) |
+| each further MS | ~5-10 s |
 
-### Step 1: Copy data to working directory
+## Example results (February 2026)
 
-```bash
-mkdir -p /lustre/$USER/ttcalx_batch && cd /lustre/$USER/ttcalx_batch
-SRC=/lustre/pipeline/night-time/averaged/73MHz/2024-05-24/09
-cp -r $SRC/20240524_090003_73MHz_averaged.ms .
-cp -r $SRC/20240524_093009_73MHz_averaged.ms .
-cp -r $SRC/20240524_095904_73MHz_averaged.ms .
-```
+Dirty Stokes I images (`niter=0`) before and after `ttcal_gpu.jl zest`, same setup as the timing.
 
-### Step 2: Apply calibration to all files
+Quick test (6 channels):
 
-```bash
-ttcalx_env
-cd /lustre/$USER/ttcalx_batch
+![Quick test: before vs after peeling](img/comparison_test.jpg)
 
-python3 -c "
-from casatasks import applycal
+Full MSes (48 channels), 09:00:03, 09:30:09 and 09:59:04 UTC:
 
-DELAY_TABLE  = '/lustre/pipeline/calibration/delay/2024-05-24/20240524_delay.delay'
-BANDPASS_TBL = '/lustre/pipeline/calibration/bandpass/73MHz/2024-05-24/11/bandpass_concat.73MHz_11.bandpass'
-
-ms_files = [
-    '20240524_090003_73MHz_averaged.ms',
-    '20240524_093009_73MHz_averaged.ms',
-    '20240524_095904_73MHz_averaged.ms',
-]
-
-for ms in ms_files:
-    print(f'Applying calibration to {ms}...')
-    applycal(
-        vis=ms,
-        gaintable=[DELAY_TABLE, BANDPASS_TBL],
-        calwt=[False],
-        flagbackup=True,
-    )
-    print(f'  Done: {ms}')
-"
-```
-
-### Step 3: Zest all files in batch mode
-
-Pass all MS files at once so TTCalX only compiles once:
-
-```bash
-ttcalx zest /home/pipeline/sources.json \
-    20240524_090003_73MHz_averaged.ms \
-    20240524_093009_73MHz_averaged.ms \
-    20240524_095904_73MHz_averaged.ms \
-    --maxiter=30 --tolerance=1e-4 --minuvw=10
-```
-
-Or using a glob:
-
-```bash
-ttcalx zest /home/pipeline/sources.json *.ms \
-    --maxiter=30 --tolerance=1e-4 --minuvw=10
-```
-
-### Step 4: Image all peeled files
-
-```python
-from pathlib import Path
-from orca.wrapper.wsclean import wsclean
-
-ms_files = [
-    "20240524_090003_73MHz_averaged.ms",
-    "20240524_093009_73MHz_averaged.ms",
-    "20240524_095904_73MHz_averaged.ms",
-]
-
-out_dir = Path("images").resolve()
-out_dir.mkdir(parents=True, exist_ok=True)
-
-for ms_name in ms_files:
-    ms = Path(ms_name).resolve()
-    prefix = ms.stem.replace("_averaged", "_zested")
-    print(f"Imaging {ms_name} -> {prefix}")
-    wsclean(
-        ms_list=[str(ms)],
-        out_dir=str(out_dir),
-        filename_prefix=prefix,
-        extra_arg_list=[
-            "-pol", "IV",
-            "-size", "4096", "4096",
-            "-scale", "0.03125",
-            "-niter", "0",
-            "-weight", "briggs", "0",
-            "-horizon-mask", "10deg",
-            "-taper-inner-tukey", "30",
-        ],
-        num_threads=4,
-        mem_gb=50,
-    )
-```
-
-### Expected Performance
-
-Benchmarked on calim server (NVIDIA RTX A4000 16 GB) with 73 MHz data (352 antennas, 48 channels, zest mode):
-
-| MS file | Time | Notes |
-|---------|------|-------|
-| 1st file | ~27s | Includes JIT compilation |
-| 2nd file | ~5-10s | Full GPU speed |
-| 3rd file | ~5-10s | Full GPU speed |
-| **Average (excl. JIT)** | **~5-10s** | |
-
-!!! tip
-    **Always use batch mode** — pass all MS files in a single `ttcalx` call to pay the JIT cost only once.
-
----
-
-## Example Results
-
-Below are dirty images (Stokes I, `niter=0`) showing the effect of peeling with TTCalX.
-
-### Quick Test (6 channels)
-
-![Quick Test: Before vs After Peeling](img/comparison_test.jpg)
-
-### Full MS (48 channels)
-
-**09:00:03 UTC:**
-![09:00:03 Before vs After](img/comparison_090003.jpg)
-
-**09:30:09 UTC:**
-![09:30:09 Before vs After](img/comparison_093009.jpg)
-
-**09:59:04 UTC:**
-![09:59:04 Before vs After](img/comparison_095904.jpg)
+![09:00:03 before vs after](img/comparison_090003.jpg)
+![09:30:09 before vs after](img/comparison_093009.jpg)
+![09:59:04 before vs after](img/comparison_095904.jpg)

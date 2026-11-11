@@ -14,6 +14,7 @@ geometry (the first snapshot of a geometry costs ~1-2 s extra).
 """
 import json
 import math
+import os
 import time
 import traceback
 from collections import deque
@@ -51,7 +52,28 @@ def snapshot_svd(N, sc, wf, tol):
     if key not in gridder._SVD_CACHE:
         for k in [k for k in gridder._SVD_CACHE if k[4] == 600]:
             del gridder._SVD_CACHE[k]
+        if os.environ.get("TTCALX_SVD_PREFETCH", "0") == "1":
+            _prefetch_factors(wq, tol)
     return get_svd(N, sc, float(wf) * 1.0001 + 1e-6, tol, quantum=0.25, nw=600, pad=0.0)
+
+
+_PREFETCH = {}
+
+
+def _prefetch_factors(wq, tol):
+    """TTCALX_SVD_PREFETCH=1 (default 0): the w-term factors (gridder._svd_factors, host) of the neighbouring
+    0.25-lambda keys are computed in a background thread, so the next snapshot whose w range moves to one of
+    them finds them in gridder's factor cache (the same function and arguments, so the same factors)."""
+    from concurrent.futures import ThreadPoolExecutor
+    ex = _PREFETCH.get("ex")
+    if ex is None:
+        ex = _PREFETCH["ex"] = ThreadPoolExecutor(1, thread_name_prefix="ttcalx-svd-prefetch")
+    for w in (wq + 0.25, wq - 0.25):
+        if w > 0 and (float(w), float(tol), 600, 2001) not in _PREFETCH:
+            _PREFETCH[(float(w), float(tol), 600, 2001)] = ex.submit(gridder._svd_factors, float(w), tol, 600, 2001)
+    if len(_PREFETCH) > 64:              # forget old futures (their factors stay in gridder's cache)
+        for k in [k for k in _PREFETCH if k != "ex"][:32]:
+            _PREFETCH.pop(k, None)
 
 
 
@@ -217,11 +239,15 @@ class SnapshotImager:
                                   N, scale_deg, params, beam, timing=T, pre=L.get("pre"))
             info.update(r["info"])
             if out_prefix:
-                h = make_header(N, scale_deg, *ms.phase_dir, ms.freqs, ms.chan_width, ms.tstart, beam=info["beam"],
-                                telescope=ms.telescope, observer=ms.observer, obj=ms.field_name,
-                                history=[f"ttcalx-image snapshot: clean I niter={params.niter} auto-mask={params.auto_mask} "
-                                         f"auto-threshold={params.auto_threshold} local-rms horizon={params.horizon_deg}deg "
-                                         f"briggs {params.robust} tukey {params.taper_inner_tukey} nmajor={params.nmajor}"])
+                hdr = lambda hist: make_header(N, scale_deg, *ms.phase_dir, ms.freqs, ms.chan_width, ms.tstart,
+                                               beam=info["beam"], telescope=ms.telescope, observer=ms.observer,
+                                               obj=ms.field_name, history=[hist])
+                # the V image is the dirty image (no CLEAN): its own HISTORY, not the I CLEAN line
+                h = {"I": hdr(f"ttcalx-image snapshot: clean I niter={params.niter} auto-mask={params.auto_mask} "
+                              f"auto-threshold={params.auto_threshold} local-rms horizon={params.horizon_deg}deg "
+                              f"briggs {params.robust} tukey {params.taper_inner_tukey} nmajor={params.nmajor}"),
+                     "V": hdr(f"ttcalx-image snapshot: dirty V (no CLEAN) briggs {params.robust} "
+                              f"tukey {params.taper_inner_tukey}")}
                 prods = [("I-image", r["restored"], "I")]
                 if write_aux:
                     prods += [("I-residual", r["residual"], "I"), ("I-model", r["model"], "I")]
@@ -421,7 +447,7 @@ class SnapshotImager:
             wr.shutdown(wait=True)
 
 
-def v_rms_from_samples(s, N, scale_deg, robust=0.0, tukey_inner=30.0, svd_tol=1e-4, eps=1e-4):
+def v_rms_from_samples(s, N, scale_deg, robust=0.0, tukey_inner=30.0, svd_tol=1e-4, eps=1e-4, scope="snap"):
     """QA statistic of one loaded snapshot (msio.load_samples dict): std of the central box of the
     dirty Stokes V image made with the snapshot's own Briggs weights (= orca pilot snapshot)."""
     if len(s["u"]) == 0:
@@ -432,6 +458,6 @@ def v_rms_from_samples(s, N, scale_deg, robust=0.0, tukey_inner=30.0, svd_tol=1e
     WG.add(u, v, nw); WG.finalize()
     iw = WG.weights(u, v, nw)
     svd = snapshot_svd(N, sc, float(cp.abs(w).max()), svd_tol)
-    S = SampleSet(u, v, w, iw, N, sc, svd=svd, eps=eps, precompute=False)
+    S = SampleSet(u, v, w, iw, N, sc, svd=svd, eps=eps, precompute=False, scope=scope)
     img = to_ws(S.grid(cp.asarray(s["V"]))) / float(iw.sum())
     return box_std(img)
