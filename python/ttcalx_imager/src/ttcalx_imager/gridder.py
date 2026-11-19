@@ -290,6 +290,16 @@ def pruned_on(scope):
     return v in ("1", "all", "on") or scope in {x.strip() for x in v.split(",")}
 
 
+def _room_for_setpts(m):
+    """cuFINUFFT allocates its per-point index / sort arrays with cudaMalloc, outside CuPy's pool, so it cannot
+    reclaim the pool's cached (unused) blocks.  While an hour's chunks of slightly different sizes are gridded the
+    pool can grow to the whole card (2026-11-17 18 MHz LST 22h: 16 GB cached, 0.7 GB in use), and setpts then
+    fails with cudaErrorMemoryAllocation or not, depending on whether CuPy or cuFINUFFT allocates next.  The
+    cached blocks are released when the free device memory is short of what setpts may need (same results)."""
+    if cp.cuda.runtime.memGetInfo()[0] < 64 * m + (1 << 30):
+        cp.get_default_memory_pool().free_all_blocks()
+
+
 def get_plans(N, eps=1e-4, scope="snap"):
     """(type-1, type-2) single-transform complex64 cuFINUFFT plans for an N x N image.  scope: "snap" (snapshot
     imager) or "hour" (hour stage), for TTCALX_NUFFT_PRUNED."""
@@ -363,6 +373,7 @@ class SampleSet:
     def _setpts(self, t):
         """Point the type-t plan (1 grid, 2 degrid) at this sample set (skipped if already)."""
         if self.plans[t + 1] != self.token:
+            _room_for_setpts(self.npts)
             self.plans[t - 1].setpts(self.x, self.y)
             self.plans[t + 1] = self.token
 
