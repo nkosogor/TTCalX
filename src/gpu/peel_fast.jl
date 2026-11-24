@@ -18,10 +18,11 @@
 #   square matrices       32x32 tiles through shared memory, only the tiles I <= J the tiled normal
 #                         equations read, the short-baseline mask built once per call; no zero
 #                         fills of buffers that are fully overwritten
-#   precision             ComplexF32 gain copies in the normal equations, the 2x2 step solve in
-#                         Float32, model x gain products of the add / subtract in Float32, model
-#                         fringes with the phase reduced mod 2pi in Float64 and sincos in Float32;
-#                         ComplexF32 visibilities when the caller passes them (the validated setup)
+#   precision             ComplexF32 gain copies in the normal equations (Float32 partial sums, the
+#                         2x2 step solve in Float64 as the default), model x gain products of the
+#                         add / subtract in Float32, model fringes with the phase reduced mod 2pi
+#                         in Float64 and sincos in Float32; ComplexF32 visibilities when the caller
+#                         passes them (the validated setup)
 #   RK4                   ~9 launches per iteration: the step kernel also writes the RK stage and
 #                         its Float32 copy, one kernel per channel does the update, the stop test
 #                         and the mask; the early stop is read from host-mapped memory one
@@ -361,34 +362,6 @@ function fast_ne_tile_kernel!(part, gxx, gxy, gyx, gyy, Vxx, Vxy, Vyx, Vyy, Mxx,
     return nothing
 end
 
-"""Normal equations of antenna `j` (compact number), channel β, from the tile partial sums in their own precision."""
-@inline function _sum_part32(part, j, β, ntile)
-    ntuple(Val(8)) do q
-        acc = part[j, q, 1, β]
-        for t in 2:ntile
-            acc += part[j, q, t, β]
-        end
-        acc
-    end
-end
-
-"""`_full_step_ne` (no prior) with the 2x2 solve in the normal equations' own (single) precision."""
-@inline function _full_step_ne32(j, β, ne, gxx, gxy, gyx, gyy)
-    nxx, nxy, nyx, nyy, dxx, dxy, dyx, dyy = ne
-    z = ComplexF64(0)
-    det_den = dxx*dyy - dxy*dyx
-    abs(det_den) > eps(Float64) || return z, z, z, z
-    inv_det = one(det_den) / det_den
-    inv_xx = dyy * inv_det; inv_xy = -dxy * inv_det
-    inv_yx = -dyx * inv_det; inv_yy = dxx * inv_det
-    sol_xx = inv_xx*nxx + inv_xy*nyx
-    sol_xy = inv_xx*nxy + inv_xy*nyy
-    sol_yx = inv_yx*nxx + inv_yy*nyx
-    sol_yy = inv_yx*nxy + inv_yy*nyy
-    return ComplexF64(conj(sol_xx)) - gxx[j, β], ComplexF64(conj(sol_yx)) - gxy[j, β],
-           ComplexF64(conj(sol_xy)) - gyx[j, β], ComplexF64(conj(sol_yy)) - gyy[j, β]
-end
-
 function fast_tog32_kernel!(o1, o2, o3, o4, g1, g2, g3, g4, n)
     i = thread_index_1d()
     if i <= n
@@ -398,10 +371,11 @@ function fast_tog32_kernel!(o1, o2, o3, o4, g1, g2, g3, g4, n)
     return nothing
 end
 
-# StefCal step k of antenna j (0 for frozen channels and dead antennas), then for stage 1 / 2 the RK stage
+# StefCal step k of antenna j (0 for frozen channels and dead antennas; else the default's _sum_part and
+# _full_step_ne: Float32 partials summed, the 2x2 solve in Float64), then for stage 1 / 2 the RK stage
 # x = base + 0.5 k, stage 3 x = base + k (stage 4: none), and its ComplexF32 copy y (the next NE's gains)
 function fast_step_kernel!(kxx, kxy, kyx, kyy, part, gxx, gxy, gyx, gyy, b1, b2, b3, b4, x1, x2, x3, x4,
-                           y1, y2, y3, y4, stage::Int, active, Nant, Nfreq, ntile, comp, lowp::Bool)
+                           y1, y2, y3, y4, stage::Int, active, Nant, Nfreq, ntile, comp)
     idx = thread_index_1d()
     if idx <= Nant * Nfreq
         j = ((idx - 1) % Nant) + 1
@@ -410,8 +384,6 @@ function fast_step_kernel!(kxx, kxy, kyx, kyy, part, gxx, gxy, gyx, gyy, b1, b2,
         if (active !== nothing && !active[β]) || jc == 0
             z = zero(eltype(kxx))
             sxx = z; sxy = z; syx = z; syy = z
-        elseif lowp
-            sxx, sxy, syx, syy = _full_step_ne32(j, β, _sum_part32(part, jc, β, ntile), gxx, gxy, gyx, gyy)
         else
             ne = _sum_part(part, jc, β, ntile)
             sxx, sxy, syx, syy = _full_step_ne(j, β, ne, gxx, gxy, gyx, gyy, nothing, nothing, 0.0)
@@ -581,7 +553,6 @@ function _fast_rk4!(g, meas_sq, model_sq, ne, Na, Nf, maxiter, tolerance, compac
     n = Na * Nf
     blocks, threads = kernel_config_1d(n)
     @cuda blocks=blocks threads=threads fast_tog32_kernel!(y..., g..., n)
-    lowp = eltype(ne) == ComplexF32
     comp = compact === nothing ? nothing : compact.comp
     live = compact === nothing ? nothing : compact.live
     N = compact === nothing ? Na : compact.N
@@ -594,7 +565,7 @@ function _fast_rk4!(g, meas_sq, model_sq, ne, Na, Nf, maxiter, tolerance, compac
             @cuda blocks=(ntile * (ntile + 1) ÷ 2, Nf) threads=(_NE_TILE, ty) shmem=8 * _NE_TILE * ty * sizeof(eltype(ne)) fast_ne_tile_kernel!(
                 ne, y..., V..., M..., active, N, ntile, live)
             @cuda blocks=blocks threads=threads fast_step_kernel!(kk..., ne, gin..., g..., x..., y..., stage, active, Na, Nf,
-                                                                 ntile, comp, lowp)
+                                                                 ntile, comp)
         end
         if Na <= 1024
             @cuda blocks=Nf threads=32 * cld(Na, 32) fast_final1_kernel!(g..., k1..., k2..., k3..., k4..., y..., active, Na,
