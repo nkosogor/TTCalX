@@ -246,6 +246,25 @@ def test_degrid_switch_uses_the_hour_frame_sampleset(zen_env):
     assert float(cp.abs(z["restored"] - ref["restored"]).max()) < 3e-3 * float(ref["restored"].max())
 
 
+def test_hour_set_degrid_not_precomputed(zen_env):
+    """_HourSet builds its hour-frame SampleSet without the precomputed a_k arrays (K_h x npts, while the zenith
+    buffers are alive); its degrid is bitwise that of the precomputed production SampleSet."""
+    small, raw, R, _ = _snapshot()
+    sc = math.radians(SDEG)
+    L = snapshot.gpu_select(small, raw, SDEG)
+    iw, sw = _weights(L, sc)
+    pre = L["pre"]
+    hs = snapshot._HourSet(N, sc, pre, iw, 1e-4, 1e-4)
+    rng = np.random.default_rng(5)
+    model = cp.zeros((N, N), cp.float32)
+    model[rng.integers(60, 200, 40), rng.integers(60, 200, 40)] = cp.asarray(rng.uniform(0.1, 3.0, 40), cp.float32)
+    got = hs.degrid(model)
+    assert hs._S.a is None
+    svd = snapshot.snapshot_svd(N, sc, pre["wabsmax"], 1e-4)
+    ref = SampleSet(None, None, None, iw, N, sc, svd=svd, pre=pre).degrid(model)
+    assert ref.dtype == got.dtype and bool((ref == got).all())
+
+
 def test_pinned_h2d_same_bytes(monkeypatch):
     """TTCALX_PINNED_H2D: host arrays reach the GPU through the page-locked staging buffer unchanged (the buffer
     grows for a larger request and is reused); CuPy inputs pass through; off = cp.asarray."""

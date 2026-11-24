@@ -182,8 +182,11 @@ class _HourSet:
 
     def degrid(self, model):
         if self._S is None:
+            # precompute=False: no K_h x npts a_k arrays while the zenith buffers are alive (a_k formed per call:
+            # the same values, so the same degrid bits)
             svd = snapshot_svd(self.N, self.sc, self.pre["wabsmax"], self.tol)
-            self._S = SampleSet(None, None, None, self.iw, self.N, self.sc, svd=svd, eps=self.eps, pre=self.pre)
+            self._S = SampleSet(None, None, None, self.iw, self.N, self.sc, svd=svd, eps=self.eps, pre=self.pre,
+                                precompute=False)
         return self._S.degrid(model)
 
 
