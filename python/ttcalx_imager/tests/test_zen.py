@@ -246,6 +246,44 @@ def test_degrid_switch_uses_the_hour_frame_sampleset(zen_env):
     assert float(cp.abs(z["restored"] - ref["restored"]).max()) < 3e-3 * float(ref["restored"].max())
 
 
+@pytest.mark.parametrize("where", ["construct", "dirty", "psf", "cufinufft"])
+def test_zen_out_of_memory_falls_back_to_production(zen_env, where):
+    """An out-of-GPU-memory error in ZenSnapshot or in its first passes (dirty I, PSF; also cuFINUFFT's plan / setpts
+    allocation errors): the zenith caches are freed and the snapshot is imaged on the production path (the same
+    products as without the zenith samples, to the GPU rerun floor); any other error is raised."""
+    small, raw, R, _ = _snapshot()
+    im = SnapshotImager()
+    L = snapshot.gpu_select(small, raw, SDEG)
+    args = (L["u"], L["v"], L["w"], L["wnat"], L["visI"], L["visV"], N, SDEG)
+    ref = im.image_arrays(*args, pre=L["pre"])
+    oom = (RuntimeError("Error setting non-uniform points: 2") if where == "cufinufft" else
+           cp.cuda.memory.OutOfMemoryError(1 << 34, 1 << 34))
+    real_init, real_image = zenith.ZenSnapshot.__init__, zenith.ZenSnapshot.image
+
+    def init(self, *a, **k):
+        real_init(self, *a, **k)
+        if where in ("construct", "cufinufft"):
+            raise oom
+
+    def image(self, vis, grid="main", norm=True):
+        if (where == "dirty" and grid == "main") or (where == "psf" and grid == "psf"):
+            raise oom
+        return real_image(self, vis, grid, norm)
+    zen_env.setattr(zenith.ZenSnapshot, "__init__", init)
+    zen_env.setattr(zenith.ZenSnapshot, "image", image)
+    z = im.image_arrays(*args, pre=L["pre"], zen=L["zen"])
+    assert "zen" not in z["info"] and "zen_oom" in z["info"] and z["info"]["K"] == ref["info"]["K"]
+    assert not zenith._TABLES and not zenith._PLANS and "w" not in L["zen"]._c
+    peak = float(ref["restored"].max())
+    assert float(cp.abs(z["restored"] - ref["restored"]).max()) < 1e-5 * peak     # the GPU rerun floor
+    # not an out-of-memory error: raised
+    oom = ValueError("a bug")
+    with pytest.raises(ValueError):
+        im.image_arrays(*args, pre=L["pre"], zen=L["zen"])
+    assert zenith.is_oom(RuntimeError("Error creating plan: 3")) and zenith.is_oom(RuntimeError("cudaErrorMemoryAllocation: out of memory"))
+    assert not zenith.is_oom(RuntimeError("Error executing plan"))
+
+
 def test_hour_set_degrid_not_precomputed(zen_env):
     """_HourSet builds its hour-frame SampleSet without the precomputed a_k arrays (K_h x npts, while the zenith
     buffers are alive); its degrid is bitwise that of the precomputed production SampleSet."""

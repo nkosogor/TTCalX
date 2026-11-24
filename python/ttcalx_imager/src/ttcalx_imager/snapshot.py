@@ -218,7 +218,7 @@ class SnapshotImager:
         del ud, vd, nwd
         lap("weights")
         Z = None
-        zen_far = None
+        zen_far = zen_oom = None
         if pre is not None and zen is not None:
             wz = zen.wabs if hasattr(zen, "wabs") else float(cp.abs(zen["w"]).max())
             use, kh, kz = zenith.use_zen(pre["wabsmax"], wz, self.svd_tol)
@@ -228,41 +228,61 @@ class SnapshotImager:
                 except zenith.ZenFar as e:      # too far from its zenith for the b_k table: production path
                     Z, zen_far = None, e.n_min
                     self.log(str(e))
+                except Exception as e:          # out of GPU memory: production path (anything else is raised)
+                    if not zenith.is_oom(e):
+                        raise
+                    Z, zen_oom = None, str(e)
         if Z is not None:
-            # zenith-frame gridding (zenith.py); the hour-frame SampleSet only for degridding (> dft_max components)
-            lap("svd table")
-            S = _HourSet(N, sc, pre, iw, self.svd_tol, self.eps)
-            u32 = cp.asarray(pre["u32"]); v32 = cp.asarray(pre["v32"]); w32 = cp.asarray(pre["w32"])
-            theo_pix = pre["theo_pix"]
-        elif pre is None:
-            svd = snapshot_svd(N, sc, np.abs(w).max(), self.svd_tol)
-            lap("svd table")
-            S = SampleSet(u, v, w, iw, N, sc, svd=svd, eps=self.eps)
-            u32 = cp.asarray(u, dtype=cp.float32); v32 = cp.asarray(v, dtype=cp.float32); w32 = cp.asarray(w, dtype=cp.float32)
-            theo_pix = 1.0 / float(np.sqrt(u * u + v * v + w * w).max()) / sc     # WSClean theoretical beam
-        else:
-            svd = snapshot_svd(N, sc, pre["wabsmax"], self.svd_tol)
-            lap("svd table")
-            S = SampleSet(None, None, None, iw, N, sc, svd=svd, eps=self.eps, pre=pre)
-            u32 = cp.asarray(pre["u32"]); v32 = cp.asarray(pre["v32"]); w32 = cp.asarray(pre["w32"])
-            theo_pix = pre["theo_pix"]
-        check_psf_support(scale_deg, theo_pix, params.local_rms_window, S.npts)   # no gridding for a degenerate PSF
-        dI = cp.asarray(visI)
-        lap("gridder setup")
+            # zenith-frame gridding (zenith.py); the hour-frame SampleSet only for degridding (> dft_max components).
+            # The first passes (dirty I, PSF) may still run out of GPU memory: then the production path below
+            try:
+                lap("svd table")
+                S = _HourSet(N, sc, pre, iw, self.svd_tol, self.eps)
+                u32 = cp.asarray(pre["u32"]); v32 = cp.asarray(pre["v32"]); w32 = cp.asarray(pre["w32"])
+                theo_pix = pre["theo_pix"]
+                check_psf_support(scale_deg, theo_pix, params.local_rms_window, S.npts)
+                dI = cp.asarray(visI)
+                lap("gridder setup")
+                image = Z.image
+                dirty = image(dI)
+                lap("dirty I")
+                psf = Z.image(cp.ones(S.npts, cp.complex64), grid="psf", norm=False)
+            except Exception as e:
+                if not zenith.is_oom(e):
+                    raise
+                Z, zen_oom = None, str(e)
+                S = image = dirty = psf = None
+        if zen_oom is not None:                 # the zenith buffers are gone with Z: free them, then production
+            zenith.clear()
+            if hasattr(zen, "drop_samples"):
+                zen.drop_samples()
+            cp.get_default_memory_pool().free_all_blocks()
+            self.log(f"zenith: out of GPU memory ({zen_oom[:200]}): production path")
         if Z is None:
+            if pre is None:
+                svd = snapshot_svd(N, sc, np.abs(w).max(), self.svd_tol)
+                lap("svd table")
+                S = SampleSet(u, v, w, iw, N, sc, svd=svd, eps=self.eps)
+                u32 = cp.asarray(u, dtype=cp.float32); v32 = cp.asarray(v, dtype=cp.float32); w32 = cp.asarray(w, dtype=cp.float32)
+                theo_pix = 1.0 / float(np.sqrt(u * u + v * v + w * w).max()) / sc     # WSClean theoretical beam
+            else:
+                svd = snapshot_svd(N, sc, pre["wabsmax"], self.svd_tol)
+                lap("svd table")
+                S = SampleSet(None, None, None, iw, N, sc, svd=svd, eps=self.eps, pre=pre)
+                u32 = cp.asarray(pre["u32"]); v32 = cp.asarray(pre["v32"]); w32 = cp.asarray(pre["w32"])
+                theo_pix = pre["theo_pix"]
+            check_psf_support(scale_deg, theo_pix, params.local_rms_window, S.npts)   # no gridding for a degenerate PSF
+            dI = cp.asarray(visI)
+            lap("gridder setup")
+
             def image(x):
                 return to_ws(S.grid(x)) / sw
-        else:
-            image = Z.image
-        dirty = image(dI)
-        lap("dirty I")
-        # PSF = image of unit visibilities WITH the w-term: WSClean's PSF agrees with a direct DFT
-        # of that to ~1e-5, the w-less PSF differs by up to ~1e-3 of the peak at el < 60 deg.
-        # Normalised to 1 at the centre, as WSClean writes it.
-        if Z is None:
+            dirty = image(dI)
+            lap("dirty I")
+            # PSF = image of unit visibilities WITH the w-term: WSClean's PSF agrees with a direct DFT
+            # of that to ~1e-5, the w-less PSF differs by up to ~1e-3 of the peak at el < 60 deg.
+            # Normalised to 1 at the centre, as WSClean writes it.
             psf = to_ws(S.grid(cp.ones(S.npts, cp.complex64)))
-        else:
-            psf = Z.image(cp.ones(S.npts, cp.complex64), grid="psf", norm=False)
         psf = psf / psf[N // 2, N // 2]
         lap("psf")
         sky = to_ws(svd.inside) if Z is None else to_ws(gridder._geometry(N, sc, 1.0, 2001)[0])
@@ -287,6 +307,8 @@ class SnapshotImager:
             info["zen"] = Z.info()
         elif zen_far is not None:
             info["zen_far_n_min"] = zen_far
+        if zen_oom is not None:
+            info["zen_oom"] = zen_oom[:200]
         if imgV is not None:
             info.update(V_rms_box=box_std(imgV), V_maxabs=float(cp.abs(imgV).max()))
         return dict(restored=restored, residual=res, model=model, dirty=dirty, psf=psf, V=imgV, info=info)

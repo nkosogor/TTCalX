@@ -67,6 +67,19 @@ RING_PX_DEFAULT = 8.0    # ... and at least this many zenith-grid pixels (radial
 QUANTUM = 0.25           # snapshot table key quantum (snapshot.snapshot_svd)
 
 
+_OOM_PREFIXES = ("Error setting non-uniform points", "Error creating plan")
+
+
+def is_oom(e):
+    """True for an out-of-GPU-memory error of the zenith path (CuPy OutOfMemoryError, a CUDA "out of memory", or a
+    cuFINUFFT plan / setpts allocation failure); SnapshotImager.image_arrays then images the snapshot on the
+    production path.  Anything else is a bug and is raised."""
+    if isinstance(e, cp.cuda.memory.OutOfMemoryError):
+        return True
+    msg = str(e)
+    return "out of memory" in msg.lower() or msg.startswith(_OOM_PREFIXES)
+
+
 def mode():
     """TTCALX_SNAP_ZEN: 'off' (default), 'auto' (1 / auto: per-snapshot router) or 'force'."""
     v = os.environ.get("TTCALX_SNAP_ZEN", "0").strip().lower()
@@ -137,6 +150,11 @@ class ZenSamples:
     @property
     def w(self):
         return self["w"]
+
+    def drop_samples(self):
+        """Free the per-sample stored-frame u, v, w (float64; rebuilt on the next access).  R and wabs are kept."""
+        for k in ("u", "v", "w"):
+            self._c.pop(k, None)
 
     def _col(self, i):
         return (self._ud[:, i:i + 1] / self._lam[None])[self._sel]
