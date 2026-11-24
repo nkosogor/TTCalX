@@ -307,3 +307,17 @@ def test_qa_reject():
     r = np.r_[np.full(20, 0.89) + np.linspace(-0.005, 0.005, 20), 1.2, 0.3]
     bad, med, sd = qa_reject(r)
     assert bad == [20, 21] and med == pytest.approx(0.89, abs=0.01)
+
+
+def test_use_fast_settings_v5_opt_in():
+    """The v5 switches are off by default (not in FAST_ENV); TTCALX_V5=1 adds them; an explicit value wins."""
+    import ttcalx_imager
+    env = {}
+    ttcalx_imager.use_fast_settings(env)
+    assert all(k not in env for k in ttcalx_imager.v5_env()) and env["TTCALX_NUFFT_PRUNED"] == "1"
+    env = {"TTCALX_V5": "1", "TTCALX_SNAP_ZEN": "auto"}
+    got = ttcalx_imager.use_fast_settings(env)
+    assert env["TTCALX_SNAP_ZEN"] == "auto" and got["TTCALX_SNAP_ZEN"] == "auto"
+    assert env["TTCALX_REPROJ_FAST"] == "1" and set(ttcalx_imager.v5_env()) <= set(got)
+    # the page-locked H2D staging is opt-in only (no measured gain): not in the v5 set
+    assert "TTCALX_PINNED_H2D" not in ttcalx_imager.v5_env() and "TTCALX_PINNED_H2D" not in env

@@ -24,7 +24,7 @@ from concurrent.futures.process import BrokenProcessPool
 import numpy as np
 import cupy as cp
 
-from . import bands, gridder
+from . import bands, gridder, zenith
 from .clean import check_psf_support, clean_snapshot, mad_std
 from .fits import make_header, write_image, write_images
 from .gridder import SampleSet, dft_predict, get_svd, to_ws
@@ -77,16 +77,55 @@ def _prefetch_factors(wq, tol):
 
 
 
+_PIN = {"buf": None, "nbytes": 0}
+_PIN_LOCK = __import__("threading").Lock()
+
+
+def pinned_on() -> bool:
+    return os.environ.get("TTCALX_PINNED_H2D", "0") == "1"
+
+
+def h2d(*arrays):
+    """Host arrays to the GPU (CuPy arrays are passed through).  TTCALX_PINNED_H2D=1 (default 0, opt-in only, not
+    in the v5 set): through one process-wide page-locked staging buffer (grown as needed, kept).  The same bytes
+    either way.  No measured gain in the engine: CuPy 13.6's cp.asarray of a pageable array already stages through
+    pinned memory (verifier 2026-11-24, calim03, 107 MB: cp.asarray 12.9 ms, TTCALX_PINNED_H2D 13.0 ms)."""
+    if not pinned_on():
+        return tuple(cp.asarray(a) for a in arrays)
+    host = [(i, np.ascontiguousarray(a)) for i, a in enumerate(arrays) if not isinstance(a, cp.ndarray)]
+    out = list(arrays)
+    if not host:
+        return tuple(out)
+    need = sum((a.nbytes + 255) // 256 * 256 for _, a in host)
+    with _PIN_LOCK:
+        if _PIN["nbytes"] < need:
+            _PIN["buf"] = None
+            _PIN["buf"] = cp.cuda.alloc_pinned_memory(need)
+            _PIN["nbytes"] = need
+        off = 0
+        for i, a in host:
+            st = np.frombuffer(_PIN["buf"], a.dtype, a.size, offset=off).reshape(a.shape)
+            np.copyto(st, a)
+            out[i] = cp.asarray(st)
+            off += (a.nbytes + 255) // 256 * 256
+        cp.cuda.get_current_stream().synchronize()     # the staging area is free again (also for an async copy)
+    return tuple(out)
+
+
 def gpu_select(small, raw, scale_deg, pols="IV", zero_limit=0.999):
     """GPU version of snapload.load_snapshot from the raw MS columns (RawLoader): the same
     float64/complex64 element operations as msio.read_ms + load_snapshot + prepare_samples, in
     the same sample order (row-major boolean selection), hence the same values; returns the
-    load_snapshot dict with CuPy arrays."""
+    load_snapshot dict with CuPy arrays.
+
+    small["uvw_stored"] (optional, gsi v3 engine: the UVW before the phase-centre change, per row [m]) with
+    TTCALX_SNAP_ZEN on: L["zen"] = zenith.ZenSamples (the stored-frame samples of the same selection and R with
+    uvw = R uvw_stored, built on first use: only their max |w| for the router at once); ignored otherwise."""
     from types import SimpleNamespace
     t1 = time.perf_counter()
     column = small["column"]
     keep = cp.asarray(small["a1"] != small["a2"])
-    data = cp.asarray(raw[column]); flag = cp.asarray(raw["FLAG"])
+    data, flag = h2d(raw[column], raw["FLAG"])
     wcol = cp.asarray(small["wcol"]); uvw = cp.asarray(small["uvw"].astype(np.float64))
     ok = ~(flag[:, :, 0] | flag[:, :, 3]) & keep[:, None]          # = read_ms ok on the kept rows
     nkeep = int(keep.sum()); nchan = data.shape[1]
@@ -117,6 +156,8 @@ def gpu_select(small, raw, scale_deg, pols="IV", zero_limit=0.999):
                         wfold=wf.astype(cp.float32), u32=u.astype(cp.float32), v32=v.astype(cp.float32),
                         w32=w.astype(cp.float32), wabsmax=float(cp.abs(w).max()),
                         theo_pix=1.0 / float(cp.sqrt(u * u + v * v + w * w).max()) / sc)
+        if small.get("uvw_stored") is not None and zenith.mode() != "off":
+            L["zen"] = zenith.ZenSamples(small, sel, lam)
     cp.cuda.Device().synchronize()
     L["timing"]["select (GPU)"] = time.perf_counter() - t1
     return L
@@ -129,16 +170,35 @@ def rephase(data, w_old, w_new, freqs, xp=cp):
     return _rephase(data, w_old, w_new, freqs, xp=xp)
 
 
+class _HourSet:
+    """The production hour-frame SampleSet of a zenith-path snapshot (zenith.py), built only when a major cycle
+    degrids (more than dft_max model components): the same table, SampleSet and degrid as the production path."""
+
+    def __init__(self, N, sc, pre, iw, tol, eps):
+        self.N, self.sc, self.pre, self.iw, self.tol, self.eps = N, sc, pre, iw, tol, eps
+        self.npts = int(iw.size)
+        self.K = zenith.hour_rank(pre["wabsmax"], tol)
+        self._S = None
+
+    def degrid(self, model):
+        if self._S is None:
+            svd = snapshot_svd(self.N, self.sc, self.pre["wabsmax"], self.tol)
+            self._S = SampleSet(None, None, None, self.iw, self.N, self.sc, svd=svd, eps=self.eps, pre=self.pre)
+        return self._S.degrid(model)
+
+
 class SnapshotImager:
     def __init__(self, eps=1e-4, svd_tol=1e-4, dft_max=8000, verbose=False):
         self.eps = eps; self.svd_tol = svd_tol; self.dft_max = dft_max
         self.log = (lambda *a: print(*a, flush=True)) if verbose else (lambda *a: None)
 
     def image_arrays(self, u, v, w, wnat, visI, visV, N, scale_deg, params=bands.SNAPSHOT_CLEAN_I, beam=None,
-                     timing=None, pre=None):
+                     timing=None, pre=None, zen=None):
         """Core imager on per-sample arrays (host numpy): u, v, w [lambda] float64, wnat natural
         weights (> 0), visI / visV (or None) complex64.  Returns a dict with the cupy images
-        restored, residual, model, dirty, psf, V (or None) and an 'info' dict."""
+        restored, residual, model, dirty, psf, V (or None) and an 'info' dict.
+        zen (with pre; gpu_select's L["zen"]): the gridding may run in the stored (zenith) frame
+        (zenith.py, TTCALX_SNAP_ZEN; per-snapshot router), everything else as below."""
         T = {} if timing is None else timing
         last = [time.perf_counter()]
 
@@ -154,7 +214,24 @@ class SnapshotImager:
         sw = float(iw.sum())
         del ud, vd, nwd
         lap("weights")
-        if pre is None:
+        Z = None
+        zen_far = None
+        if pre is not None and zen is not None:
+            wz = zen.wabs if hasattr(zen, "wabs") else float(cp.abs(zen["w"]).max())
+            use, kh, kz = zenith.use_zen(pre["wabsmax"], wz, self.svd_tol)
+            if use:
+                try:
+                    Z = zenith.ZenSnapshot(zen, cp.asarray(w), pre, iw, sw, N, sc, self.svd_tol, self.eps)
+                except zenith.ZenFar as e:      # too far from its zenith for the b_k table: production path
+                    Z, zen_far = None, e.n_min
+                    self.log(str(e))
+        if Z is not None:
+            # zenith-frame gridding (zenith.py); the hour-frame SampleSet only for degridding (> dft_max components)
+            lap("svd table")
+            S = _HourSet(N, sc, pre, iw, self.svd_tol, self.eps)
+            u32 = cp.asarray(pre["u32"]); v32 = cp.asarray(pre["v32"]); w32 = cp.asarray(pre["w32"])
+            theo_pix = pre["theo_pix"]
+        elif pre is None:
             svd = snapshot_svd(N, sc, np.abs(w).max(), self.svd_tol)
             lap("svd table")
             S = SampleSet(u, v, w, iw, N, sc, svd=svd, eps=self.eps)
@@ -169,32 +246,44 @@ class SnapshotImager:
         check_psf_support(scale_deg, theo_pix, params.local_rms_window, S.npts)   # no gridding for a degenerate PSF
         dI = cp.asarray(visI)
         lap("gridder setup")
-        dirty = to_ws(S.grid(dI)) / sw
+        if Z is None:
+            def image(x):
+                return to_ws(S.grid(x)) / sw
+        else:
+            image = Z.image
+        dirty = image(dI)
         lap("dirty I")
         # PSF = image of unit visibilities WITH the w-term: WSClean's PSF agrees with a direct DFT
         # of that to ~1e-5, the w-less PSF differs by up to ~1e-3 of the peak at el < 60 deg.
         # Normalised to 1 at the centre, as WSClean writes it.
-        psf = to_ws(S.grid(cp.ones(S.npts, cp.complex64)))
+        if Z is None:
+            psf = to_ws(S.grid(cp.ones(S.npts, cp.complex64)))
+        else:
+            psf = Z.image(cp.ones(S.npts, cp.complex64), grid="psf", norm=False)
         psf = psf / psf[N // 2, N // 2]
         lap("psf")
-        sky = to_ws(svd.inside)
+        sky = to_ws(svd.inside) if Z is None else to_ws(gridder._geometry(N, sc, 1.0, 2001)[0])
 
         def residual(model):
             if int(cp.count_nonzero(model)) <= self.dft_max:
                 pred = dft_predict(u32, v32, w32, model, sc)
             else:
                 pred = S.degrid(model)
-            return to_ws(S.grid(dI - pred)) / sw
+            return image(dI - pred)
 
         restored, res, model, ci = clean_snapshot(dirty, psf, residual, scale_deg, theo_pix, sky, params,
                                                   beam=beam, log=self.log)
         lap("clean + major cycles + restore")
         imgV = None
         if visV is not None:
-            imgV = to_ws(S.grid(cp.asarray(visV))) / sw
+            imgV = image(cp.asarray(visV))
             lap("dirty V")
-        info = dict(ci, K=svd.K, npts=S.npts, theo_beam_pix=theo_pix, sumw=sw, I_peak=float(restored.max()),
-                    I_res_rms_box=box_std(res), I_res_mad=mad_std(res[sky]))
+        info = dict(ci, K=svd.K if Z is None else S.K, npts=S.npts, theo_beam_pix=theo_pix, sumw=sw,
+                    I_peak=float(restored.max()), I_res_rms_box=box_std(res), I_res_mad=mad_std(res[sky]))
+        if Z is not None:
+            info["zen"] = Z.info()
+        elif zen_far is not None:
+            info["zen_far_n_min"] = zen_far
         if imgV is not None:
             info.update(V_rms_box=box_std(imgV), V_maxabs=float(cp.abs(imgV).max()))
         return dict(restored=restored, residual=res, model=model, dirty=dirty, psf=psf, V=imgV, info=info)
@@ -236,7 +325,7 @@ class SnapshotImager:
             info["status"] = "empty"
         else:
             r = self.image_arrays(L["u"], L["v"], L["w"], L["wnat"], L["visI"], L["visV"],
-                                  N, scale_deg, params, beam, timing=T, pre=L.get("pre"))
+                                  N, scale_deg, params, beam, timing=T, pre=L.get("pre"), zen=L.get("zen"))
             info.update(r["info"])
             if out_prefix:
                 hdr = lambda hist: make_header(N, scale_deg, *ms.phase_dir, ms.freqs, ms.chan_width, ms.tstart,

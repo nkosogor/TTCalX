@@ -33,7 +33,7 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import cupy as cp
 
-from . import bands
+from . import HOUR_V5_ENV, bands
 from .clean import deconvolve_multiscale
 from .fits import make_header, write_image
 from .gridder import SampleSet, get_svd, to_ws
@@ -86,6 +86,48 @@ def _uvmax(s):
 
 
 _DENSITY_MEMO = {}      # TTCALX_HOUR_SETUP_FAST: (snapshot set, geometry) -> WeightGrid density grid (one entry)
+_WMAX_MEMO = {}         # TTCALX_WMAX_MEMO: (snapshot set, R, samples) -> max |w| in that frame (floats, per call)
+
+# Hour-stage v5 speed switches: ttcalx_imager.HOUR_V5_ENV (env, read at call time, each default off)
+
+
+def svd_quantum():
+    """TTCALX_SVD_QUANTUM (default 2, as before): the hour w-term factorisations are made for wmax rounded up to a
+    multiple of this [lambda].  A finer quantum (0.25, the snapshot imager's) gives each w-snapshot block the
+    rank its own w range needs instead of that of up to 2 lambda more (fewer terms per (de)gridding), at the
+    price of more distinct factorisations (cheap with TTCALX_SVD_METHOD=gram)."""
+    return float(os.environ.get("TTCALX_SVD_QUANTUM", "2"))
+
+
+def wmax_memo():
+    """TTCALX_WMAX_MEMO=1 (default 0): a w-snapshot block grid with given weights takes its max |w| from a per-call
+    memo keyed by its snapshots, their R and sample counts (every product / interval re-uses the same blocks)
+    instead of rotating every snapshot again; the sum of the weights is still summed (same values)."""
+    return os.environ.get("TTCALX_WMAX_MEMO", "0") == "1"
+
+
+def uvmax_gpu():
+    """TTCALX_UVMAX_GPU=1 (default 0): fill the LazySnap uvmax memo of every kept snapshot from the GPU expansion
+    (prefill_uvmax) right after the QA drop, instead of a host-side numpy expansion of each snapshot inside the
+    first product's setup (~10 s at 55 MHz).  Bit-identical (same float32 expression; max is exact)."""
+    return os.environ.get("TTCALX_UVMAX_GPU", "0") == "1"
+
+
+def prefill_uvmax(snaps):
+    """Set the uvmax memo of each LazySnap (gsiv.py) that has none from its GPU expansion: float32
+    sqrt(u * u + v * v + w * w).max(), the expression of LazySnap.uvmax (u ** 2 of float32 = u * u, each
+    operation rounded on its own).  Snapshots without a memo (msio dicts) are left alone.  Returns how many
+    were set."""
+    n = 0
+    for s in snaps:
+        memo = getattr(s, "_memo", None)
+        if memo is None or "uvmax" in memo or not hasattr(s, "expand_uvw"):
+            continue
+        u, v, w = s.expand_uvw(cp)
+        memo["uvmax"] = float(cp.sqrt(u * u + v * v + w * w).max())
+        n += 1
+        del u, v, w
+    return n
 
 
 # ----------------------------------------------------------------------------- chunk cache control
@@ -204,11 +246,23 @@ class HourGrid:
         else:
             self.iw = weights
         if not done:
-            for i in range(len(snaps)):
-                _, _, w = rot_uvw(i)
-                sw += float(self.iw[i].sum()); wmax = max(wmax, float(cp.abs(w).max()))
+            mkey = None
+            if wmax_memo() and snaps:
+                # TTCALX_WMAX_MEMO: max |w| depends on the samples and R only (not on the weights)
+                mkey = (tuple(s["stem"] for s in snaps), tuple(self._n(i) for i in range(len(snaps))),
+                        b"".join(np.asarray(s["R"], np.float64).tobytes() for s in snaps), self.rotate)
+            if mkey is not None and mkey in _WMAX_MEMO:
+                wmax = _WMAX_MEMO[mkey]
+                for i in range(len(snaps)):
+                    sw += float(self.iw[i].sum())
+            else:
+                for i in range(len(snaps)):
+                    _, _, w = rot_uvw(i)
+                    sw += float(self.iw[i].sum()); wmax = max(wmax, float(cp.abs(w).max()))
+                if mkey is not None:
+                    _WMAX_MEMO[mkey] = wmax
         self.sumw = sw
-        self.svd = get_svd(N, self.sc, wmax, svd_tol) if need_svd else None
+        self.svd = get_svd(N, self.sc, wmax, svd_tol, quantum=svd_quantum()) if need_svd else None
         self.chunks = self._subchunks(range(len(snaps)))
         self.npts = sum(self._n(i) for i in range(len(snaps)))
         log(f"HourGrid: {len(snaps)} snaps, {self.npts / 1e6:.1f} M samples, {len(self.chunks)} chunks, "
@@ -542,13 +596,14 @@ def image_hour(paths, band, out_prefix, phase_centre=None, products=(("1h", 1, b
 
 def image_hour_snaps(snaps, *args, **kwargs):
     """Image one band-hour (:func:`_image_hour_snaps`).  The per-call memos (TTCALX_HOUR_SETUP_FAST density grid,
-    TTCALX_PSF_MEMO PSF visibilities on the snapshots) are dropped before and after the call, also when it
-    raises, so a later call can never see another call's state and the host RAM of the PSF memo is freed."""
-    _DENSITY_MEMO.clear()
+    TTCALX_WMAX_MEMO block w ranges, TTCALX_PSF_MEMO PSF visibilities on the snapshots) are dropped before and
+    after the call, also when it raises, so a later call can never see another call's state and the host RAM of
+    the PSF memo is freed."""
+    _DENSITY_MEMO.clear(); _WMAX_MEMO.clear()
     try:
         return _image_hour_snaps(snaps, *args, **kwargs)
     finally:
-        _DENSITY_MEMO.clear()
+        _DENSITY_MEMO.clear(); _WMAX_MEMO.clear()
         for s in snaps:
             memo = getattr(s, "_memo", None)
             if memo:
@@ -611,6 +666,11 @@ def _image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, band
     # WSClean's DATE-OBS is the first time step of the interval whether or not it is flagged
     tstart_all = [s["tstart"] for s in snaps]
     snaps = [s for i, s in enumerate(snaps) if i not in drop]
+    v5 = {k: os.environ[k] for k in HOUR_V5_ENV if os.environ.get(k, "") not in ("", "0")}
+    if v5:
+        summary["hour_v5"] = v5                 # the v5 speed switches in effect (none: production operations)
+    if uvmax_gpu():
+        prefill_uvmax(snaps); lap("uvmax (GPU)")
     for prod in products:
         tag, nint, params = prod.tag, prod.n_intervals, prod.params
         key = tag if prod.image_i else prod.v_tag

@@ -58,15 +58,19 @@ _GEOM_CACHE_MAX = 4
 SVD_METHOD = None
 
 
-def _svd_factors(wmax, tol, nw, nx, method=None):
+def _svd_factors(wmax, tol, nw, nx, method=None, xmin=-0.5):
     """Truncated factorisation exp(-2 pi i w x') ~= sum_{k<K} A[:, k](w) Vh[k](x') on the (w, x') grid,
-    K = smallest rank with max |M - A_K Vh_K| < tol (as before).  Cached (compact, host)."""
+    K = smallest rank with max |M - A_K Vh_K| < tol (as before).  Cached (compact, host).
+    xmin: lower end of the x' grid (x' in [xmin, 1/2]; -1/2 = the upper hemisphere, the imager's tables;
+    the zenith-frame snapshot table of zenith.py extends it below the horizon)."""
     method = method or SVD_METHOD or os.environ.get("TTCALX_SVD_METHOD", "lapack")
     key = (float(wmax), float(tol), int(nw), int(nx), method)
+    if xmin != -0.5:
+        key = key + (float(xmin),)
     hit = _FACTOR_CACHE.get(key)
     if hit is not None:
         return hit
-    wg = np.linspace(0, wmax, nw); xg = np.linspace(-0.5, 0.5, nx)
+    wg = np.linspace(0, wmax, nw); xg = np.linspace(xmin, 0.5, nx)
     M = np.exp(-2j * np.pi * np.outer(wg, xg))
     res = None
     if method == "gram":
@@ -200,6 +204,28 @@ _ak_fused = cp.ElementwiseKernel(
     "ttcalx_ak_fused", preamble=_AK_INTERP)
 
 
+# TTCALX_FUSED_CAK=1 (default 0; with TTCALX_FAST_AK, and for grid() TTCALX_FUSED_WACC + pruned plans): the a_k(w)
+# evaluation fused with its use -- grid: c * a_k(w) into one reused buffer; degrid: q += conj(a_k(w)) * r in place --
+# the float operations of _ak_fused followed by CuPy's multiply / add, without the a_k, conj and product temporaries
+_cak_grid = cp.ElementwiseKernel(
+    "complex64 c, float32 x, int64 ix, raw float32 fx, raw float32 fr, raw float32 fi, raw float64 sr, "
+    "raw float64 si, int64 len", "complex64 out",
+    "const complex<float> a((float)ttcalx_interp1(x, ix, &fx[0], &fr[0], &sr[0], len), "
+    "(float)ttcalx_interp1(x, ix, &fx[0], &fi[0], &si[0], len)); out = c * a;",
+    "ttcalx_cak_grid", preamble=_AK_INTERP)
+_cak_degrid = cp.ElementwiseKernel(
+    "complex64 r, float32 x, int64 ix, raw float32 fx, raw float32 fr, raw float32 fi, raw float64 sr, "
+    "raw float64 si, int64 len", "complex64 q",
+    "const complex<float> a((float)ttcalx_interp1(x, ix, &fx[0], &fr[0], &sr[0], len), "
+    "(float)ttcalx_interp1(x, ix, &fx[0], &fi[0], &si[0], len)); const complex<float> t = conj(a) * r; q = q + t;",
+    "ttcalx_cak_degrid", preamble=_AK_INTERP)
+
+
+def fused_cak() -> bool:
+    """TTCALX_FUSED_CAK=1 (default 0): fused a_k(w) products in SampleSet.grid / degrid (see above)."""
+    return os.environ.get("TTCALX_FUSED_CAK", "0") == "1"
+
+
 class SvdWTerm:
     """exp(-2 pi i w x') ~= sum_k a_k(w) b_k(x'),  w in [0, wmax], x' in [-1/2, 1/2]."""
 
@@ -325,6 +351,10 @@ def fused_wacc() -> bool:
 
 def clear_caches():
     _SVD_CACHE.clear(); _PLAN_CACHE.clear(); _FACTOR_CACHE.clear(); _GEOM_CACHE.clear()
+    import sys
+    zen = sys.modules.get(__package__ + ".zenith")       # the zenith-frame snapshot gridder's tables / plans
+    if zen is not None:
+        zen.clear()
     if pruned_on("snap") or pruned_on("hour"):
         from . import pruned
         pruned.clear()
@@ -398,6 +428,16 @@ class SampleSet:
         idx = self._aidx(); nocopy = idx is not None
         # TTCALX_FUSED_WACC=1 (pruned plans): each term accumulated inside the transform's last gather
         fuse = hasattr(self.plans[0], "execute_acc") and fused_wacc()
+        if fuse and nocopy and fused_cak() and self.w.dtype == cp.float32 and idx.dtype == cp.int64:
+            # TTCALX_FUSED_CAK: c * a_k(w) formed in one kernel into a buffer reused by every term
+            c = cp.ascontiguousarray(c, dtype=cp.complex64)
+            buf = cp.empty(self.npts, cp.complex64)
+            for k in range(self.svd.K):
+                sr, si = self.svd._slopes(k)
+                _cak_grid(c, self.w, idx, self.svd.wg, self.svd.Ar[k], self.svd.Ai[k], sr, si, self.svd.wg.size, buf)
+                self.plans[0].execute_acc(buf, acc, self.svd.jx, self.svd.tx, self.svd.Br[k], self.svd.Bi[k])
+            del idx, buf
+            return cp.where(self.svd.inside, acc, 0)
         for k in range(self.svd.K):
             if fuse:
                 self.plans[0].execute_acc((c * self._ak(k, idx)).astype(cp.complex64, copy=not nocopy), acc,
@@ -419,8 +459,16 @@ class SampleSet:
         m = cp.ascontiguousarray(from_ws(model_ws).astype(cp.float32))
         q = cp.zeros(self.npts, cp.complex64)
         idx = self._aidx()
-        for k in range(self.svd.K):
-            q += cp.conj(self._ak(k, idx)) * self.plans[1].execute(self.svd.model_conj_b(m, k))
+        if idx is not None and fused_cak() and self.w.dtype == cp.float32 and idx.dtype == cp.int64:
+            # TTCALX_FUSED_CAK: q += conj(a_k(w)) * r in one kernel per term
+            for k in range(self.svd.K):
+                r = cp.ascontiguousarray(self.plans[1].execute(self.svd.model_conj_b(m, k)), dtype=cp.complex64)
+                sr, si = self.svd._slopes(k)
+                _cak_degrid(r, self.w, idx, self.svd.wg, self.svd.Ar[k], self.svd.Ai[k], sr, si, self.svd.wg.size, q)
+                del r
+        else:
+            for k in range(self.svd.K):
+                q += cp.conj(self._ak(k, idx)) * self.plans[1].execute(self.svd.model_conj_b(m, k))
         del idx
         q *= cp.conj(self._eph())
         return cp.where(self.flip, cp.conj(q), q)
