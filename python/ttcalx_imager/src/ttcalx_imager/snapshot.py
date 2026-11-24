@@ -15,6 +15,7 @@ geometry (the first snapshot of a geometry costs ~1-2 s extra).
 import json
 import math
 import os
+import threading
 import time
 import traceback
 import warnings
@@ -79,7 +80,7 @@ def _prefetch_factors(wq, tol):
 
 
 _PIN = {"buf": None, "nbytes": 0}
-_PIN_LOCK = __import__("threading").Lock()
+_PIN_LOCK = threading.Lock()
 
 
 def pinned_on() -> bool:

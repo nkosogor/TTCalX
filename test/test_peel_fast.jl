@@ -24,6 +24,19 @@ relrows(a, b, rows) = maximum(maximum(abs, ComplexF64.(getfield(a, f)[rows, :]) 
                               for f in (:xx, :xy, :yx, :yy)) /
                       maximum(maximum(abs, getfield(b, f)[rows, :]) for f in (:xx, :xy, :yx, :yy))
 
+"""Default and fast zest_sky_rfi! of `measured` (keywords `kw`): each as (vis, log, peeled) on the host."""
+function fast_pair(meta, measured, sky, rfi, ws; kw...)
+    one(fast) = begin
+        v = deepcopy_gpu(measured); log = []
+        r = zest_sky_rfi!(v, meta, TEST_MJD, sky, rfi; FAST_CFG..., workspace=ws, peel_fast=fast, kw...,
+                          report=(n, it; k...) -> push!(log, (n, it, Dict(k))))
+        (vis=host_copy(v), log=log, peeled=r.peeled)
+    end
+    one(false), one(true)
+end
+"""The guard decisions, convergence flags and iteration counts of a report log."""
+decisions(log) = [(l[1], l[2], l[3][:action], l[3][:converged], l[3][:niters]) for l in log]
+
 @testset "peel_fast" begin
     @test !TTCalX._PEEL_FAST_BUSY[]
     @testset "argument checks (host)" begin
@@ -31,6 +44,13 @@ relrows(a, b, rows) = maximum(maximum(abs, ComplexF64.(getfield(a, f)[rows, :]) 
         @test_throws ArgumentError zest_sky_rfi!(deepcopy_gpu(measured), meta, TEST_MJD, sky, rfi;
                                                  FAST_CFG..., workspace=PeelWorkspace(), peel_fast=true)
         @test !TTCalX._PEEL_FAST_BUSY[]
+    end
+    @testset "_fast_region: > 1100 regions stay in bounds" begin
+        s0 = TTCalX._FAST_SLOT[]
+        rs = try [TTCalX._fast_region() for _ in 1:1200] finally TTCalX._FAST_SLOT[] = s0 end
+        # a region's slots are base + 1 .. base + 63 (1-based) of the host-mapped buffer
+        @test all(r -> 0 <= r && r + 63 <= TTCalX._FAST_SLOTS, rs)
+        @test allunique(rs[1:1000])
     end
     is_gpu_available() || return
     try
@@ -114,6 +134,65 @@ relrows(a, b, rows) = maximum(maximum(abs, ComplexF64.(getfield(a, f)[rows, :]) 
         end
         @testset "the default after a fast peel is unchanged (bitwise)" begin
             @test same(peelrun(measured), ref)
+        end
+        @testset "maxiter = 1: as the default" begin
+            d, f = fast_pair(meta, measured, sky, rfi, ws; peeliter=2, maxiter=1)
+            @test decisions(f.log) == decisions(d.log) && f.peeled == d.peeled
+            @test all(l -> l[3][:niters] == 1, f.log)
+            @test relrows(f.vis, d.vis, 1:meta.Nbase) < 2e-5
+        end
+        @testset "guard: gain-check rejections as guarded_zest!" begin
+            # max_gain below the starting gains: every solve rejected (|g| = 1 > 0.5)
+            d, f = fast_pair(meta, measured, sky, rfi, ws; peeliter=2, max_gain=0.5)
+            @test decisions(f.log) == decisions(d.log) && isempty(f.peeled) && f.peeled == d.peeled
+            @test all(l -> l[3][:action] != :accept && l[3][:finite], f.log)
+            @test [l[3][:max_gain] for l in f.log] ≈ [l[3][:max_gain] for l in d.log] rtol=1e-6
+            @test relrows(f.vis, d.vis, 1:meta.Nbase) < 2e-5
+            # non-finite gains (a NaN-producing model): the guard rejects them, keeps / leaves the
+            # direction as guarded_zest! does; the solve is the same (solve_gains!) for both
+            m2 = TTCalX.PeelWorkspace()
+            cohs() = map(sky[1:2]) do src
+                c = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=true)
+                genvis_exact!(c, meta, src, TEST_MJD); c.flags .= measured.flags; c
+            end
+            cals() = [GPUCalibration(meta.Nant, meta.Nfreq; diagonal=false, gpu=true) for _ in 1:2]
+            function nansolve(cs)
+                (cal, v, coh) -> begin
+                    cv, ni, _ = solve_gains!(cal, v, coh, meta; maxiter=5, tolerance=1e-4, minuvw=5.0,
+                                             precision=:mixed)
+                    cal === cs[2] && (cal.xy .= NaN)          # the second direction's solve "diverges"
+                    cv, ni
+                end
+            end
+            logs = Any[[], []]
+            outs = map(1:2) do k
+                v = deepcopy_gpu(measured); flag_zero_visibilities!(v)
+                c, g = cohs(), cals()
+                rep = (i, it; kw...) -> push!(logs[k], (i, it, Dict(kw)))
+                if k == 1
+                    guarded_zest!(v, meta, c, g, nansolve(g); peeliter=2, max_gain=100.0, report=rep)
+                else
+                    TTCalX._ws_prepare!(m2, (meta.Nant, meta.Nbase, meta.Nfreq, :mixed, true))
+                    TTCalX._fast_guarded_zest!(v, meta, c, g, nansolve(g), 2, 100.0, rep, m2)
+                end
+                host_copy(v)
+            end
+            @test decisions(logs[2]) == decisions(logs[1])
+            @test [l[3][:finite] for l in logs[2]] == [l[3][:finite] for l in logs[1]]
+            @test count(l -> !l[3][:finite], logs[1]) == 2 && all(l -> l[3][:finite] || l[3][:action] != :accept, logs[1])
+            @test relrows(outs[2], outs[1], 1:meta.Nbase) < 2e-5
+        end
+        @testset "more than 1024 antennas through the full peel, antenna compaction" begin
+            mb, vb, skyb, rfib, _ = ws_problem(; seed=5, Nant=1030, channels=[50e6, 60e6], gpu=true)
+            bl = Array(mb.baselines); fl = Array(vb.flags)
+            fl[(bl[1, :] .== 7) .| (bl[2, :] .== 7), :] .= true                # a dead antenna: compaction
+            copyto!(vb.flags, fl)
+            @test TTCalX.compact_antennas(vb, mb).N == 1029
+            wb = PeelWorkspace()
+            d, f = fast_pair(mb, vb, skyb, rfib, wb; peeliter=2, maxiter=5)
+            @test decisions(f.log) == decisions(d.log) && f.peeled == d.peeled
+            @test relrows(f.vis, d.vis, 1:mb.Nbase) < 2e-5
+            free_workspace!(wb); vb = nothing; GC.gc(); CUDA.reclaim()
         end
         @testset "fully flagged snapshot" begin
             v = deepcopy_gpu(measured); v.flags .= true
