@@ -53,6 +53,16 @@ run-to-run GPU floor (82 MHz MS hour job vs 748884a, 2026-11-02; 2026-10-27 regr
 | `TTCALX_FAST_UPSAMPLE` | `0` | `1` | hour: the 2x band-limited model upsampling as four N-point inverse FFTs (polyphase identity) instead of one zero-padded 2N transform, a slow Bluestein one at the hour sizes (values to float32 rounding; 82 MHz hour -13 s). |
 | `TTCALX_NUFFT_PRUNED` | unset | `1` | `1` (every scope) or a list of `snap,hour`: NUFFTs as cuFINUFFT spread / interpolation only plus our own fine-grid FFT (row FFTs of the occupied band, tiled transposes, contiguous row FFTs; `pruned.py`). Same transform to float32 rounding (5e-7); 82 MHz 8.2 -> 3.4 ms (type 1), 7.7 -> 2.3 ms (type 2); 82 MHz band-hour -29 %. |
 | `TTCALX_FUSED_WACC` | `0` | `1` | pruned type-1 transforms (`TTCALX_NUFFT_PRUNED`): each w-term accumulated inside the last mode gather (`PrunedPlan.execute_acc`) instead of writing the N x N modes and re-reading them in `acc_re`. The same float operations (images at the rerun floor, 0 CLEAN flips in 60 snapshots); 82 MHz snapshot imaging -8 %, 82 MHz band-hour snapshot stage -4.4 % (2026-11-04). |
+| `TTCALX_REPROJ_FAST` | `0` | (`HOUR_V5_ENV`: `1`) | hour w-snapshot reprojection (order 3 / 5): B-spline prefilter as one zero-padded real-FFT division by the B-spline transfer function, interpolation in one float32 kernel, instead of cupyx `spline_filter` + `map_coordinates`. Equal to float32 rounding where the image is zero within ~10 px of its edge (the production geometries end 7-12 px beyond the horizon). |
+| `TTCALX_SVD_QUANTUM` | `2` | (`HOUR_V5_ENV`: `0.25`) | hour: w-term factorisations for wmax rounded up to this multiple [lambda] (0.25 = the snapshot imager's): each block gets the rank its own w range needs. Other factors within the 1e-4 tolerance. |
+| `TTCALX_MS_INCR` | `0` | (`HOUR_V5_ENV`: `16`) | multiscale CLEAN (with `TTCALX_SPARSE_UPDATE_MAX`): after a sparse residual update with <= n components the scale images are updated with the same components (S_s * S_k * PSF kernels) instead of recomputed by FFT. Kernels capped at `MultiScaleClean.INCR_CACHE_GB` (1) per interval and made only with `INCR_FREE_GB` (1) of the GPU free, else the FFT path. |
+| `TTCALX_FUSED_CAK` | `0` | (`HOUR_V5_ENV`: `1`) | `SampleSet.grid` / `degrid` (with `TTCALX_FAST_AK`; grid also `TTCALX_FUSED_WACC` + pruned plans): a_k(w) evaluated inside the product kernel (no a_k / conj / product temporaries); the same float operations (degrid bitwise). |
+| `TTCALX_WMAX_MEMO` | `0` | (`HOUR_V5_ENV`: `1`) | hour: a w-snapshot block's max abs(w) re-used by every product / interval of the call (bit-identical). |
+| `TTCALX_UVMAX_GPU` | `0` | (`HOUR_V5_ENV`: `1`) | hour: the archive snapshots' max abs(u, v, w) computed on the GPU right after the QA drop instead of a host-side expansion per snapshot (bit-identical). |
+
+Hour-stage v5 switches: `ttcalx_imager.use_hour_v5_settings()` sets `FAST_ENV` and `HOUR_V5_ENV` (an explicit
+value wins); they are not in `FAST_ENV`, so the gsi entry points leave them off unless the caller sets them.
+`summary["hour_v5"]` lists the ones in effect.
 
 `SnapshotImager.image_many` reads with a spawned helper process: scripts calling it need an
 `if __name__ == "__main__":` guard (or `reader="thread"`). Set `CUPY_CACHE_DIR` if the home
