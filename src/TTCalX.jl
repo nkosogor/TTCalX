@@ -89,6 +89,7 @@ include("gpu/workspace.jl")
 include("gpu/solver.jl")
 include("gpu/ms_io.jl")
 include("gpu/guard.jl")
+include("gpu/peel_fast.jl")
 include("gpu/sky_rfi.jl")
 
 """

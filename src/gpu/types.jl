@@ -61,7 +61,7 @@ GPU-friendly visibility storage.
 
 Shape: (Nbase, Nfreq) for each component.
 """
-struct GPUVisibilities{T<:AbstractArray{ComplexF64}, F<:AbstractArray{Bool}}
+struct GPUVisibilities{T<:AbstractArray{<:Complex}, F<:AbstractArray{Bool}}
     xx::T
     xy::T
     yx::T

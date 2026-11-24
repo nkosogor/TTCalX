@@ -87,7 +87,7 @@ function construct_gpu_rfi_source(c::Dict)
 end
 
 """
-    gpu_genvis!(vis, meta, source::GPURFISource, ra, dec, lst; position=nothing, s0=nothing)
+    gpu_genvis!(vis, meta, source::GPURFISource, ra, dec, lst; position=nothing, s0=nothing, overwrite=false)
 
 Add the near-field model of an RFI emitter with CPU TTCal's geometry:
 
@@ -104,7 +104,8 @@ GPU and host visibilities (the model is built on the host).
 """
 function gpu_genvis!(vis::GPUVisibilities, meta::GPUMetadata, source::GPURFISource,
                      phase_center_ra::Float64, phase_center_dec::Float64, lst::Float64;
-                     position=nothing, s0=nothing)
+                     position=nothing, s0=nothing, overwrite::Bool=false)
+    # overwrite: vis need not be zero; it gets what adding the model to zeros gives (as genvis_exact!)
     positions = Array(meta.antenna_positions)
     channels = Array(meta.channels)
     baselines = Array(meta.baselines)
@@ -121,9 +122,10 @@ function gpu_genvis!(vis::GPUVisibilities, meta::GPUMetadata, source::GPURFISour
         end
         blocks, threads = kernel_config_1d(Nb * Nf)
         @cuda blocks=blocks threads=threads rfi_genvis_kernel!(vis.xx, vis.xy, vis.yx, vis.yy,
-            CuArray(path), CuArray(flux), meta.baselines, meta.channels, Nb, Nf)
+            CuArray(path), CuArray(flux), meta.baselines, meta.channels, Nb, Nf, overwrite)
         return vis
     end
+    overwrite && _zero_model!(vis)
     hxx = zeros(ComplexF64, Nb, Nf); hxy = zeros(ComplexF64, Nb, Nf)
     hyx = zeros(ComplexF64, Nb, Nf); hyy = zeros(ComplexF64, Nb, Nf)
     @inbounds for β in 1:Nf
@@ -148,7 +150,7 @@ end
 
 const RFI_GENVIS_KERNEL = Ref(false)   # true: the fringes on the device (fast_kernels!); false: the host loop (as 748884a)
 
-function rfi_genvis_kernel!(xx, xy, yx, yy, path, flux, baselines, channels, Nb, Nf)
+function rfi_genvis_kernel!(xx, xy, yx, yy, path, flux, baselines, channels, Nb, Nf, overwrite::Bool=false)
     idx = thread_index_1d()
     if idx <= Nb * Nf
         α = ((idx - 1) % Nb) + 1
@@ -156,8 +158,14 @@ function rfi_genvis_kernel!(xx, xy, yx, yy, path, flux, baselines, channels, Nb,
         a1 = baselines[1, α]; a2 = baselines[2, α]
         k = 2π * channels[β] / SPEED_OF_LIGHT
         fringe = cis(k * (path[a2] - path[a1]))
-        xx[α, β] += flux[1, β] * fringe; xy[α, β] += flux[2, β] * fringe
-        yx[α, β] += flux[3, β] * fringe; yy[α, β] += flux[4, β] * fringe
+        if overwrite        # not-zeroed buffer: 0 + v, bitwise `+=` on zeros (-0.0 parts become +0.0)
+            z = zero(eltype(xx))
+            xx[α, β] = z + flux[1, β] * fringe; xy[α, β] = z + flux[2, β] * fringe
+            yx[α, β] = z + flux[3, β] * fringe; yy[α, β] = z + flux[4, β] * fringe
+        else
+            xx[α, β] += flux[1, β] * fringe; xy[α, β] += flux[2, β] * fringe
+            yx[α, β] += flux[3, β] * fringe; yy[α, β] += flux[4, β] * fringe
+        end
     end
     return nothing
 end

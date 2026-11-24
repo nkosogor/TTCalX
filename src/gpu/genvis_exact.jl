@@ -101,40 +101,84 @@ with b = r₂ - r₁ and k = 2πν/c.  Shared by the GPU kernel and the host loo
     axx, axy, ayx, ayy
 end
 
+"""
+`_exact_vis` of a fast peel (`PEEL_FAST`): the phase in Float64 reduced mod 2π, its sincos and the Gaussian
+taper in Float32, the flux sums in Float64.
+"""
+@inline function _exact_vis32(α, β, delay, flux, shape, positions, baselines, channels, Nc)
+    a1 = baselines[1, α]; a2 = baselines[2, α]
+    ν = channels[β]
+    k = 2π * ν / SPEED_OF_LIGHT
+    λ = SPEED_OF_LIGHT / ν
+    bx = positions[1, a2] - positions[1, a1]
+    by = positions[2, a2] - positions[2, a1]
+    bz = positions[3, a2] - positions[3, a1]
+    axx = zero(ComplexF64); axy = zero(ComplexF64); ayx = zero(ComplexF64); ayy = zero(ComplexF64)
+    for n in 1:Nc
+        ph = -k * (delay[a2, n] - delay[a1, n])
+        ph -= 2π * round(ph / 2π)
+        s, c = sincos(Float32(ph))
+        v = ComplexF32(c, s)
+        if shape[9, n] != 0
+            pmaj = Float32((bx * shape[1, n] + by * shape[2, n] + bz * shape[3, n]) / λ)
+            pmin = Float32((bx * shape[4, n] + by * shape[5, n] + bz * shape[6, n]) / λ)
+            v *= exp(-Float32(shape[7, n]) * pmaj^2 - Float32(shape[8, n]) * pmin^2)
+        end
+        vd = ComplexF64(v)
+        axx += flux[1, β, n] * vd; axy += flux[2, β, n] * vd
+        ayx += flux[3, β, n] * vd; ayy += flux[4, β, n] * vd
+    end
+    axx, axy, ayx, ayy
+end
+
 function genvis_exact_kernel!(xx, xy, yx, yy, delay, flux, shape, positions, baselines, channels,
-                              Nbase, Nfreq, Nc)
+                              Nbase, Nfreq, Nc, overwrite::Bool=false, lowp::Bool=false)
     idx = thread_index_1d()
     if idx <= Nbase * Nfreq
         α = ((idx - 1) % Nbase) + 1
         β = ((idx - 1) ÷ Nbase) + 1
-        vxx, vxy, vyx, vyy = _exact_vis(α, β, delay, flux, shape, positions, baselines, channels, Nc)
-        xx[α, β] += vxx; xy[α, β] += vxy; yx[α, β] += vyx; yy[α, β] += vyy
+        vxx, vxy, vyx, vyy = lowp ? _exact_vis32(α, β, delay, flux, shape, positions, baselines, channels, Nc) :
+                                    _exact_vis(α, β, delay, flux, shape, positions, baselines, channels, Nc)
+        if overwrite        # not-zeroed buffer: store 0 + v, bitwise what `+=` gives on zeros
+            z = zero(eltype(xx))
+            xx[α, β] = z + vxx; xy[α, β] = z + vxy; yx[α, β] = z + vyx; yy[α, β] = z + vyy
+        else
+            xx[α, β] += vxx; xy[α, β] += vxy; yx[α, β] += vyx; yy[α, β] += vyy
+        end
     end
     return nothing
 end
 
-genvis_exact!(::GPUVisibilities, ::GPUMetadata, ::GPURFISource, ::Float64) =
+"""Zero the four correlations of a model (not its flags)."""
+_zero_model!(vis) = (foreach(a -> fill!(a, zero(eltype(a))), (vis.xx, vis.xy, vis.yx, vis.yy)); vis)
+
+genvis_exact!(::GPUVisibilities, ::GPUMetadata, ::GPURFISource, ::Float64; kw...) =
     throw(ArgumentError("genvis_exact! is for sky sources; use gpu_genvis! for RFI sources"))
 
 """
-    genvis_exact!(vis, meta, source, mjd_utc)
+    genvis_exact!(vis, meta, source, mjd_utc; overwrite=false)
 
 Add the model of a sky source computed as CPU TTCal does (see the file
 header).  `mjd_utc` is the observation time (`ms_mjd`).  The per-component
 tables are built on the host; every (baseline, channel) is then evaluated by
 a GPU kernel, or by host threads for host arrays.  `meta.uvw` is not used,
 so the result does not depend on the MS's UVW convention.
+
+`overwrite = true`: `vis.xx .. yy` need not be zero; they get exactly the values that adding the
+model to zeros gives (the GPU kernel stores 0 + v without reading them; the host zero-fills first).
 """
-function genvis_exact!(vis::GPUVisibilities, meta::GPUMetadata, source::GPUSource, mjd_utc::Float64)
+function genvis_exact!(vis::GPUVisibilities, meta::GPUMetadata, source::GPUSource, mjd_utc::Float64;
+                       overwrite::Bool=false)
     delay, flux, shape = exact_model_tables(meta, source, mjd_utc)
     Nc = size(delay, 2)
+    overwrite && (Nc == 0 || !_is_gpu(vis)) && _zero_model!(vis)
     Nc == 0 && return vis
     Nb, Nf = meta.Nbase, meta.Nfreq
     if _is_gpu(vis)
         blocks, threads = kernel_config_1d(Nb * Nf)
         @cuda blocks=blocks threads=threads genvis_exact_kernel!(
             vis.xx, vis.xy, vis.yx, vis.yy, CuArray(delay), CuArray(flux), CuArray(shape),
-            meta.antenna_positions, meta.baselines, meta.channels, Nb, Nf, Nc)
+            meta.antenna_positions, meta.baselines, meta.channels, Nb, Nf, Nc, overwrite, PEEL_FAST[])
         CUDA.synchronize()
     else
         pos, bl, ch = meta.antenna_positions, meta.baselines, meta.channels
