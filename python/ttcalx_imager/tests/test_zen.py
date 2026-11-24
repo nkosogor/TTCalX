@@ -30,7 +30,7 @@ def _rot(ax, deg):
     return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
 
 
-def _snapshot(nant=90, freqs=(46e6, 47e6, 48e6), tilt=8.0, seed=3):
+def _snapshot(nant=90, freqs=(46e6, 47e6, 48e6), tilt=6.0, seed=3):
     """Rows (a1 < a2 plus autos), stored uvw [m] (zenith frame, nearly coplanar), hour uvw = R uvw_stored, and
     DATA: point sources (stored-frame l, m) predicted exactly in the stored frame, re-phased to the hour frame."""
     rng = np.random.default_rng(seed)
@@ -264,3 +264,18 @@ def test_pinned_h2d_same_bytes(monkeypatch):
     assert np.array_equal(cp.asnumpy(db), big) and snapshot._PIN["nbytes"] >= max(n0, big.nbytes)
     da2, df2, _ = snapshot.h2d(a, f, g)
     assert np.array_equal(cp.asnumpy(da2), a) and np.array_equal(cp.asnumpy(df2), f) and np.array_equal(cp.asnumpy(db), big)
+
+
+def test_far_from_zenith_warns_and_quantum_keeps_production(zen_env):
+    """A snapshot imaged > asin(NLOW) from its zenith warns (b_k extrapolated); with the engine's GSI_SVD_QUANTUM
+    table override the router keeps the production path (the loss emulation assumes production's table key)."""
+    small, raw, R, _ = _snapshot(tilt=8.0)
+    sc = math.radians(SDEG)
+    L = snapshot.gpu_select(small, raw, SDEG)
+    iw, sw = _weights(L, sc)
+    with pytest.warns(UserWarning, match="extrapolates"):
+        zenith.ZenSnapshot(L["zen"], L["w"], L["pre"], iw, sw, N, sc)
+    zen_env.setenv("GSI_SVD_QUANTUM", "1.0")
+    assert zenith.use_zen(5.0, 1.0, 1e-4)[0] is False
+    zen_env.setenv("GSI_SVD_QUANTUM", "0")
+    assert zenith.use_zen(5.0, 1.0, 1e-4)[0] is True

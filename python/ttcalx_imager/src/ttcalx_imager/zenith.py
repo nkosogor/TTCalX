@@ -110,6 +110,10 @@ def use_zen(wabs_h, wabs_z, tol):
     m = mode()
     if m == "off":
         return False, None, None
+    if float(os.environ.get("GSI_SVD_QUANTUM", "0") or 0) > 0:
+        # the gsi engine then replaces snapshot.snapshot_svd with another table quantum: the a_k-loss emulation and
+        # the router assume production's 0.25 lambda key, so keep the production path
+        return False, None, None
     kh, kz = hour_rank(wabs_h, tol), zen_rank(wabs_z, tol)
     return (m == "force" or kh >= kz + settings()["dk"]), kh, kz
 
@@ -179,6 +183,15 @@ def _geometry(Nz, scz, rmax, xmin, nx):
             _GEOM.pop(next(iter(_GEOM)))
         hit = _GEOM[key] = (inside, xp, jj.astype(cp.int16), t)
     return hit
+
+
+def _min_ns(N, sc, rt):
+    """The lowest stored-frame n of the hour sky (n_hour = 0 circle, the extreme of a rotated hemisphere)."""
+    r = cp.asnumpy(rt).reshape(3, 3)
+    # n_s = -(a l + b m) + c n_h with (a, b, c) = row 2 of R^T: the minimum over the hemisphere n_h >= 0 is on the
+    # horizon (-hypot(a, b)) unless c < 0 (then -|(a, b, c)|)
+    a, b, c = r[2]
+    return -math.sqrt(a * a + b * b + c * c) if c < 0 else -math.hypot(a, b)
 
 
 class ZenTable(SvdWTerm):
@@ -477,6 +490,12 @@ class _Grid:
         self.ridx = cp.flatnonzero(ring)
         del ring
         n = int(self.ridx.size)
+        if n:
+            lo = float(_min_ns(N, Z.sc, Z.rt))
+            if lo < -NLOW:
+                import warnings
+                warnings.warn(f"zenith: hour pixels reach n_stored = {lo:.3f} < -{NLOW} (snapshot imaged > "
+                              f"{math.degrees(math.asin(NLOW)):.1f} deg from its zenith): the b_k table extrapolates there")
         self.i0 = cp.empty(2 * n, cp.int32); self.txy = cp.empty(2 * n, cp.float32)
         self.jb = cp.empty(n, cp.int16); self.tb = cp.empty(n, cp.float32)
         self.q1 = self.q0 = None
