@@ -551,7 +551,7 @@ function _fast_rk4!(g, meas_sq, model_sq, ne, Na, Nf, maxiter, tolerance, compac
     for iter in 1:maxiter
         niters = iter
         for (stage, kk, gin) in ((1, k1, g), (2, k2, x), (3, k3, x), (4, k4, x))
-            @cuda blocks=(ntile * (ntile + 1) ÷ 2, Nf) threads=(_NE_TILE, ty) shmem=8 * _NE_TILE * ty * sizeof(eltype(ne)) fast_ne_tile_kernel!(
+            @cuda blocks=(ntile * (ntile + 1) ÷ 2, Nf) threads=(_NE_TILE, ty) shmem=8 * _NE_TILE * ty * sizeof(eltype(meas_sq.xx)) fast_ne_tile_kernel!(
                 ne, y..., V..., M..., active, N, ntile, live)
             @cuda blocks=blocks threads=threads fast_step_kernel!(kk..., ne, gin..., g..., x..., y..., stage, active, Na, Nf,
                                                                  ntile, comp)
