@@ -54,6 +54,34 @@ run-to-run GPU floor (82 MHz MS hour job vs 748884a, 2026-11-02; 2026-10-27 regr
 | `TTCALX_NUFFT_PRUNED` | unset | `1` | `1` (every scope) or a list of `snap,hour`: NUFFTs as cuFINUFFT spread / interpolation only plus our own fine-grid FFT (row FFTs of the occupied band, tiled transposes, contiguous row FFTs; `pruned.py`). Same transform to float32 rounding (5e-7); 82 MHz 8.2 -> 3.4 ms (type 1), 7.7 -> 2.3 ms (type 2); 82 MHz band-hour -29 %. |
 | `TTCALX_FUSED_WACC` | `0` | `1` | pruned type-1 transforms (`TTCALX_NUFFT_PRUNED`): each w-term accumulated inside the last mode gather (`PrunedPlan.execute_acc`) instead of writing the N x N modes and re-reading them in `acc_re`. The same float operations (images at the rerun floor, 0 CLEAN flips in 60 snapshots); 82 MHz snapshot imaging -8 %, 82 MHz band-hour snapshot stage -4.4 % (2026-11-04). |
 
+## v5 switches (default off)
+
+Not in `FAST_ENV`: production behaviour is unchanged unless they are set.  `TTCALX_V5=1` in the environment of
+a process that calls `use_fast_settings()` (the gsi v3 engine) sets all of them (`ttcalx_imager.v5_env()`; an
+explicit value wins).  For the nightly: `imaging.gpu_env: {TTCALX_V5: "1"}` in the gsi config (the engine also
+needs gsi's `small["uvw_stored"]`, branch `exp/gsi-v5-img`; without it the snapshot router has nothing to route).
+
+| variable | default | `TTCALX_V5` | meaning |
+|---|---|---|---|
+| `TTCALX_SNAP_ZEN` | `0` | `1` | snapshot (gsi v3 engine path): grid dirty I, PSF, the two residuals and dirty V in the snapshot's stored (zenith) frame, K ~ 4-8 w-layers instead of the hour frame's 17-61, reprojected to the production hour grid (`zenith.py`).  Weights, prediction (DFT / degrid switch at `dft_max`), CLEAN, beam fit, restore, QA and FITS are the production code.  `1` / `auto`: per-snapshot router (zenith path when K_hour >= K_zen + `TTCALX_SNAP_ZEN_DK`), `force`: always.  2026-11-24, 2024-12-20 LST 01h, 6 snapshots per band: snapshot time x3.0-3.6 at the hour ends, x1.0-1.1 mid-hour, x2.5 (82 MHz) / x2.2 (55) / x1.4 (23) over the 6; headers equal except BMAJ/BMIN (<= 2e-5 rel.) and BPA (<= 3e-3 deg); I above 10 deg <= 0.007 sigma rms, below 10 deg incl. the horizon <= 0.006 sigma rms / 0.05 sigma max; dirty I up to ~0.35 sigma at the brightest peaks (~1e-4 relative: production itself moves 0.2 sigma for 1e-4 rms per-antenna gain errors); larger restored differences (up to 1.9 sigma, one source 1 %) only via CLEAN near-ties (niter differs); V QA rms -1e-4 relative. |
+| `TTCALX_SNAP_ZEN_DK` | `4` | | router margin in w-term layers. |
+| `TTCALX_SNAP_ZEN_GZ` / `_PSFGZ` | `1` / `1.5` | | zenith grid oversampling of the I/V/residual passes / of the PSF pass (PSFGZ 1: beam 3-10x further off, ~-10 % time). |
+| `TTCALX_SNAP_ZEN_RING_DEG` / `_RING_PX` | `6` / `8` | | horizon ring: hour pixels below this zenith-frame elevation, or within this many zenith-grid pixels of the zenith-frame horizon, are evaluated per w-layer (exact w-term at the pixel's direction) instead of from the reprojected zenith image (whose w-term factor varies too fast there: 1-2 sigma near bright sources at el ~ 0 without it). |
+| `TTCALX_SNAP_ZEN_AK_LOSS` | `1` | | `1`: multiply the zenith-path image by production's per-pixel a_k / b_k linear-interpolation gain (`zenith.gain_map`), so that the products stay production's.  `0`: the loss-free image (see Known issues). |
+| `TTCALX_PINNED_H2D` | `0` | `1` | snapshot DATA / FLAG to the GPU through one page-locked staging buffer (`snapshot.h2d`; the gsi engine's `prepare` uses it when present): the same bytes, 82 MHz 107 MB 13.2 -> 8.5 ms. |
+
+### Known issues
+
+* **a_k interpolation flux loss (production, not fixed here).**  The snapshot hour-frame gridder interpolates the
+  a_k(w) table (600 points over [0, wmax]) and the b_k(x') table (2001 points) linearly; at the hour ends
+  (K 45-61) this lowers the image by up to ~0.3 % (55 MHz) / ~0.5 % (73-82 MHz), direction dependent
+  (`zenith.gain_map`, 2nd order: 1 - 2 pi^2 [t(1-t) (dw x')^2 + s(1-s) (dx w)^2]).  The zenith path reproduces it
+  (`TTCALX_SNAP_ZEN_AK_LOSS=1`) so that v5 is identity-first.  Fixing it is a separate, product-changing step:
+  `TTCALX_SNAP_ZEN_AK_LOSS=0` (zenith path without the loss, unvalidated as a product change) and, for the
+  production path, finer tables (not implemented).
+* The zenith path needs the stored UVW (`small["uvw_stored"]`); the MS-reading paths (`image`, `image_many`) and
+  `v_rms_from_samples` always use the production gridding.
+
 `SnapshotImager.image_many` reads with a spawned helper process: scripts calling it need an
 `if __name__ == "__main__":` guard (or `reader="thread"`). Set `CUPY_CACHE_DIR` if the home
 quota is small.

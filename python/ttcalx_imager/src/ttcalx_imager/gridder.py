@@ -58,15 +58,19 @@ _GEOM_CACHE_MAX = 4
 SVD_METHOD = None
 
 
-def _svd_factors(wmax, tol, nw, nx, method=None):
+def _svd_factors(wmax, tol, nw, nx, method=None, xmin=-0.5):
     """Truncated factorisation exp(-2 pi i w x') ~= sum_{k<K} A[:, k](w) Vh[k](x') on the (w, x') grid,
-    K = smallest rank with max |M - A_K Vh_K| < tol (as before).  Cached (compact, host)."""
+    K = smallest rank with max |M - A_K Vh_K| < tol (as before).  Cached (compact, host).
+    xmin: lower end of the x' grid (x' in [xmin, 1/2]; -1/2 = the upper hemisphere, the imager's tables;
+    the zenith-frame snapshot table of zenith.py extends it below the horizon)."""
     method = method or SVD_METHOD or os.environ.get("TTCALX_SVD_METHOD", "lapack")
     key = (float(wmax), float(tol), int(nw), int(nx), method)
+    if xmin != -0.5:
+        key = key + (float(xmin),)
     hit = _FACTOR_CACHE.get(key)
     if hit is not None:
         return hit
-    wg = np.linspace(0, wmax, nw); xg = np.linspace(-0.5, 0.5, nx)
+    wg = np.linspace(0, wmax, nw); xg = np.linspace(xmin, 0.5, nx)
     M = np.exp(-2j * np.pi * np.outer(wg, xg))
     res = None
     if method == "gram":
@@ -325,6 +329,10 @@ def fused_wacc() -> bool:
 
 def clear_caches():
     _SVD_CACHE.clear(); _PLAN_CACHE.clear(); _FACTOR_CACHE.clear(); _GEOM_CACHE.clear()
+    import sys
+    zen = sys.modules.get(__package__ + ".zenith")       # the zenith-frame snapshot gridder's tables / plans
+    if zen is not None:
+        zen.clear()
     if pruned_on("snap") or pruned_on("hour"):
         from . import pruned
         pruned.clear()

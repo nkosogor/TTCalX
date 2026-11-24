@@ -307,3 +307,15 @@ def test_qa_reject():
     r = np.r_[np.full(20, 0.89) + np.linspace(-0.005, 0.005, 20), 1.2, 0.3]
     bad, med, sd = qa_reject(r)
     assert bad == [20, 21] and med == pytest.approx(0.89, abs=0.01)
+
+
+def test_use_fast_settings_v5_opt_in():
+    """The v5 switches are off by default (not in FAST_ENV); TTCALX_V5=1 adds them; an explicit value wins."""
+    import ttcalx_imager
+    env = {}
+    ttcalx_imager.use_fast_settings(env)
+    assert all(k not in env for k in ttcalx_imager.v5_env()) and env["TTCALX_NUFFT_PRUNED"] == "1"
+    env = {"TTCALX_V5": "1", "TTCALX_PINNED_H2D": "0"}
+    got = ttcalx_imager.use_fast_settings(env)
+    assert env["TTCALX_SNAP_ZEN"] == "1" and env["TTCALX_PINNED_H2D"] == "0" and got["TTCALX_SNAP_ZEN"] == "1"
+    assert set(ttcalx_imager.v5_env()) <= set(got)

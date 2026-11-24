@@ -44,10 +44,28 @@ FAST_ENV = {
 }
 
 
+# v5 speed switches (2026-11-24), default off: not in FAST_ENV.  TTCALX_V5=1 in the environment of a process that
+# calls use_fast_settings (the gsi v3 engine; gsi: imaging.gpu_env: {TTCALX_V5: "1"}) switches them on together.
+# Snapshot: zenith-frame gridding with the per-snapshot router (zenith.py; same products to the gridding accuracy,
+# headers equal except the restoring beam) and the page-locked host-to-device staging buffer (same bytes).
+SNAP_V5_ENV = {
+    "TTCALX_SNAP_ZEN": "1",
+    "TTCALX_PINNED_H2D": "1",
+}
+
+
+def v5_env():
+    """The variables TTCALX_V5=1 sets (snapshot and hour-stage v5 switches)."""
+    return dict(SNAP_V5_ENV)
+
+
 def use_fast_settings(env=None):
-    """Set every FAST_ENV variable that is not already set (an explicit value wins); returns the
-    values now in effect."""
+    """Set every FAST_ENV variable that is not already set (an explicit value wins); with TTCALX_V5=1 also the v5
+    switches (v5_env()).  Returns the values now in effect."""
     env = _os.environ if env is None else env
-    for k, v in FAST_ENV.items():
+    want = dict(FAST_ENV)
+    if env.get("TTCALX_V5", "0") == "1":
+        want.update(v5_env())
+    for k, v in want.items():
         env.setdefault(k, v)
-    return {k: env[k] for k in FAST_ENV}
+    return {k: env[k] for k in want}
