@@ -237,10 +237,13 @@ Keywords:
   allocate almost no device memory (a long-lived process with a CUDA soft memory limit then
   does not collect inside the solve).  Results are bitwise the same as without it.
 - `peel_fast = false`: `true` runs the fast peel (src/gpu/peel_fast.jl): the same peel rearranged
-  on the GPU, about 3x faster, equal to the default to Float32 rounding of the visibilities.  It
-  needs GPU visibilities (ComplexF32, as read from the MS, is the validated setup; ComplexF64
-  works), a `workspace`, `fast_kernels!(true)`, `solver = :rk4`, `precision = :mixed`, full Jones,
-  no `reg`, no smoothing, no `restore` and `maxiter ≤ 63`; one fast peel per process at a time.
+  on the GPU, about 3x faster; another rounding of the default (Float32 level at 55 / 82 MHz, up to
+  ~1e-3 relative at 23 MHz where an RFI guard decision occasionally flips, as with fast_kernels! on
+  vs off).  It needs GPU visibilities (ComplexF32, as read from the MS, is the validated setup;
+  ComplexF64 works), a `workspace`, `fast_kernels!(true)`, `solver = :rk4`, `precision = :mixed`,
+  full Jones, no `reg`, no smoothing, no `restore`, `rfi_mode = :after`, no `initial_gains`,
+  `cache_model_sq = true` and `maxiter ≤ 63`; one fast peel per process at a time.  Without it the
+  visibilities must be ComplexF64.
 
 Returns `(peeled, skipped, flagged_zeros, restored, gains)`: names of the subtracted sources,
 names of the sky sources below `min_elevation`, newly flagged zero samples,
@@ -270,6 +273,8 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
     PEEL_FAST[] == peel_fast ||
         error("zest_sky_rfi!: a fast peel is running in this process (one peel at a time with peel_fast)")
     fast = peel_fast
+    fast || eltype(vis.xx) == ComplexF64 ||
+        throw(ArgumentError("zest_sky_rfi!: ComplexF32 visibilities need peel_fast = true"))
     rfi_mode in (:after, :joint) || throw(ArgumentError("rfi_mode must be :after or :joint"))
     precision in (:double, :mixed) || throw(ArgumentError("precision must be :double or :mixed"))
     smooth_exempt_flux > 0 || throw(ArgumentError("smooth_exempt_flux must be > 0 (Inf: none exempt)"))
@@ -315,7 +320,8 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
                        _ws_vis!(ws, :model, meta.Nbase, meta.Nfreq, gpu, nmodel += 1)
             # fast: the generators overwrite the not-zeroed model (0 + v, what adding to zeros gives)
             if is_rfi(s)
-                gpu_genvis!(c, meta, s, meta.phase_center_ra, meta.phase_center_dec, 0.0; overwrite=fast)
+                gpu_genvis!(c, meta, s, meta.phase_center_ra, meta.phase_center_dec, 0.0; overwrite=fast,
+                            s0=fast ? _RFI_S0[] : nothing)
             else
                 genvis_exact!(c, meta, s, mjd; overwrite=fast)
             end

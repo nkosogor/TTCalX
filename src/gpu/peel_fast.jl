@@ -4,9 +4,11 @@
 #
 # The same peel as the default zest_sky_rfi! (rk4, :mixed, fast_kernels!, the residual guard), with
 # the work rearranged on the GPU.  Off (the default) none of this code runs and the peel is the
-# default one bit for bit.  On, the result agrees with the default to Float32 rounding of the
-# visibilities (guard decisions identical on the OVRO-LWA validation snapshots, deep images at the
-# production floor), in about 1/3 of the time:
+# default one bit for bit.  On, the result is another rounding of the default peel, in about 1/3 of
+# the time: on the OVRO-LWA validation snapshots it agrees to Float32 rounding at 55 and 82 MHz
+# (~1e-8 - 1e-6 relative) and to ~1e-4 rms / ~1e-3 max relative at 23 MHz, where the ill-conditioned
+# solves amplify rounding and a guard decision (RFI) occasionally flips, as with fast_kernels! on vs off;
+# deep images at the production floor.  The work rearranged:
 #
 #   baseline compaction   only baselines with an unflagged sample are peeled (padded to a multiple of
 #                         1024 rows); the accepted directions are then also subtracted, with their
@@ -49,7 +51,10 @@ const _BLC_PAD = 1024                  # compacted baseline count rounded up to 
 # per-call caches (reset at the start and end of every fast call)
 const _SQ_TABLE = Ref{Any}(nothing)    # (baselines, live, device pair table)
 const _SQ_MASK = Ref{Any}(nothing)     # (baselines, positions, channels, minuvw, device mask)
-_fast_reset_caches!() = (_SQ_TABLE[] = nothing; _SQ_MASK[] = nothing; nothing)
+# the RFI models' phase centre ŝ₀ (uvw_geometry) fitted once on the full metadata of the call: the compacted
+# rows (and the few fully flagged rows) would fit it from a subset (underdetermined for 1-2 dead rows)
+const _RFI_S0 = Ref{Any}(nothing)
+_fast_reset_caches!() = (_SQ_TABLE[] = nothing; _SQ_MASK[] = nothing; _RFI_S0[] = nothing; nothing)
 
 const _G32 = Dict{Any,Any}()
 """ComplexF32 copies (role `s`) of the four gain arrays `g` (buffers kept per role, shape and device)."""
@@ -625,9 +630,7 @@ function _fast_solve!(cal::GPUCalibration, measured::GPUVisibilities, model::GPU
     tolerance = max(Float64(tolerance), 1e-6)               # as solve_gains! with precision = :mixed
     minuvw = Float64(minuvw)
     _fast_square!(meas_sq, measured, meta, minuvw, compact)
-    model_sq === nothing &&
-        (model_sq = _fast_square!(_ws_square!(ws, :solve_model_sq, Na, Nf, ComplexF32, true; zero=false),
-                                  model, meta, minuvw, compact))
+    model_sq === nothing && throw(ArgumentError("peel_fast: the square model is built by the caller (cache_model_sq)"))
     ne = _ws_buf!(ws, :ne, ComplexF32, (Na, 8, cld(Na, _NE_TILE), Nf), true; zero=false)
     g = (cal.xx, cal.xy, cal.yx, cal.yy)
     _fast_rk4!(g, meas_sq, model_sq, ne, Na, Nf, Int(maxiter), tolerance, compact, ws)
@@ -1009,6 +1012,9 @@ function _check_fast(vis, ws, kw)
           kw.reg !== nothing ? "no phase prior (reg = nothing)" :
           (kw.smooth_flux != 0 || kw.rfi_smooth_flux != 0) ? "no smoothing (smooth_flux = rfi_smooth_flux = 0)" :
           !isempty(kw.restore) ? "no restored sources (restore = [])" :
+          kw.rfi_mode != :after ? "rfi_mode = :after" :
+          kw.initial_gains !== nothing ? "a cold start (initial_gains = nothing)" :
+          !kw.cache_model_sq ? "cache_model_sq = true" :
           !(1 <= kw.maxiter <= FAST_MAXITER) ? "1 <= maxiter <= $FAST_MAXITER" :
           !(eltype(vis.xx) in (ComplexF32, ComplexF64)) ? "ComplexF32 or ComplexF64 visibilities" : ""
     isempty(why) || throw(ArgumentError("peel_fast needs $why"))
@@ -1027,6 +1033,7 @@ function _zest_sky_rfi_fast!(vis, meta, mjd, sky, rfi, kw; flag_zeros::Bool, wor
     try
         _fast_reset_caches!()
         PEEL_FAST[] = true
+        isempty(rfi) || (_RFI_S0[] = uvw_geometry(meta)[1])
         return _zest_blc!(vis, meta, mjd, sky, rfi, kw, flag_zeros, ws)
     finally
         PEEL_FAST[] = false
@@ -1105,7 +1112,8 @@ function _dead_subtract!(vis, meta, mjd, sky, rfi, r, dead, ws)
     for name in r.peeled
         s = src[name]; cal = r.gains.cals[name]
         if is_rfi(s)
-            gpu_genvis!(md, meta_d, s, meta_d.phase_center_ra, meta_d.phase_center_dec, 0.0; overwrite=true)
+            gpu_genvis!(md, meta_d, s, meta_d.phase_center_ra, meta_d.phase_center_dec, 0.0; overwrite=true,
+                        s0=_RFI_S0[])
         else
             genvis_exact!(md, meta_d, s, mjd; overwrite=true)
         end
