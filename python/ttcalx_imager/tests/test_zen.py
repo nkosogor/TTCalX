@@ -374,6 +374,21 @@ def test_zen_samples_lazy(zen_env):
     assert "zen" not in a["info"] and L2["zen"]._c == {}
 
 
+def test_zen_snapshot_drops_stored_samples(zen_env):
+    """ZenSnapshot frees the float64 stored-frame u, v, w of its ZenSamples once it has used them (they are not
+    needed through CLEAN; R and the router's wabs stay); a later access rebuilds them, the same values."""
+    small, raw, R, _ = _snapshot()
+    sc = math.radians(SDEG)
+    L = snapshot.gpu_select(small, raw, SDEG)
+    iw, sw = _weights(L, sc)
+    z = L["zen"]
+    w0 = cp.asnumpy(z["w"])
+    Z = zenith.ZenSnapshot(z, L["w"], L["pre"], iw, sw, N, sc)
+    assert not {"u", "v", "w"} & set(z._c) and "R" in z._c
+    assert np.array_equal(cp.asnumpy(z["w"]), w0) and z.wabs == float(np.abs(w0).max())
+    assert float(cp.abs(Z.image(L["visI"])).max()) > 0
+
+
 def test_clear_caches_clears_zenith(zen_env):
     """gridder.clear_caches (the gsi engine's before_hour / after_hour / band change) also drops the zenith tables and
     plans."""

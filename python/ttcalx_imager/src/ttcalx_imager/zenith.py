@@ -587,7 +587,9 @@ class ZenSnapshot:
         self.grids = {"main": _Grid(self, self.opts["gz"], tol, eps)}
         pg = self.opts["psfgz"]
         self.grids["psf"] = self.grids["main"] if pg == self.opts["gz"] else _Grid(self, pg, tol, eps)
-        del self.uf, self.vf
+        del self.uf, self.vf, u, v, w
+        if hasattr(zen, "drop_samples"):
+            zen.drop_samples()          # the float64 stored-frame u, v, w are not needed through CLEAN
 
     @property
     def K(self):
