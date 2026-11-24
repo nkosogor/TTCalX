@@ -22,4 +22,5 @@ include("helpers.jl")
     include("test_ms_io.jl")
     include("test_sky_rfi.jl")
     include("test_workspace.jl")
+    include("test_peel_fast.jl")
 end

@@ -59,9 +59,10 @@ Adapt.adapt_structure(to, x::GPUHermitianJonesMatrixArray) =
 """
 GPU-friendly visibility storage.
 
-Shape: (Nbase, Nfreq) for each component.
+Shape: (Nbase, Nfreq) for each component.  ComplexF64, or ComplexF32 for
+`zest_sky_rfi!(...; peel_fast=true)` only (the other functions are written and tested for ComplexF64).
 """
-struct GPUVisibilities{T<:AbstractArray{ComplexF64}, F<:AbstractArray{Bool}}
+struct GPUVisibilities{T<:AbstractArray{<:Complex}, F<:AbstractArray{Bool}}
     xx::T
     xy::T
     yx::T

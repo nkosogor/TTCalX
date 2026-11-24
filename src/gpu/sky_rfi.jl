@@ -236,6 +236,14 @@ Keywords:
   scratch, residual and restore buffers from it, so that repeated calls with the same shapes
   allocate almost no device memory (a long-lived process with a CUDA soft memory limit then
   does not collect inside the solve).  Results are bitwise the same as without it.
+- `peel_fast = false`: `true` runs the fast peel (src/gpu/peel_fast.jl): the same peel rearranged
+  on the GPU, about 3x faster; another rounding of the default (Float32 level at 55 / 82 MHz, up to
+  ~1e-3 relative at 23 MHz where an RFI guard decision occasionally flips, as with fast_kernels! on
+  vs off).  It needs GPU visibilities (ComplexF32, as read from the MS, is the validated setup;
+  ComplexF64 works), a `workspace`, `fast_kernels!(true)`, `solver = :rk4`, `precision = :mixed`,
+  full Jones, no `reg`, no smoothing, no `restore`, `rfi_mode = :after`, no `initial_gains`,
+  `cache_model_sq = true` and `maxiter ≤ 63`; one fast peel per process at a time.  Without it the
+  visibilities must be ComplexF64.
 
 Returns `(peeled, skipped, flagged_zeros, restored, gains)`: names of the subtracted sources,
 names of the sky sources below `min_elevation`, newly flagged zero samples,
@@ -255,7 +263,18 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
                        restore_below_mhz::Real=Inf, restore_offset_deg::Real=0.0,
                        precision::Symbol=:double, initial_gains=nothing, warm_max_age_s::Real=60.0,
                        cache_model_sq::Bool=(precision == :mixed),
-                       workspace::Union{Nothing,PeelWorkspace}=nothing)
+                       workspace::Union{Nothing,PeelWorkspace}=nothing, peel_fast::Bool=false)
+    if peel_fast && !PEEL_FAST[]            # the fast peel's entry; it calls back here with PEEL_FAST set
+        kw = (; rfi_mode, solver, maxiter, tolerance, minuvw, peeliter, max_gain, min_elevation, diagonal, reg,
+              report, smooth_flux, rfi_smooth_flux, smooth_exempt_flux, smooth_exempt_names, restore,
+              restore_below_mhz, restore_offset_deg, precision, initial_gains, warm_max_age_s, cache_model_sq)
+        return _zest_sky_rfi_fast!(vis, meta, mjd, sky, rfi, kw; flag_zeros=flag_zeros, workspace=workspace)
+    end
+    PEEL_FAST[] == peel_fast ||
+        error("zest_sky_rfi!: a fast peel is running in this process (one peel at a time with peel_fast)")
+    fast = peel_fast
+    fast || eltype(vis.xx) == ComplexF64 ||
+        throw(ArgumentError("zest_sky_rfi!: ComplexF32 visibilities need peel_fast = true"))
     rfi_mode in (:after, :joint) || throw(ArgumentError("rfi_mode must be :after or :joint"))
     precision in (:double, :mixed) || throw(ArgumentError("precision must be :double or :mixed"))
     smooth_exempt_flux > 0 || throw(ArgumentError("smooth_exempt_flux must be > 0 (Inf: none exempt)"))
@@ -286,6 +305,8 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
     peeled = String[]
     Tsq = precision == :mixed ? ComplexF32 : ComplexF64
     nmodel = 0                             # workspace models used so far (kept over the passes)
+    # fast: the antennas with data (flags are fixed from here on) are the only ones solved for
+    cmap = fast ? compact_antennas(vis, meta) : nothing
     for sources in passes
         isempty(sources) && continue
         cals = [calibration_type(wrap(s), meta.Nant, meta.Nfreq; gpu=gpu) for s in sources]
@@ -295,11 +316,14 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
         append!(solved, get_name.(sources) .=> cals)
         cohs = map(sources) do s
             c = ws === nothing ? GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=gpu) :
-                                 _ws_vis!(ws, :model, meta.Nbase, meta.Nfreq, gpu, nmodel += 1)
+                fast ? _ws_vis!(ws, :model, meta.Nbase, meta.Nfreq, gpu, nmodel += 1; zero=false, T=eltype(vis.xx)) :
+                       _ws_vis!(ws, :model, meta.Nbase, meta.Nfreq, gpu, nmodel += 1)
+            # fast: the generators overwrite the not-zeroed model (0 + v, what adding to zeros gives)
             if is_rfi(s)
-                gpu_genvis!(c, meta, s, meta.phase_center_ra, meta.phase_center_dec, 0.0)
+                gpu_genvis!(c, meta, s, meta.phase_center_ra, meta.phase_center_dec, 0.0; overwrite=fast,
+                            s0=fast ? _RFI_S0[] : nothing)
             else
-                genvis_exact!(c, meta, s, mjd)
+                genvis_exact!(c, meta, s, mjd; overwrite=fast)
             end
             c.flags .= vis.flags
             c
@@ -311,13 +335,17 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
         # (Nant² Nfreq × 4 per direction: 190 MB at 352 antennas, 48 channels, :mixed)
         sqcache = IdDict{Any,Any}()
         meas_sq = ws === nothing ? GPUSquareVisibilities(meta.Nant, meta.Nfreq; gpu=gpu, T=Tsq) :
-                                   _ws_square!(ws, :meas_sq, meta.Nant, meta.Nfreq, Tsq, gpu)
+                                   _ws_square!(ws, :meas_sq, meta.Nant, meta.Nfreq, Tsq, gpu; zero=!fast)
         # workspace: square models numbered within the pass (the passes reuse them)
         new_model_sq(coh) = ws === nothing ? square_model(coh, meta; minuvw=minuvw, precision=precision) :
+            fast ? _fast_square!(_ws_square!(ws, :model_sq, meta.Nant, meta.Nfreq, Tsq, gpu, length(sqcache) + 1;
+                                             zero=false), coh, meta, minuvw, cmap) :
             square_model!(_ws_square!(ws, :model_sq, meta.Nant, meta.Nfreq, Tsq, gpu, length(sqcache) + 1),
                           coh, meta; minuvw=minuvw)
         solve = (cal, v, coh) -> begin
             msq = cache_model_sq ? get!(() -> new_model_sq(coh), sqcache, coh) : nothing
+            fast && return _fast_solve!(cal, v, coh, meta, msq, meas_sq, ws, cmap; maxiter=maxiter,
+                                        tolerance=tolerance, minuvw=minuvw)[1:2]
             converged, niters, _ = solve_gains!(cal, v, coh, meta; solver=solver, maxiter=maxiter,
                                                 tolerance=tolerance, minuvw=minuvw, reg=prior,
                                                 smooth_flux=sflux[findfirst(c -> c === cal, cals)],
@@ -325,7 +353,8 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
                                                 workspace=ws)
             converged, niters
         end
-        sub = guarded_zest!(vis, meta, cohs, cals, solve; peeliter=peeliter,
+        sub = fast ? _fast_guarded_zest!(vis, meta, cohs, cals, solve, peeliter, max_gain, rep, ws) :
+              guarded_zest!(vis, meta, cohs, cals, solve; peeliter=peeliter,
                             max_gain=max_gain, report=rep, workspace=ws)
         append!(peeled, get_name.(sources[sub]))
         before === nothing || append!(peeled_models, [c.xx for c in cohs[sub]])

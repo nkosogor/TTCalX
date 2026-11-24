@@ -62,7 +62,10 @@ Pass many MSes in one call: the first pays ~1 min of compilation, the rest take 
 From Julia: `zest_sky_rfi_ms!(ms, sky, rfi; kwargs...)`, or `zest_sky_rfi!` on visibilities in
 memory. Opt-in speed paths for long-running processes: `fast_kernels!(true)` (faster GPU kernels,
 equal to rounding) and `zest_sky_rfi!(...; workspace=PeelWorkspace())` (reuses ~2 GB of GPU buffers
-across calls, bitwise the same results). The building blocks (`solve_gains!`, `genvis_exact!`,
+across calls, bitwise the same results). With both, `zest_sky_rfi!(...; peel_fast=true)` (rk4,
+`precision=:mixed`, ComplexF32 visibilities as read from the MS) runs the same peel ~3x faster, another
+rounding of the default (Float32 level at 55 / 82 MHz; ~1e-3 relative at 23 MHz, where an RFI guard
+decision occasionally flips, as with `fast_kernels!` on vs off) (`src/gpu/peel_fast.jl`; off by default). The building blocks (`solve_gains!`, `genvis_exact!`,
 `geometric_uvw!`, `restore_point_sources!`, `read_ms_fast`) are described in their docstrings and
 in the [documentation](https://nkosogor.github.io/TTCalX/).
 

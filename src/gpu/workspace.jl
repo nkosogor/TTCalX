@@ -85,21 +85,29 @@ function _ws_buf!(ws::PeelWorkspace, tag, ::Type{T}, dims::Dims, gpu::Bool, i::I
     a
 end
 
-"""Visibilities number `i` of role `tag` (as `GPUVisibilities(Nb, Nf)` when zeroed)."""
-function _ws_vis!(ws::PeelWorkspace, tag, Nb::Int, Nf::Int, gpu::Bool, i::Int=1; zero::Bool=true)
-    c(q) = _ws_buf!(ws, (tag, q), ComplexF64, (Nb, Nf), gpu, i; zero=zero)
+"""
+Visibilities number `i` of role `tag` (as `GPUVisibilities(Nb, Nf)` when zeroed), element type `T`
+(ComplexF64, or ComplexF32 for the ComplexF32 visibilities of a fast peel).
+"""
+function _ws_vis!(ws::PeelWorkspace, tag, Nb::Int, Nf::Int, gpu::Bool, i::Int=1; zero::Bool=true,
+                  T::Type{<:Complex}=ComplexF64)
+    c(q) = _ws_buf!(ws, (tag, q), T, (Nb, Nf), gpu, i; zero=zero)
     GPUVisibilities(c(1), c(2), c(3), c(4), _ws_buf!(ws, (tag, 5), Bool, (Nb, Nf), gpu, i; zero=zero))
 end
 
-"""Square visibilities number `i` of role `tag` (as `GPUSquareVisibilities(Na, Nf; T)`)."""
-function _ws_square!(ws::PeelWorkspace, tag, Na::Int, Nf::Int, ::Type{T}, gpu::Bool, i::Int=1) where {T}
-    c(q) = _ws_buf!(ws, (tag, q), T, (Na, Na, Nf), gpu, i)
+"""
+Square visibilities number `i` of role `tag` (as `GPUSquareVisibilities(Na, Nf; T)`); `zero=false`
+when the caller fills them with `square_visibilities!` / `square_model!` (which write every entry).
+"""
+function _ws_square!(ws::PeelWorkspace, tag, Na::Int, Nf::Int, ::Type{T}, gpu::Bool, i::Int=1;
+                     zero::Bool=true) where {T}
+    c(q) = _ws_buf!(ws, (tag, q), T, (Na, Na, Nf), gpu, i; zero=zero)
     GPUSquareVisibilities(c(1), c(2), c(3), c(4))
 end
 
 """`deepcopy_gpu(vis)` into the workspace's buffers of role `tag`."""
 function _ws_copy!(ws::PeelWorkspace, tag, vis::GPUVisibilities)
-    c = _ws_vis!(ws, tag, size(vis.xx)..., _is_gpu(vis.xx); zero=false)
+    c = _ws_vis!(ws, tag, size(vis.xx)..., _is_gpu(vis.xx); zero=false, T=eltype(vis.xx))
     for f in (:xx, :xy, :yx, :yy, :flags)
         copyto!(getfield(c, f), getfield(vis, f))
     end
