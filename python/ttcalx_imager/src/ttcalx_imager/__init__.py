@@ -56,7 +56,7 @@ SNAP_V5_ENV = {
 
 def v5_env():
     """The variables TTCALX_V5=1 sets (snapshot and hour-stage v5 switches)."""
-    return dict(SNAP_V5_ENV)
+    return dict(SNAP_V5_ENV, **HOUR_V5_ENV)
 
 
 def use_fast_settings(env=None):
@@ -69,3 +69,27 @@ def use_fast_settings(env=None):
     for k, v in want.items():
         env.setdefault(k, v)
     return {k: env[k] for k in want}
+
+
+# Hour-stage v5 speed switches (2026-11 "pexact" set; each default off, env read at call time), validated on top of
+# FAST_ENV (TTCALX_FUSED_CAK needs TTCALX_FAST_AK + TTCALX_FUSED_WACC + TTCALX_NUFFT_PRUNED, TTCALX_MS_INCR needs
+# TTCALX_SPARSE_UPDATE_MAX): the same hour images to float32 rounding (at the GPU rerun floor; TTCALX_UVMAX_GPU and
+# TTCALX_WMAX_MEMO bit-identical), ~1.2x faster at 55-73 MHz.  Not in FAST_ENV: use_hour_v5_settings() turns them on.
+HOUR_V5_ENV = {
+    "TTCALX_REPROJ_FAST": "1",
+    "TTCALX_SVD_QUANTUM": "0.25",
+    "TTCALX_MS_INCR": "16",
+    "TTCALX_FUSED_CAK": "1",
+    "TTCALX_WMAX_MEMO": "1",
+    "TTCALX_UVMAX_GPU": "1",
+}
+
+
+def use_hour_v5_settings(env=None):
+    """Set every FAST_ENV and HOUR_V5_ENV variable that is not already set (an explicit value wins); returns the
+    HOUR_V5_ENV values now in effect."""
+    env = _os.environ if env is None else env
+    use_fast_settings(env)
+    for k, v in HOUR_V5_ENV.items():
+        env.setdefault(k, v)
+    return {k: env[k] for k in HOUR_V5_ENV}

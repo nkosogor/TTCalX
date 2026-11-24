@@ -608,6 +608,10 @@ class MultiScaleClean:
         self.divergence_limit = divergence_limit; self.diverged = False
         self.sparse_max = min(64, int(os.environ.get("TTCALX_SPARSE_UPDATE_MAX", "0")))    # 0: FFT updates (748884a); 64 = kernel limit
         self._small, self._fullps = {}, {}
+        # TTCALX_MS_INCR=n (default 0 = off; needs TTCALX_SPARSE_UPDATE_MAX): after a sparse residual update with
+        # <= n components the scale images are updated with the same components (minor())
+        self.incr_max = min(self.sparse_max, max(0, int(os.environ.get("TTCALX_MS_INCR", "0"))))
+        self._gsk = {}
         self.log = log or (lambda *a: None)
         self.psf = cp.asarray(psf, dtype=cp.float32)
         self.beam = tuple(beam) if beam is not None else fit_beam(self.psf, scale_deg, theo_pix)
@@ -682,6 +686,64 @@ class MultiScaleClean:
                                                     .astype(cp.float32)), c + h)
         return self._fullps[k]
 
+    # TTCALX_MS_INCR: the incremental scale-image update kernels S_s * S_k * PSF (and S_s * PSF) are full-size
+    # ((N + 2 h_s + 2 h_k)^2 float32, ~40 MB at 3122 px) and kept for the minor loops of one interval.  INCR_HMAX
+    # bounds the scale pairs that use them (h_s + h_k, h = ceil(scale / 2) px); a kernel is only made while the
+    # full-size kernels held (these and full_ps) stay below INCR_CACHE_GB and the GPU keeps INCR_FREE_GB free
+    # (device + CuPy pool) -- otherwise that cycle's scale images are recomputed by FFT (the default path)
+    INCR_HMAX = 64
+    INCR_CACHE_GB = 1.0
+    INCR_FREE_GB = 1.0
+
+    def _incr_room(self, nbytes):
+        held = sum(int(g.nbytes) for g, _ in list(self._gsk.values()) + list(self._fullps.values()))
+        if held + nbytes > self.INCR_CACHE_GB * 1e9:
+            return False
+        pool = cp.get_default_memory_pool()
+        free = cp.cuda.runtime.memGetInfo()[0] + pool.total_bytes() - pool.used_bytes()
+        return free - 4 * nbytes >= self.INCR_FREE_GB * 1e9         # 4x: the fftconvolve temporaries
+
+    def _incr_ok(self, active, k):
+        """Scale images may be updated incrementally after a cycle of scale k: every active non-zero scale s has
+        h_s + h_k <= INCR_HMAX."""
+        hk = int(math.ceil(0.5 * self.scales[k]))
+        hs = max([int(math.ceil(0.5 * s)) for a, s in zip(active, self.scales) if a and s != 0] or [0])
+        return hk + hs <= self.INCR_HMAX
+
+    def gsk(self, s, k):
+        """(kernel, centre) of S_s * S_k * PSF for sparse_conv_sub: S_s * full_ps(k) as an exact linear convolution,
+        full_ps(s) for k = scale 0.  None if it is not cached and there is no room for it (_incr_room)."""
+        h = lambda j: int(math.ceil(0.5 * self.scales[j]))
+        if self.scales[k] == 0:
+            if s not in self._fullps and not self._incr_room(4 * (self.N + 2 * h(s)) ** 2):
+                return None
+            return self.full_ps(s)
+        key = (s, k)
+        if key not in self._gsk:
+            if not self._incr_room(4 * (self.N + 2 * h(s) + 2 * h(k)) ** 2 + (0 if k in self._fullps else
+                                                                             4 * (self.N + 2 * h(k)) ** 2)):
+                return None
+            from cupyx.scipy.signal import fftconvolve
+            kP, cP = self.full_ps(k)
+            kS, hS = self.small_shape(s)
+            self._gsk[key] = (cp.ascontiguousarray(fftconvolve(kP, kS, mode="full").astype(cp.float32)), cP + hS)
+        return self._gsk[key]
+
+    def _incr_scale_images(self, Rs, active, k, cy, cx, ca):
+        """Scale images after the sparse update of a scale-k cycle (components ca at (cy, cx)):
+        R_s - sum_j ca_j (S_s * S_k * PSF)(. - p_j) for every active non-zero scale s (the same linear
+        convolution as recomputing S_s * R from the updated residual, to float32 rounding); None if a kernel is
+        not available (memory), then the caller recomputes them."""
+        out = list(Rs)
+        for s in range(len(self.scales)):
+            if not active[s] or self.scales[s] == 0:
+                continue
+            g = self.gsk(s, k)
+            if g is None:
+                return None
+            out[s] = sparse_conv_sub(Rs[s], g[0], g[1], cy, cx, ca)
+        return out
+
     def minor(self, R, M, stop, fac, scale_masks=None, maxiter=500000, niter_done=0, comp_masks=None,
               max_cycles=100000):
         """Clean until all scaled peaks < stop.  scale_masks: per-scale allowed pixels (phase 2)."""
@@ -696,8 +758,13 @@ class MultiScaleClean:
         # peak 0 and can never be selected: its scale image is not computed (same result)
         active = [bool(v) for v in cp.stack([a.any() for a in allow]).get()]
         nsc = len(self.scales)
+        Rs_next = None          # TTCALX_MS_INCR: scale images of the updated residual (scale 0 = R itself)
         while nit < maxiter and ncyc < max_cycles:
-            Rs = self.scale_images(R, active)
+            if Rs_next is not None:
+                Rs = Rs_next; Rs[0] = R if active[0] else None
+            else:
+                Rs = self.scale_images(R, active)
+            Rs_next = None
             # fused masked |R_s| * fac (one kernel per scale), one device->host copy for all maxima
             absf = [_masked_absf(Rs[k], fac, allow[k]) if active[k] else None for k in range(nsc)]
             act = [k for k in range(nsc) if active[k]]
@@ -749,6 +816,8 @@ class MultiScaleClean:
                     M -= sparse_conv_sub(cp.zeros_like(M), kS, hS, cy, cx, ca)
                     kP, cP = self.full_ps(k)
                     R = sparse_conv_sub(R, kP, cP, cy, cx, ca)
+                if self.incr_max and int(nz.size) <= self.incr_max and self._incr_ok(active, k):
+                    Rs_next = self._incr_scale_images(Rs, active, k, cy, cx, ca)
             else:
                 Fd = self.C.img_fft(dm)
                 M += dm if self.scales[k] == 0 else self.C.back(Fd * self.KS[k])
