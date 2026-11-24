@@ -62,21 +62,41 @@ def snapshot_svd(N, sc, wf, tol):
 _PREFETCH = {}
 
 
-def _prefetch_factors(wq, tol):
+def _prefetch_factors(wq, tol, steps=(0.25,)):
     """TTCALX_SVD_PREFETCH=1 (default 0): the w-term factors (gridder._svd_factors, host) of the neighbouring
     0.25-lambda keys are computed in a background thread, so the next snapshot whose w range moves to one of
-    them finds them in gridder's factor cache (the same function and arguments, so the same factors)."""
+    them finds them in gridder's factor cache (the same function and arguments, so the same factors).
+    steps: the key offsets prefetched on either side (nearest first)."""
     from concurrent.futures import ThreadPoolExecutor
     ex = _PREFETCH.get("ex")
     if ex is None:
         ex = _PREFETCH["ex"] = ThreadPoolExecutor(1, thread_name_prefix="ttcalx-svd-prefetch")
-    for w in (wq + 0.25, wq - 0.25):
+    for w in [wq + s * d for d in steps for s in (1, -1)]:
         if w > 0 and (float(w), float(tol), 600, 2001) not in _PREFETCH:
             _PREFETCH[(float(w), float(tol), 600, 2001)] = ex.submit(gridder._svd_factors, float(w), tol, 600, 2001)
     if len(_PREFETCH) > 64:              # forget old futures (their factors stay in gridder's cache)
         for k in [k for k in _PREFETCH if k != "ex"][:32]:
             _PREFETCH.pop(k, None)
 
+
+def hour_factors(wq, tol):
+    """gridder._svd_factors of the production snapshot table key wq (the zenith router's K_h, zenith.hour_rank).
+    With TTCALX_SVD_PREFETCH=1 the neighbouring keys are prefetched as snapshot_svd does, and a factorisation of
+    this key already running in the prefetch thread is waited for instead of computed again: on the zenith path
+    snapshot_svd is not called, so without this the router computed every new hour key's SVD synchronously (the
+    hour w range moves by a key every 1-2 snapshots: +0.3 s on every other snapshot at 32 / 36 MHz in the v5 e2e,
+    +0.5-1 s on every snapshot at 82 MHz).  Keys two steps away are prefetched too: at 73-82 MHz the hour w range
+    of consecutive snapshots can move by more than one 0.25-lambda key.
+    The same function and arguments either way, so the same factors (and router decisions)."""
+    if os.environ.get("TTCALX_SVD_PREFETCH", "0") == "1":
+        f = _PREFETCH.get((float(wq), float(tol), 600, 2001))
+        _prefetch_factors(wq, tol, steps=(0.25, 0.5))
+        if f is not None:
+            try:
+                f.result()
+            except Exception:            # computed again below (and raised there if it fails for good)
+                pass
+    return gridder._svd_factors(float(wq), tol, 600, 2001)
 
 
 _PIN = {"buf": None, "nbytes": 0}

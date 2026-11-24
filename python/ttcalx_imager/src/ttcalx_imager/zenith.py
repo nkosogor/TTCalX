@@ -110,8 +110,10 @@ def _zen_nx(nlow=NLOW):
 
 
 def hour_rank(wabs_h, tol):
-    """K of the production hour-frame snapshot table for this w range (the factors production would use: cached)."""
-    return gridder._svd_factors(table_wq(wabs_h), tol, NW, 2001)[0]
+    """K of the production hour-frame snapshot table for this w range (the factors production would use: cached;
+    prefetched as production's snapshot_svd with TTCALX_SVD_PREFETCH=1, see snapshot.hour_factors)."""
+    from .snapshot import hour_factors           # (snapshot imports this module)
+    return hour_factors(table_wq(wabs_h), tol)[0]
 
 
 def zen_rank(wabs_z, tol, nlow=NLOW):

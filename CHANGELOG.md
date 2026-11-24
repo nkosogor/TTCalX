@@ -40,6 +40,11 @@ Two speed paths, both **off by default**: with default settings the peeler and t
   `ttcalx_imager.use_hour_v5_settings()` for the hour stage only.
 - Details, tuning knobs and measurements: [python/ttcalx_imager/README.md](python/ttcalx_imager/README.md)
   ("v5 switches", "Known issues").
+- Router timing fix (after the gsi v5 e2e test): the router's hour-table rank K_h now goes through the same SVD
+  prefetch as production's `snapshot_svd` (`TTCALX_SVD_PREFETCH`, in `FAST_ENV`; keys one and two 0.25-lambda steps
+  ahead). Before, the zenith path computed each new hour key's SVD synchronously: +0.3 s on every other snapshot
+  at 32 / 36 MHz (alternating 0.25 / 0.55 s in the e2e) and +0.5-1 s on nearly every snapshot at 73-82 MHz. Same
+  factors, same router decisions, same images.
 - Tests: `python/ttcalx_imager/tests/test_zen.py`, `test_hour_v5.py`.
 
 ### Versions

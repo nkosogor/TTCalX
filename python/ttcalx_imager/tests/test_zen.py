@@ -4,6 +4,7 @@ A synthetic snapshot: a nearly coplanar array observed at its zenith (stored fra
 as the gsi v3 engine) to a phase centre ~8 deg away (the LST-hour frame late in the hour), with point sources
 up to the zenith-frame horizon."""
 import math
+import os
 
 import numpy as np
 import pytest
@@ -427,3 +428,44 @@ def test_clear_caches_clears_zenith(zen_env):
     assert zenith._TABLES and zenith._PLANS
     gridder.clear_caches()
     assert not zenith._TABLES and not zenith._PLANS and not zenith._GEOM and not zenith._GAIN
+
+
+def test_router_rank_prefetched_as_production(zen_env, monkeypatch):
+    """zenith.hour_rank (the router's K_h) with TTCALX_SVD_PREFETCH=1: the neighbouring hour-table keys are
+    factorised in the prefetch thread as production's snapshot_svd does, so a snapshot whose w range moves to the
+    next key finds its factors cached (no synchronous SVD on the zenith path: the 2026-11-24 e2e alternation), and a
+    key still being prefetched is waited for, not computed twice.  The same K as without the prefetch."""
+    import threading
+    monkeypatch.setenv("TTCALX_SVD_PREFETCH", "1")
+    tol = 1e-4
+    w0 = 7.3                                       # key 7.5; neighbours 7.25 / 7.75, two steps 7.0 / 8.0
+    keys = [zenith.table_wq(w) for w in (w0, w0 - 0.25, w0 + 0.25, w0 - 0.5, w0 + 0.5)]
+    for k in [k for k in gridder._FACTOR_CACHE if k[0] in keys and k[2:4] == (600, 2001)]:
+        del gridder._FACTOR_CACHE[k]
+    for k in [k for k in snapshot._PREFETCH if k != "ex" and k[0] in keys]:
+        del snapshot._PREFETCH[k]
+    main = threading.get_ident()
+    computed = []
+    orig = gridder._svd_factors
+
+    def spy(wmax, tol_, nw, nx, *a, **kw):
+        method = kw.get("method") or gridder.SVD_METHOD or os.environ.get("TTCALX_SVD_METHOD", "lapack")
+        if (float(wmax), float(tol_), int(nw), int(nx), method) not in gridder._FACTOR_CACHE:
+            computed.append((float(wmax), threading.get_ident() == main))
+        return orig(wmax, tol_, nw, nx, *a, **kw)
+    monkeypatch.setattr(gridder, "_svd_factors", spy)
+    k0 = zenith.hour_rank(w0, tol)
+    assert (keys[0], True) in computed                       # the first key: computed at once
+    for w in keys[1:]:
+        snapshot._PREFETCH[(float(w), float(tol), 600, 2001)].result()
+    computed.clear()
+    k1 = zenith.hour_rank(w0 - 0.25, tol)                    # the next snapshot's key: prefetched
+    assert not [c for c in computed if c[1]], computed       # nothing factorised in the calling thread
+    computed.clear()
+    zenith.hour_rank(w0 + 0.5, tol)                          # a jump of two keys (73-82 MHz): prefetched too
+    assert not [c for c in computed if c[1]], computed
+    assert k0 == orig(keys[0], tol, 600, 2001)[0] and k1 == orig(keys[1], tol, 600, 2001)[0]
+    # without the prefetch: the same ranks
+    monkeypatch.setenv("TTCALX_SVD_PREFETCH", "0")
+    assert zenith.hour_rank(w0, tol) == k0 and zenith.hour_rank(w0 - 0.25, tol) == k1
+
