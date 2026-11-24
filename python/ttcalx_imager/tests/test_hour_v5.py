@@ -169,6 +169,35 @@ def test_reproj_fast_equals_map_coordinates(monkeypatch, order):
 
 
 @needs_gpu
+@pytest.mark.parametrize("order", [3, 5])
+def test_reproj_fast_disc_geometry(monkeypatch, order):
+    """The hour geometry: a sky image that is nonzero up to the horizon disc, which ends 7 px from the grid edge (the
+    production geometries end 7-12 px beyond the horizon).  TTCALX_REPROJ_FAST = cupyx spline_filter +
+    map_coordinates on the ok pixels to float32 level (max relative difference ~3e-6)."""
+    from ttcalx_imager.reproject import Reprojector, target_dirs
+    from ttcalx_imager.rotate import analytic_rotation
+    rng = np.random.default_rng(10 + order)
+    N = 512
+    sc = 1.0 / (N // 2 - 7.5)                     # horizon radius 248.5 px: 7 (and 8) empty px at the edges
+    inside = target_dirs(N, sc)[3]
+    img = cp.where(inside, _band_limited(N, rng, 0), 0).astype(cp.float32)
+    rows = cp.asnumpy(inside.any(axis=1)); cols = cp.asnumpy(inside.any(axis=0))
+    margins = [int(np.argmax(x)) for x in (rows, rows[::-1], cols, cols[::-1])]
+    assert min(margins) == 7, margins
+    P = Reprojector(N, sc)
+    for d0, d1 in ((0.003, 0.002), (0.05, -0.03)):
+        R = analytic_rotation(1.0, 0.65, 1.0 + d0, 0.65 + d1)
+        out = {}
+        for v in ("0", "1"):
+            monkeypatch.setenv("TTCALX_REPROJ_FAST", v)
+            out[v] = P(img, R, order)
+        (a0, ok0), (a1, ok1) = out["0"], out["1"]
+        assert bool((ok0 == ok1).all()) and bool((a1[~ok0] == 0).all())
+        rel = float(cp.abs(a1 - a0)[ok0].max()) / float(cp.abs(a0[ok0]).max())
+        assert rel < 1e-5, rel
+
+
+@needs_gpu
 def test_prefilter_fft_inverts_bspline(monkeypatch):
     """prefilter_fft: sampling the B-spline expansion of the prefiltered image at the integer pixels gives the
     image back (interior; float32 rounding)."""
