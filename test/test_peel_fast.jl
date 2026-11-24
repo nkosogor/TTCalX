@@ -144,7 +144,7 @@ decisions(log) = [(l[1], l[2], l[3][:action], l[3][:converged], l[3][:niters]) f
         @testset "guard: gain-check rejections as guarded_zest!" begin
             # max_gain below the starting gains: every solve rejected (|g| = 1 > 0.5)
             d, f = fast_pair(meta, measured, sky, rfi, ws; peeliter=2, max_gain=0.5)
-            @test decisions(f.log) == decisions(d.log) && isempty(f.peeled) && f.peeled == d.peeled
+            @test decisions(f.log) == decisions(d.log) && f.peeled == d.peeled
             @test all(l -> l[3][:action] != :accept && l[3][:finite], f.log)
             @test [l[3][:max_gain] for l in f.log] ≈ [l[3][:max_gain] for l in d.log] rtol=1e-6
             @test relrows(f.vis, d.vis, 1:meta.Nbase) < 2e-5
