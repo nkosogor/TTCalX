@@ -188,10 +188,11 @@ _GEOM = {}               # (Nz, scz, rmax, xmin, nx) -> (inside, x', j, t)
 _PLANS = {}              # (Nz, eps, pruned) -> [type-1 plan, token of the points set]
 _GAIN = {}               # (N, sc) -> (x'^2, s (1 - s)) float64 WSClean orientation
 _TAPS = {}
+_TAPS_DEV = {}           # device id -> the FIR taps as a float32 CuPy array
 
 
 def clear():
-    _TABLES.clear(); _GEOM.clear(); _PLANS.clear(); _GAIN.clear()
+    _TABLES.clear(); _GEOM.clear(); _PLANS.clear(); _GAIN.clear(); _TAPS_DEV.clear()
 
 
 def _geometry(Nz, scz, rmax, xmin, nx):
@@ -274,6 +275,15 @@ def _quintic_taps(H=FIR_H, M=8192):
         h = np.real(np.fft.ifft(1.0 / B))
         _TAPS[H] = np.array([h[k % M] for k in range(-H, H + 1)], np.float64)
     return _TAPS[H]
+
+
+def _taps_dev():
+    """The prefilter's FIR taps on the current device (float32; uploaded once per device)."""
+    dev = cp.cuda.Device().id
+    h = _TAPS_DEV.get(dev)
+    if h is None:
+        h = _TAPS_DEV[dev] = cp.asarray(_quintic_taps(), dtype=cp.float32)
+    return h
 
 
 def grid_size(N, sc, g):
@@ -464,7 +474,7 @@ def _launch(kernel, n, args, bs=256):
 def prefilter(img):
     """Quintic B-spline prefilter (FIR, zero outside the grid) of a square float32 image."""
     N = img.shape[0]
-    h = cp.asarray(_quintic_taps(), dtype=cp.float32)
+    h = _taps_dev()
     src = cp.ascontiguousarray(img, dtype=cp.float32); tmp = cp.empty_like(src)
     _launch(_FIR, src.size, (src, tmp, np.int32(N), np.int32(1), h, np.int32(FIR_H)))
     _launch(_FIR, src.size, (tmp, src, np.int32(N), np.int32(0), h, np.int32(FIR_H)))
@@ -538,7 +548,7 @@ class _Grid:
         """racc += Re(F_k b_k) at the ring targets: F_k = f (raw layer image) prefiltered at the needed pixels only
         (the FIR of ``prefilter``) and B-spline interpolated (as the reprojection of the zenith image)."""
         n = int(self.ridx.size); Nz = self.Nz
-        h = cp.asarray(_quintic_taps(), dtype=cp.float32)
+        h = _taps_dev()
         fx, cc = bufs
         _launch(_RFIR, self.q1.size, (f, fx, self.q1, np.int64(self.q1.size), np.int32(Nz), np.int32(1), h, np.int32(FIR_H)))
         _launch(_RFIR, self.q0.size, (fx, cc, self.q0, np.int64(self.q0.size), np.int32(Nz), np.int32(0), h, np.int32(FIR_H)))
