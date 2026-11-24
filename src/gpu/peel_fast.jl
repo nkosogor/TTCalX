@@ -286,7 +286,14 @@ function _fast_event(i)
     while length(_FAST_EV) < i; push!(_FAST_EV, CuEvent(CUDA.EVENT_DISABLE_TIMING)); end
     _FAST_EV[i]
 end
-_fast_wait(ev) = (while !CUDA.isdone(ev); end; nothing)      # spin: the waits are short
+# spin (the waits are short); after ~1000 polls yield, so other tasks of the process can run meanwhile
+function _fast_wait(ev)
+    n = 0
+    while !CUDA.isdone(ev)
+        (n += 1) >= 1000 && (yield(); n = 0)
+    end
+    nothing
+end
 const _FAST_SLOT = Ref(0)            # ring of host-mapped regions of 64 slots
 function _fast_region()
     _FAST_SLOT[] = (_FAST_SLOT[] + 64) % (_FAST_SLOTS - 64)
