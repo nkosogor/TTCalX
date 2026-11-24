@@ -17,6 +17,7 @@ import math
 import os
 import time
 import traceback
+import warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -156,8 +157,13 @@ def gpu_select(small, raw, scale_deg, pols="IV", zero_limit=0.999):
                         wfold=wf.astype(cp.float32), u32=u.astype(cp.float32), v32=v.astype(cp.float32),
                         w32=w.astype(cp.float32), wabsmax=float(cp.abs(w).max()),
                         theo_pix=1.0 / float(cp.sqrt(u * u + v * v + w * w).max()) / sc)
-        if small.get("uvw_stored") is not None and zenith.mode() != "off":
-            L["zen"] = zenith.ZenSamples(small, sel, lam)
+        us = small.get("uvw_stored")
+        if us is not None and zenith.mode() != "off":
+            if np.shape(us) == np.shape(small["uvw"]):
+                L["zen"] = zenith.ZenSamples(small, sel, lam)
+            else:                       # not the rows of this MS: no zenith samples (production path)
+                warnings.warn(f"gpu_select: uvw_stored {np.shape(us)} does not match uvw {np.shape(small['uvw'])}: "
+                              "zenith path off for this snapshot")
     cp.cuda.Device().synchronize()
     L["timing"]["select (GPU)"] = time.perf_counter() - t1
     return L
@@ -218,7 +224,7 @@ class SnapshotImager:
         del ud, vd, nwd
         lap("weights")
         Z = None
-        zen_far = zen_oom = None
+        zen_far = zen_oom = zen_bad_r = None
         if pre is not None and zen is not None:
             wz = zen.wabs if hasattr(zen, "wabs") else float(cp.abs(zen["w"]).max())
             use, kh, kz = zenith.use_zen(pre["wabsmax"], wz, self.svd_tol)
@@ -227,6 +233,9 @@ class SnapshotImager:
                     Z = zenith.ZenSnapshot(zen, cp.asarray(w), pre, iw, sw, N, sc, self.svd_tol, self.eps)
                 except zenith.ZenFar as e:      # too far from its zenith for the b_k table: production path
                     Z, zen_far = None, e.n_min
+                    self.log(str(e))
+                except zenith.ZenBadR as e:     # uvw is not R uvw_stored: production path
+                    Z, zen_bad_r = None, e.res / e.scale
                     self.log(str(e))
                 except Exception as e:          # out of GPU memory: production path (anything else is raised)
                     if not zenith.is_oom(e):
@@ -309,6 +318,8 @@ class SnapshotImager:
             info["zen_far_n_min"] = zen_far
         if zen_oom is not None:
             info["zen_oom"] = zen_oom[:200]
+        if zen_bad_r is not None:
+            info["zen_bad_R_rel"] = zen_bad_r
         if imgV is not None:
             info.update(V_rms_box=box_std(imgV), V_maxabs=float(cp.abs(imgV).max()))
         return dict(restored=restored, residual=res, model=model, dirty=dirty, psf=psf, V=imgV, info=info)

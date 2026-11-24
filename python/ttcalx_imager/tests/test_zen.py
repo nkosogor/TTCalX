@@ -361,6 +361,27 @@ def test_far_from_zenith_falls_back_and_quantum_keeps_production(zen_env):
     assert zenith.use_zen(5.0, 1.0, 1e-4)[0] is True
 
 
+def test_bad_rotation_or_shape_keeps_production(zen_env):
+    """uvw that is not R uvw_stored (R fit residual > R_TOL max |uvw|) raises ZenBadR in ZenSnapshot and image_arrays
+    images the snapshot on the production path; a uvw_stored of another shape gives no zenith samples (warning)."""
+    small, raw, R, _ = _snapshot()
+    rng = np.random.default_rng(9)
+    bad = dict(small); bad["uvw"] = small["uvw"] + rng.normal(scale=1e-3, size=small["uvw"].shape)   # ~2e-5 relative
+    im = SnapshotImager()
+    L = snapshot.gpu_select(bad, raw, SDEG)
+    args = (L["u"], L["v"], L["w"], L["wnat"], L["visI"], L["visV"], N, SDEG)
+    ref = im.image_arrays(*args, pre=L["pre"])
+    z = im.image_arrays(*args, pre=L["pre"], zen=L["zen"])
+    assert "zen" not in z["info"] and z["info"]["zen_bad_R_rel"] > zenith.R_TOL
+    assert float(cp.abs(z["restored"] - ref["restored"]).max()) < 1e-5 * float(ref["restored"].max())
+    ok = snapshot.gpu_select(small, raw, SDEG)["zen"]
+    ok["R"]
+    assert ok.R_res <= zenith.R_TOL * ok.R_scale
+    short = dict(small); short["uvw_stored"] = small["uvw_stored"][:-1]
+    with pytest.warns(UserWarning, match="uvw_stored"):
+        assert "zen" not in snapshot.gpu_select(short, raw, SDEG)
+
+
 def test_zen_samples_lazy(zen_env):
     """ZenSamples: the router's max |w| equals max |zen["w"]| exactly (no per-sample array built for it); w, u, v are
     built on first use; the production pick of the router builds none of them."""

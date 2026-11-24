@@ -171,8 +171,12 @@ class ZenSamples:
                 from .rotate import rotation_from_uvw
                 sm = self._small
                 keep = np.asarray(sm["a1"]) != np.asarray(sm["a2"])
-                self._c[k] = rotation_from_uvw(np.asarray(sm["uvw_stored"], np.float64)[keep],
-                                               np.asarray(sm["uvw"], np.float64)[keep])
+                us = np.asarray(sm["uvw_stored"], np.float64)[keep]; uh = np.asarray(sm["uvw"], np.float64)[keep]
+                R = rotation_from_uvw(us, uh)
+                # the fit's residual (ZenSnapshot falls back when uvw is not R uvw_stored to ~1e-6 of max |uvw|)
+                self.R_res = float(np.abs(us @ R.T - uh).max()) if uh.size else 0.0
+                self.R_scale = float(np.abs(uh).max()) if uh.size else 0.0
+                self._c[k] = R
             else:
                 raise KeyError(k)
         return self._c[k]
@@ -559,6 +563,20 @@ class ZenFar(Exception):
                          f"{math.degrees(math.asin(NLOW)):.1f} deg from its zenith): production path")
 
 
+class ZenBadR(Exception):
+    """The hour-frame uvw is not a rotation of the stored-frame uvw (least-squares R residual > R_TOL max |uvw|):
+    the zenith path's b = exp(2 pi i (w_hour - w_stored)) and reprojection would be wrong, so the snapshot is
+    imaged on the production path (as ZenFar)."""
+
+    def __init__(self, res, scale):
+        self.res, self.scale = res, scale
+        super().__init__(f"zenith: uvw is not R uvw_stored (fit residual {res:.3g} m, max |uvw| {scale:.3g} m): "
+                         "production path")
+
+
+R_TOL = 1e-6             # ZenBadR: relative residual of the R fit
+
+
 class ZenSnapshot:
     """Zenith-frame gridding of one snapshot; ``image(vis_hour)`` stands in for to_ws(S.grid(vis_hour)) / sw.
 
@@ -568,7 +586,11 @@ class ZenSnapshot:
 
     def __init__(self, zen, w_hour, pre, iw, sw, N, sc, tol=1e-4, eps=1e-4, opts=None):
         self.N = N; self.sc = sc; self.sw = sw
-        self.rt = cp.asarray(np.ascontiguousarray(np.asarray(zen["R"], np.float64).T).ravel())
+        R = zen["R"]
+        res = getattr(zen, "R_res", None)
+        if res is not None and res > R_TOL * zen.R_scale:
+            raise ZenBadR(res, zen.R_scale)
+        self.rt = cp.asarray(np.ascontiguousarray(np.asarray(R, np.float64).T).ravel())
         lo = float(_min_ns(N, sc, self.rt))
         if lo < -NLOW:      # before any GPU work: the caller falls back to the production path
             raise ZenFar(lo)
