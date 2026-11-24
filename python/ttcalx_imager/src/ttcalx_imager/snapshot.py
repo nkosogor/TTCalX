@@ -86,10 +86,10 @@ def pinned_on() -> bool:
 
 
 def h2d(*arrays):
-    """Host arrays to the GPU (CuPy arrays are passed through).  TTCALX_PINNED_H2D=1 (default 0): through one
-    process-wide page-locked staging buffer (grown as needed, kept): a host copy into it plus a DMA transfer is
-    faster than a transfer from pageable memory (82 MHz snapshot DATA + FLAG, 107 MB from a /dev/shm slot:
-    13.2 -> 8.5 ms on calim06).  The same bytes either way."""
+    """Host arrays to the GPU (CuPy arrays are passed through).  TTCALX_PINNED_H2D=1 (default 0, opt-in only, not
+    in the v5 set): through one process-wide page-locked staging buffer (grown as needed, kept).  The same bytes
+    either way.  No measured gain in the engine: CuPy 13.6's cp.asarray of a pageable array already stages through
+    pinned memory (verifier 2026-11-24, calim03, 107 MB: cp.asarray 12.9 ms, TTCALX_PINNED_H2D 13.0 ms)."""
     if not pinned_on():
         return tuple(cp.asarray(a) for a in arrays)
     host = [(i, np.ascontiguousarray(a)) for i, a in enumerate(arrays) if not isinstance(a, cp.ndarray)]
@@ -120,7 +120,7 @@ def gpu_select(small, raw, scale_deg, pols="IV", zero_limit=0.999):
 
     small["uvw_stored"] (optional, gsi v3 engine: the UVW before the phase-centre change, per row [m]) with
     TTCALX_SNAP_ZEN on: L["zen"] = zenith.ZenSamples (the stored-frame samples of the same selection and R with
-    uvw = R uvw_stored); ignored otherwise."""
+    uvw = R uvw_stored, built on first use: only their max |w| for the router at once); ignored otherwise."""
     from types import SimpleNamespace
     t1 = time.perf_counter()
     column = small["column"]
@@ -215,11 +215,16 @@ class SnapshotImager:
         del ud, vd, nwd
         lap("weights")
         Z = None
+        zen_far = None
         if pre is not None and zen is not None:
             wz = zen.wabs if hasattr(zen, "wabs") else float(cp.abs(zen["w"]).max())
             use, kh, kz = zenith.use_zen(pre["wabsmax"], wz, self.svd_tol)
             if use:
-                Z = zenith.ZenSnapshot(zen, cp.asarray(w), pre, iw, sw, N, sc, self.svd_tol, self.eps)
+                try:
+                    Z = zenith.ZenSnapshot(zen, cp.asarray(w), pre, iw, sw, N, sc, self.svd_tol, self.eps)
+                except zenith.ZenFar as e:      # too far from its zenith for the b_k table: production path
+                    Z, zen_far = None, e.n_min
+                    self.log(str(e))
         if Z is not None:
             # zenith-frame gridding (zenith.py); the hour-frame SampleSet only for degridding (> dft_max components)
             lap("svd table")
@@ -277,6 +282,8 @@ class SnapshotImager:
                     I_peak=float(restored.max()), I_res_rms_box=box_std(res), I_res_mad=mad_std(res[sky]))
         if Z is not None:
             info["zen"] = Z.info()
+        elif zen_far is not None:
+            info["zen_far_n_min"] = zen_far
         if imgV is not None:
             info.update(V_rms_box=box_std(imgV), V_maxabs=float(cp.abs(imgV).max()))
         return dict(restored=restored, residual=res, model=model, dirty=dirty, psf=psf, V=imgV, info=info)

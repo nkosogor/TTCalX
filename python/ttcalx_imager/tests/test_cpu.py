@@ -315,7 +315,9 @@ def test_use_fast_settings_v5_opt_in():
     env = {}
     ttcalx_imager.use_fast_settings(env)
     assert all(k not in env for k in ttcalx_imager.v5_env()) and env["TTCALX_NUFFT_PRUNED"] == "1"
-    env = {"TTCALX_V5": "1", "TTCALX_PINNED_H2D": "0"}
+    env = {"TTCALX_V5": "1", "TTCALX_SNAP_ZEN": "auto"}
     got = ttcalx_imager.use_fast_settings(env)
-    assert env["TTCALX_SNAP_ZEN"] == "1" and env["TTCALX_PINNED_H2D"] == "0" and got["TTCALX_SNAP_ZEN"] == "1"
-    assert set(ttcalx_imager.v5_env()) <= set(got)
+    assert env["TTCALX_SNAP_ZEN"] == "auto" and got["TTCALX_SNAP_ZEN"] == "auto"
+    assert env["TTCALX_REPROJ_FAST"] == "1" and set(ttcalx_imager.v5_env()) <= set(got)
+    # the page-locked H2D staging is opt-in only (no measured gain): not in the v5 set
+    assert "TTCALX_PINNED_H2D" not in ttcalx_imager.v5_env() and "TTCALX_PINNED_H2D" not in env

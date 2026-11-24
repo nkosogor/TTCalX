@@ -79,7 +79,7 @@ needs gsi's `small["uvw_stored"]`, branch `exp/gsi-v5-img`; without it the snaps
 | `TTCALX_SNAP_ZEN_GZ` / `_PSFGZ` | `1` / `1.5` | | zenith grid oversampling of the I/V/residual passes / of the PSF pass.  GPU peak per snapshot (82 / 55 / 23 MHz): production 3.4 / 2.3 / 1.3 GB, zenith path 6.5 / 3.9 / 1.8 GB (the 1.5x PSF grid's plan and buffers); PSFGZ 1: 3.0 GB at 82 MHz, ~-10 % time, beam 3-10x further off (BMAJ/BMIN <= 1.1e-4 rel., BPA <= 0.007 deg). |
 | `TTCALX_SNAP_ZEN_RING_DEG` / `_RING_PX` | `6` / `8` | | horizon ring: hour pixels below this zenith-frame elevation, or within this many zenith-grid pixels of the zenith-frame horizon, are evaluated per w-layer (exact w-term at the pixel's direction) instead of from the reprojected zenith image (whose w-term factor varies too fast there: 1-2 sigma near bright sources at el ~ 0 without it). |
 | `TTCALX_SNAP_ZEN_AK_LOSS` | `1` | | `1`: multiply the zenith-path image by production's per-pixel a_k / b_k linear-interpolation gain (`zenith.gain_map`), so that the products stay production's.  `0`: the loss-free image (see Known issues). |
-| `TTCALX_PINNED_H2D` | `0` | `1` | snapshot DATA / FLAG to the GPU through one page-locked staging buffer (`snapshot.h2d`; the gsi engine's `prepare` uses it when present): the same bytes, 82 MHz 107 MB 13.2 -> 8.5 ms. |
+| `TTCALX_PINNED_H2D` | `0` | (not set) | opt-in only: snapshot DATA / FLAG to the GPU through one page-locked staging buffer (`snapshot.h2d`; the gsi engine's `prepare` uses it when present), the same bytes.  Not in the v5 set: no measured speedup (CuPy 13.6's `cp.asarray` already stages pageable memory through pinned buffers; 107 MB on calim03: 12.9 vs 13.0 ms). |
 
 ### Known issues
 
@@ -92,6 +92,10 @@ needs gsi's `small["uvw_stored"]`, branch `exp/gsi-v5-img`; without it the snaps
   production path, finer tables (not implemented).
 * The zenith path needs the stored UVW (`small["uvw_stored"]`); the MS-reading paths (`image`, `image_many`) and
   `v_rms_from_samples` always use the production gridding.
+* A snapshot imaged more than asin(0.15) ~ 8.6 deg from its own zenith (the hour sky reaches stored-frame
+  n < -`zenith.NLOW`, where the extended b_k table would extrapolate) is imaged on the production path:
+  `ZenSnapshot` raises `zenith.ZenFar` before any GPU work and `image_arrays` falls back (qa info
+  `zen_far_n_min`).
 
 `SnapshotImager.image_many` reads with a spawned helper process: scripts calling it need an
 `if __name__ == "__main__":` guard (or `reader="thread"`). Set `CUPY_CACHE_DIR` if the home

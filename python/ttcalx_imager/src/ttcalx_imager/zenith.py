@@ -119,25 +119,33 @@ def use_zen(wabs_h, wabs_z, tol):
 
 
 class ZenSamples:
-    """The stored-frame (zenith) samples of a snapshot for snapshot.gpu_select's selection: w [lambda] (float64,
-    the selection's order) at once, for the router; u, v and R (uvw = R uvw_stored, rotate.rotation_from_uvw
+    """The stored-frame (zenith) samples of a snapshot for snapshot.gpu_select's selection: max |w| [lambda] at
+    once, for the router; w, u, v (float64, the selection's order) and R (uvw = R uvw_stored, rotate.rotation_from_uvw
     over the cross-correlations, as the v3 record's rotation) on first use.  Item access: zen["u"] etc."""
 
     def __init__(self, small, sel, lam):
         self._small = small; self._sel = sel; self._lam = lam
         self._ud = cp.asarray(np.asarray(small["uvw_stored"], np.float64))
-        self.w = (self._ud[:, 2:3] / lam[None])[sel]
-        self.wabs = float(cp.abs(self.w).max())
+        # max |w| over the selection without the per-sample array (the router alone needs it; zen["w"] is built only
+        # when the zenith path runs): per row |w_row| / (smallest selected lambda) -- the same float64 value, since
+        # |x / l| = |x| / l and correctly rounded division is monotonic in l > 0 (rows with no sample give 0)
+        lmin = cp.where(sel, lam[None], cp.inf).min(axis=1)
+        self.wabs = float((cp.abs(self._ud[:, 2]) / lmin).max())
+        del lmin
         self._c = {}
+
+    @property
+    def w(self):
+        return self["w"]
 
     def _col(self, i):
         return (self._ud[:, i:i + 1] / self._lam[None])[self._sel]
 
     def __getitem__(self, k):
-        if k == "w":
-            return self.w
         if k not in self._c:
-            if k == "u":
+            if k == "w":
+                self._c[k] = self._col(2)
+            elif k == "u":
                 self._c[k] = self._col(0)
             elif k == "v":
                 self._c[k] = self._col(1)
@@ -490,12 +498,6 @@ class _Grid:
         self.ridx = cp.flatnonzero(ring)
         del ring
         n = int(self.ridx.size)
-        if n:
-            lo = float(_min_ns(N, Z.sc, Z.rt))
-            if lo < -NLOW:
-                import warnings
-                warnings.warn(f"zenith: hour pixels reach n_stored = {lo:.3f} < -{NLOW} (snapshot imaged > "
-                              f"{math.degrees(math.asin(NLOW)):.1f} deg from its zenith): the b_k table extrapolates there")
         self.i0 = cp.empty(2 * n, cp.int32); self.txy = cp.empty(2 * n, cp.float32)
         self.jb = cp.empty(n, cp.int16); self.tb = cp.empty(n, cp.float32)
         self.q1 = self.q0 = None
@@ -528,6 +530,17 @@ class _Grid:
             self.plan[1] = self.token
 
 
+class ZenFar(Exception):
+    """The hour sky reaches n_stored < -NLOW (snapshot imaged more than asin(NLOW) ~ 8.6 deg from its zenith): the
+    extended b_k(x') table would be extrapolated there, so the snapshot is not imaged on the zenith path
+    (SnapshotImager.image_arrays then runs the production path)."""
+
+    def __init__(self, n_min):
+        self.n_min = n_min
+        super().__init__(f"zenith: hour pixels reach n_stored = {n_min:.3f} < -{NLOW} (snapshot imaged > "
+                         f"{math.degrees(math.asin(NLOW)):.1f} deg from its zenith): production path")
+
+
 class ZenSnapshot:
     """Zenith-frame gridding of one snapshot; ``image(vis_hour)`` stands in for to_ws(S.grid(vis_hour)) / sw.
 
@@ -537,6 +550,10 @@ class ZenSnapshot:
 
     def __init__(self, zen, w_hour, pre, iw, sw, N, sc, tol=1e-4, eps=1e-4, opts=None):
         self.N = N; self.sc = sc; self.sw = sw
+        self.rt = cp.asarray(np.ascontiguousarray(np.asarray(zen["R"], np.float64).T).ravel())
+        lo = float(_min_ns(N, sc, self.rt))
+        if lo < -NLOW:      # before any GPU work: the caller falls back to the production path
+            raise ZenFar(lo)
         self.opts = opts or settings()
         u, v, w = zen["u"], zen["v"], zen["w"]
         self.b = cp.exp(2j * np.pi * (w_hour - w)).astype(cp.complex64)       # zenith vis = hour vis * b
@@ -547,7 +564,6 @@ class ZenSnapshot:
         self.wabs_z = float(cp.abs(w).max()) if not hasattr(zen, "wabs") else zen.wabs
         self.wt = cp.asarray(iw, dtype=cp.float32)
         self.eph = cp.exp(1j * cp.pi * self.wf).astype(cp.complex64)
-        self.rt = cp.asarray(np.ascontiguousarray(np.asarray(zen["R"], np.float64).T).ravel())
         self.gain, self.gain_info = (gain_map(pre["wfold"], pre["wabsmax"], iw, sw, N, sc) if self.opts["ak_loss"]
                                      else (None, {}))
         self.grids = {"main": _Grid(self, self.opts["gz"], tol, eps)}

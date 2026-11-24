@@ -266,16 +266,64 @@ def test_pinned_h2d_same_bytes(monkeypatch):
     assert np.array_equal(cp.asnumpy(da2), a) and np.array_equal(cp.asnumpy(df2), f) and np.array_equal(cp.asnumpy(db), big)
 
 
-def test_far_from_zenith_warns_and_quantum_keeps_production(zen_env):
-    """A snapshot imaged > asin(NLOW) from its zenith warns (b_k extrapolated); with the engine's GSI_SVD_QUANTUM
-    table override the router keeps the production path (the loss emulation assumes production's table key)."""
+def test_far_from_zenith_falls_back_and_quantum_keeps_production(zen_env):
+    """A snapshot imaged > asin(NLOW) from its zenith raises ZenFar in ZenSnapshot (b_k would be extrapolated) and
+    image_arrays images it on the production path; with the engine's GSI_SVD_QUANTUM table override the router keeps
+    the production path (the loss emulation assumes production's table key)."""
     small, raw, R, _ = _snapshot(tilt=8.0)
     sc = math.radians(SDEG)
     L = snapshot.gpu_select(small, raw, SDEG)
     iw, sw = _weights(L, sc)
-    with pytest.warns(UserWarning, match="extrapolates"):
+    with pytest.raises(zenith.ZenFar) as ei:
         zenith.ZenSnapshot(L["zen"], L["w"], L["pre"], iw, sw, N, sc)
+    assert ei.value.n_min < -zenith.NLOW
+    im = SnapshotImager()
+    args = (L["u"], L["v"], L["w"], L["wnat"], L["visI"], L["visV"], N, SDEG)
+    ref = im.image_arrays(*args, pre=L["pre"])
+    z = im.image_arrays(*args, pre=L["pre"], zen=L["zen"])            # TTCALX_SNAP_ZEN=force
+    assert "zen" not in z["info"] and z["info"]["zen_far_n_min"] == ei.value.n_min
+    assert z["info"]["K"] == ref["info"]["K"]
+    peak = float(ref["restored"].max())
+    assert float(cp.abs(z["restored"] - ref["restored"]).max()) < 1e-5 * peak     # the GPU rerun floor
+    # closer to its zenith: the zenith path
+    small6, raw6, _, _ = _snapshot(tilt=6.0)
+    L6 = snapshot.gpu_select(small6, raw6, SDEG)
+    a6 = (L6["u"], L6["v"], L6["w"], L6["wnat"], L6["visI"], L6["visV"], N, SDEG)
+    z6 = im.image_arrays(*a6, pre=L6["pre"], zen=L6["zen"])
+    assert "zen" in z6["info"] and "zen_far_n_min" not in z6["info"]
     zen_env.setenv("GSI_SVD_QUANTUM", "1.0")
     assert zenith.use_zen(5.0, 1.0, 1e-4)[0] is False
     zen_env.setenv("GSI_SVD_QUANTUM", "0")
     assert zenith.use_zen(5.0, 1.0, 1e-4)[0] is True
+
+
+def test_zen_samples_lazy(zen_env):
+    """ZenSamples: the router's max |w| equals max |zen["w"]| exactly (no per-sample array built for it); w, u, v are
+    built on first use; the production pick of the router builds none of them."""
+    small, raw, R, _ = _snapshot()
+    # a few rows with only some channels selected, so the per-row smallest selected lambda matters
+    raw = dict(raw); fl = raw["FLAG"].copy(); fl[::7, 2, :] = True; fl[::11, 0, :] = True; raw["FLAG"] = fl
+    L = snapshot.gpu_select(small, raw, SDEG)
+    z = L["zen"]
+    assert z._c == {}
+    lam = C / small["freqs"]
+    full = (np.asarray(small["uvw_stored"])[:, 2:3] / lam[None])[cp.asnumpy(z._sel)]
+    assert z.wabs == float(np.abs(full).max())
+    assert z.wabs == float(cp.abs(z["w"]).max()) and np.array_equal(cp.asnumpy(z.w), full)
+    zen_env.setenv("TTCALX_SNAP_ZEN", "1"); zen_env.setenv("TTCALX_SNAP_ZEN_DK", "1000")      # router -> production
+    L2 = snapshot.gpu_select(small, raw, SDEG)
+    a = SnapshotImager().image_arrays(L2["u"], L2["v"], L2["w"], L2["wnat"], L2["visI"], L2["visV"], N, SDEG,
+                                      pre=L2["pre"], zen=L2["zen"])
+    assert "zen" not in a["info"] and L2["zen"]._c == {}
+
+
+def test_clear_caches_clears_zenith(zen_env):
+    """gridder.clear_caches (the gsi engine's before_hour / after_hour / band change) also drops the zenith tables and
+    plans."""
+    small, raw, R, _ = _snapshot()
+    L = snapshot.gpu_select(small, raw, SDEG)
+    SnapshotImager().image_arrays(L["u"], L["v"], L["w"], L["wnat"], L["visI"], L["visV"], N, SDEG, pre=L["pre"],
+                                  zen=L["zen"])
+    assert zenith._TABLES and zenith._PLANS
+    gridder.clear_caches()
+    assert not zenith._TABLES and not zenith._PLANS and not zenith._GEOM and not zenith._GAIN

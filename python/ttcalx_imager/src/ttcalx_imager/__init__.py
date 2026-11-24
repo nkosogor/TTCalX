@@ -47,10 +47,10 @@ FAST_ENV = {
 # v5 speed switches (2026-11-24), default off: not in FAST_ENV.  TTCALX_V5=1 in the environment of a process that
 # calls use_fast_settings (the gsi v3 engine; gsi: imaging.gpu_env: {TTCALX_V5: "1"}) switches them on together.
 # Snapshot: zenith-frame gridding with the per-snapshot router (zenith.py; same products to the gridding accuracy,
-# headers equal except the restoring beam) and the page-locked host-to-device staging buffer (same bytes).
+# headers equal except the restoring beam).  TTCALX_PINNED_H2D (snapshot.h2d's page-locked staging buffer) is NOT
+# in the set: no measured speedup (CuPy 13.6 already stages pageable host arrays through pinned memory); opt-in.
 SNAP_V5_ENV = {
     "TTCALX_SNAP_ZEN": "1",
-    "TTCALX_PINNED_H2D": "1",
 }
 
 
