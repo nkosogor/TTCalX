@@ -22,10 +22,11 @@ def _clear_v5(monkeypatch):
 
 # ----------------------------------------------------------------------------- settings (CPU)
 def test_hour_v5_settings(monkeypatch):
-    env = {"TTCALX_MS_INCR": "8"}
+    env = {"TTCALX_SVD_QUANTUM": "2"}
     got = use_hour_v5_settings(env)
-    assert set(got) == set(HOUR_V5_ENV) and got["TTCALX_MS_INCR"] == "8"          # an explicit value wins
-    assert all(env[k] == v for k, v in HOUR_V5_ENV.items() if k != "TTCALX_MS_INCR")
+    assert set(got) == set(HOUR_V5_ENV) and got["TTCALX_SVD_QUANTUM"] == "2"      # an explicit value wins
+    assert all(env[k] == v for k, v in HOUR_V5_ENV.items() if k != "TTCALX_SVD_QUANTUM")
+    assert "TTCALX_MS_INCR" not in env                                             # not in the v5 set (73 MHz fail)
     assert all(env[k] == v for k, v in FAST_ENV.items())                           # on top of FAST_ENV
     assert not set(HOUR_V5_ENV) & set(FAST_ENV)
 

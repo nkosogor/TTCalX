@@ -72,13 +72,15 @@ def use_fast_settings(env=None):
 
 
 # Hour-stage v5 speed switches (2026-11 "pexact" set; each default off, env read at call time), validated on top of
-# FAST_ENV (TTCALX_FUSED_CAK needs TTCALX_FAST_AK + TTCALX_FUSED_WACC + TTCALX_NUFFT_PRUNED, TTCALX_MS_INCR needs
-# TTCALX_SPARSE_UPDATE_MAX): the same hour images to float32 rounding (at the GPU rerun floor; TTCALX_UVMAX_GPU and
-# TTCALX_WMAX_MEMO bit-identical), ~1.2x faster at 55-73 MHz.  Not in FAST_ENV: use_hour_v5_settings() turns them on.
+# FAST_ENV (TTCALX_FUSED_CAK needs TTCALX_FAST_AK + TTCALX_FUSED_WACC + TTCALX_NUFFT_PRUNED): the same hour images at
+# the GPU rerun floor (55 / 73 MHz op_hour vs production, 2026-11-24; TTCALX_UVMAX_GPU and TTCALX_WMAX_MEMO
+# bit-identical), ~1.2x faster at 55-73 MHz.  TTCALX_MS_INCR (needs TTCALX_SPARSE_UPDATE_MAX) is NOT in the set: at
+# 73 MHz, with the other switches, it moves I-Deep-NoTaper-Robust-0 reproducibly (residual 0.067 sigma, model flux
+# +0.6 %) for ~7 s; alone it is not faster.
+# Not in FAST_ENV: use_hour_v5_settings() (or TTCALX_V5=1 with use_fast_settings) turns them on.
 HOUR_V5_ENV = {
     "TTCALX_REPROJ_FAST": "1",
     "TTCALX_SVD_QUANTUM": "0.25",
-    "TTCALX_MS_INCR": "16",
     "TTCALX_FUSED_CAK": "1",
     "TTCALX_WMAX_MEMO": "1",
     "TTCALX_UVMAX_GPU": "1",
