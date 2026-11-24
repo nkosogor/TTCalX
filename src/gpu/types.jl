@@ -60,7 +60,8 @@ Adapt.adapt_structure(to, x::GPUHermitianJonesMatrixArray) =
 GPU-friendly visibility storage.
 
 Shape: (Nbase, Nfreq) for each component.  ComplexF64, or ComplexF32 for
-`zest_sky_rfi!(...; peel_fast=true)` only (the other functions are written and tested for ComplexF64).
+`zest_sky_rfi!(...; peel_fast=true)` only (the other functions are written and tested for ComplexF64;
+`solve_gains!`, `guarded_zest!` and `restore_point_sources!` reject ComplexF32 with an ArgumentError).
 """
 struct GPUVisibilities{T<:AbstractArray{<:Complex}, F<:AbstractArray{Bool}}
     xx::T
@@ -68,6 +69,13 @@ struct GPUVisibilities{T<:AbstractArray{<:Complex}, F<:AbstractArray{Bool}}
     yx::T
     yy::T
     flags::F
+end
+
+"""ArgumentError unless the visibilities `vs` are ComplexF64 (ComplexF32 is for the fast peel only)."""
+function _require_c64(fname, vs::GPUVisibilities...)
+    all(v -> eltype(v.xx) == ComplexF64, vs) ||
+        throw(ArgumentError("$fname: ComplexF64 visibilities only (ComplexF32 is for zest_sky_rfi!(...; peel_fast=true))"))
+    nothing
 end
 
 function GPUVisibilities(Nbase::Int, Nfreq::Int; gpu::Bool=true)

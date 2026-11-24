@@ -67,7 +67,9 @@ equal to rounding) and `zest_sky_rfi!(...; workspace=PeelWorkspace())` (reuses ~
 across calls, bitwise the same results). With both, `zest_sky_rfi!(...; peel_fast=true)` (rk4,
 `precision=:mixed`, ComplexF32 visibilities as read from the MS) runs the same peel ~3x faster, another
 rounding of the default (Float32 level at 55 / 82 MHz; ~1e-3 relative at 23 MHz, where an RFI guard
-decision occasionally flips, as with `fast_kernels!` on vs off) (`src/gpu/peel_fast.jl`; off by default). The building blocks (`solve_gains!`, `genvis_exact!`,
+decision occasionally flips, as with `fast_kernels!` on vs off) (`src/gpu/peel_fast.jl`; off by default).
+ComplexF32 `GPUVisibilities` are for `peel_fast=true` only: the default `zest_sky_rfi!`, `solve_gains!`,
+`guarded_zest!` and `restore_point_sources!` reject them (ArgumentError); other functions expect ComplexF64. The building blocks (`solve_gains!`, `genvis_exact!`,
 `geometric_uvw!`, `restore_point_sources!`, `read_ms_fast`) are described in their docstrings and
 in the [documentation](https://nkosogor.github.io/TTCalX/).
 

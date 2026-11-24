@@ -117,6 +117,7 @@ function restore_point_sources!(vis::GPUVisibilities, before::GPUVisibilities, m
                                 mjd::Float64, sources::AbstractVector; others=[],
                                 minuvw::Real=5.0, offset_deg::Real=0.0,
                                 workspace::Union{Nothing,PeelWorkspace}=nothing)
+    _require_c64("restore_point_sources!", vis, before)
     ws = workspace
     gpu = _is_gpu(vis.xx)
     buf(tag, i=1) = _ws_buf!(ws, tag, ComplexF64, size(vis.xx), gpu, i; zero=false)

@@ -202,6 +202,7 @@ function guarded_zest!(vis::GPUVisibilities, meta::GPUMetadata,
                        peeliter::Integer=3, max_gain::Real=Inf,
                        require_convergence::Bool=false, report=nothing,
                        workspace::Union{Nothing,PeelWorkspace}=nothing)
+    _require_c64("guarded_zest!", vis)
     ws = workspace
     N = length(coherencies)
     all(c -> size(c.xx) == size(vis.xx), coherencies) ||

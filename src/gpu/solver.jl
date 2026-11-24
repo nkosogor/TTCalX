@@ -618,6 +618,7 @@ function solve_gains!(calibration::GPUCalibration, measured::GPUVisibilities,
                       minuvw::Real=0.0, reg=nothing, smooth_flux::Real=0.0,
                       precision::Symbol=:double, model_sq=nothing, meas_sq=nothing,
                       workspace::Union{Nothing,PeelWorkspace}=nothing)
+    _require_c64("solve_gains!", measured, model)
     ws = workspace
     solver in (:rk4, :damped) || throw(ArgumentError("unknown solver $solver (use :rk4 or :damped)"))
     tolerance, minuvw = Float64(tolerance), Float64(minuvw)

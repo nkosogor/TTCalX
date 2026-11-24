@@ -53,6 +53,11 @@ relrows(a, b, rows) = maximum(maximum(abs, ComplexF64.(getfield(a, f)[rows, :]) 
             @test_throws "unique" ws_run(meta, measured, sky, [rfi; rfi[1]], GPUSource[]; FAST_CFG...,
                                          workspace=ws, peel_fast=true)
             @test_throws ArgumentError peelrun(to32(measured))          # ComplexF32 needs peel_fast
+            m32 = to32(measured)
+            c = GPUCalibration(meta.Nant, meta.Nfreq; diagonal=false, gpu=true)
+            @test_throws "ComplexF64" solve_gains!(c, m32, m32, meta; precision=:mixed)
+            @test_throws "ComplexF64" guarded_zest!(m32, meta, [m32], [c], (c, v, m) -> (true, 1))
+            @test_throws "ComplexF64" restore_point_sources!(m32, m32, meta, TEST_MJD, sky[1:1])
             fast_kernels!(false)
             @test_throws ArgumentError peelrun(measured; peel_fast=true)
             fast_kernels!(true)
