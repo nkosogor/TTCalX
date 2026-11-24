@@ -45,6 +45,8 @@ Two speed paths, both **off by default**: with default settings the peeler and t
   ahead). Before, the zenith path computed each new hour key's SVD synchronously: +0.3 s on every other snapshot
   at 32 / 36 MHz (alternating 0.25 / 0.55 s in the e2e) and +0.5-1 s on nearly every snapshot at 73-82 MHz. Same
   factors, same router decisions, same images.
+- Router decision in the snapshot info: `info["zen_router"] = {K_h, K_z, routed, used}` whenever the router ran
+  (`used` False after a ZenFar / ZenBadR / OOM fallback); the gsi v3 engine persists it per snapshot.
 - Tests: `python/ttcalx_imager/tests/test_zen.py`, `test_hour_v5.py`.
 
 ### Versions

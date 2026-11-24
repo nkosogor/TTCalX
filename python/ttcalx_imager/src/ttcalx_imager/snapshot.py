@@ -245,10 +245,12 @@ class SnapshotImager:
         del ud, vd, nwd
         lap("weights")
         Z = None
-        zen_far = zen_oom = zen_bad_r = None
+        zen_far = zen_oom = zen_bad_r = router = None
         if pre is not None and zen is not None:
             wz = zen.wabs if hasattr(zen, "wabs") else float(cp.abs(zen["w"]).max())
             use, kh, kz = zenith.use_zen(pre["wabsmax"], wz, self.svd_tol)
+            if kh is not None:          # the router ran (TTCALX_SNAP_ZEN on): its decision goes into info
+                router = dict(K_h=int(kh), K_z=int(kz), routed=bool(use))
             if use:
                 try:
                     Z = zenith.ZenSnapshot(zen, cp.asarray(w), pre, iw, sw, N, sc, self.svd_tol, self.eps)
@@ -341,6 +343,10 @@ class SnapshotImager:
             info["zen_oom"] = zen_oom[:200]
         if zen_bad_r is not None:
             info["zen_bad_R_rel"] = zen_bad_r
+        if router is not None:
+            # K_h / K_z, the router's choice and whether the zenith path ran (False after a ZenFar / ZenBadR / OOM
+            # fallback); the gsi v3 engine persists it per snapshot
+            info["zen_router"] = dict(router, used=Z is not None)
         if imgV is not None:
             info.update(V_rms_box=box_std(imgV), V_maxabs=float(cp.abs(imgV).max()))
         return dict(restored=restored, residual=res, model=model, dirty=dirty, psf=psf, V=imgV, info=info)

@@ -96,6 +96,8 @@ needs gsi's `small["uvw_stored"]`, branch `exp/gsi-v5-img`; without it the snaps
   n < -`zenith.NLOW`, where the extended b_k table would extrapolate) is imaged on the production path:
   `ZenSnapshot` raises `zenith.ZenFar` before any GPU work and `image_arrays` falls back (qa info
   `zen_far_n_min`).
+* Whenever the router ran, the snapshot info has `zen_router = {K_h, K_z, routed, used}` (`routed`: the router's
+  choice; `used`: the zenith path ran, False after a ZenFar / ZenBadR / out-of-memory fallback).
 
 `SnapshotImager.image_many` reads with a spawned helper process: scripts calling it need an
 `if __name__ == "__main__":` guard (or `reader="thread"`). Set `CUPY_CACHE_DIR` if the home

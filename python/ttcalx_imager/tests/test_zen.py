@@ -223,14 +223,19 @@ def test_image_arrays_zen_path(zen_env):
     def same(x, y):
         return float(cp.abs(x["restored"] - y["restored"]).max()) < 1e-5 * peak and \
             float(cp.abs(x["V"] - y["V"]).max()) < 1e-5 * float(cp.abs(y["V"]).max())
+    zi = z["info"]["zen_router"]                                      # the router's decision (force: routed)
+    assert zi["routed"] is True and zi["used"] is True and zi["K_z"] == z["info"]["zen"]["K"]
+    assert zi["K_h"] == zenith.hour_rank(L["pre"]["wabsmax"], im.svd_tol)
+    assert "zen_router" not in ref["info"]                             # no zenith samples: the router never ran
     zen_env.setenv("TTCALX_SNAP_ZEN", "1"); zen_env.setenv("TTCALX_SNAP_ZEN_DK", "1000")
     a = im.image_arrays(*args, pre=L["pre"], zen=L["zen"])
     assert "zen" not in a["info"] and same(a, ref)
+    assert a["info"]["zen_router"] == dict(zi, routed=False, used=False)
     zen_env.setenv("TTCALX_SNAP_ZEN_DK", "0")
     assert "zen" in im.image_arrays(*args, pre=L["pre"], zen=L["zen"])["info"]
     zen_env.setenv("TTCALX_SNAP_ZEN", "0")
     b = im.image_arrays(*args, pre=L["pre"], zen=L["zen"])
-    assert "zen" not in b["info"] and same(b, ref)
+    assert "zen" not in b["info"] and same(b, ref) and "zen_router" not in b["info"]
 
 
 def test_degrid_switch_uses_the_hour_frame_sampleset(zen_env):
@@ -347,6 +352,7 @@ def test_far_from_zenith_falls_back_and_quantum_keeps_production(zen_env):
     ref = im.image_arrays(*args, pre=L["pre"])
     z = im.image_arrays(*args, pre=L["pre"], zen=L["zen"])            # TTCALX_SNAP_ZEN=force
     assert "zen" not in z["info"] and z["info"]["zen_far_n_min"] == ei.value.n_min
+    assert z["info"]["zen_router"]["routed"] is True and z["info"]["zen_router"]["used"] is False
     assert z["info"]["K"] == ref["info"]["K"]
     peak = float(ref["restored"].max())
     assert float(cp.abs(z["restored"] - ref["restored"]).max()) < 1e-5 * peak     # the GPU rerun floor
