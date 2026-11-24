@@ -59,7 +59,7 @@ _fast_reset_caches!() = (_SQ_TABLE[] = nothing; _SQ_MASK[] = nothing; _RFI_S0[] 
 
 const _G32 = Dict{Any,Any}()
 """ComplexF32 copies (role `s`) of the four gain arrays `g` (buffers kept per role, shape and device)."""
-function _g32!(g, s::Int=1)
+function _g32!(g, s::Int)
     key = (s, size(g[1]), CUDA.device())
     b = get!(() -> ntuple(_ -> CuArray{ComplexF32}(undef, size(g[1])), 4), _G32, key)
     for q in 1:4; b[q] .= ComplexF32.(g[q]); end
@@ -211,31 +211,24 @@ end
     s > 0 ? (xx, xy, yx, yy) : (conj(xx), conj(yx), conj(xy), conj(yy))
 end
 
-@inline function _sq_row_m(k, I, J, tx, ty, N, lower, sxx, sxy, syx, syy, vxx, vxy, vyx, vyy, flags, sm, table, β,
-                           ::Type{T}) where {T}
+@inline function _sq_row_m(k, I, J, tx, ty, N, vxx, vxy, vyx, vyy, flags, sm, table, β, ::Type{T}) where {T}
     z = zero(T)
     r = I * _NE_TILE + ty + _SQ_TY * (k - 1)
     c = J * _NE_TILE + tx
     (r <= N && c <= N) || return (z, z, z, z)
-    s = table[c, r]
-    e = _sq_entry_m(s, vxx, vxy, vyx, vyy, flags, sm, β, T)
-    if lower                            # lower tile: [c, r] = [r, c]ᴴ (zero without a baseline)
-        l = s == 0 ? e : (conj(e[1]), conj(e[3]), conj(e[2]), conj(e[4]))
-        sxx[c, r, β] = l[1]; sxy[c, r, β] = l[2]; syx[c, r, β] = l[3]; syy[c, r, β] = l[4]
-    end
-    e
+    _sq_entry_m(table[c, r], vxx, vxy, vyx, vyy, flags, sm, β, T)
 end
 
-function fast_sqtile_kernel!(sxx, sxy, syx, syy, vxx, vxy, vyx, vyy, flags, sm, table, N, ntile, upper::Bool)
+# upper tiles only (I ≤ J): the tiled normal equations never read the lower ones
+function fast_sqtile_kernel!(sxx, sxy, syx, syy, vxx, vxy, vyx, vyy, flags, sm, table, N, ntile)
     T = eltype(sxx)
     β = blockIdx().y
     I, J = _tile_pair(blockIdx().x, ntile)
     tx = threadIdx().x; ty = threadIdx().y
-    lower = I != J && !upper
-    e1 = _sq_row_m(1, I, J, tx, ty, N, lower, sxx, sxy, syx, syy, vxx, vxy, vyx, vyy, flags, sm, table, β, T)
-    e2 = _sq_row_m(2, I, J, tx, ty, N, lower, sxx, sxy, syx, syy, vxx, vxy, vyx, vyy, flags, sm, table, β, T)
-    e3 = _sq_row_m(3, I, J, tx, ty, N, lower, sxx, sxy, syx, syy, vxx, vxy, vyx, vyy, flags, sm, table, β, T)
-    e4 = _sq_row_m(4, I, J, tx, ty, N, lower, sxx, sxy, syx, syy, vxx, vxy, vyx, vyy, flags, sm, table, β, T)
+    e1 = _sq_row_m(1, I, J, tx, ty, N, vxx, vxy, vyx, vyy, flags, sm, table, β, T)
+    e2 = _sq_row_m(2, I, J, tx, ty, N, vxx, vxy, vyx, vyy, flags, sm, table, β, T)
+    e3 = _sq_row_m(3, I, J, tx, ty, N, vxx, vxy, vyx, vyy, flags, sm, table, β, T)
+    e4 = _sq_row_m(4, I, J, tx, ty, N, vxx, vxy, vyx, vyy, flags, sm, table, β, T)
     sh = CuDynamicSharedArray(T, (_NE_TILE + 1, _NE_TILE))     # padded: no bank conflicts on the transpose
     _sq_upper!(sxx, sh, (e1[1], e2[1], e3[1], e4[1]), I, J, tx, ty, N, β)
     _sq_upper!(sxy, sh, (e1[2], e2[2], e3[2], e4[2]), I, J, tx, ty, N, β)
@@ -259,7 +252,7 @@ function _fast_square!(sq, vis, meta, minuvw, compact)
     ntile = cld(N, _NE_TILE)
     T = eltype(sq.xx)
     @cuda blocks=(ntile * (ntile + 1) ÷ 2, Nf) threads=(_NE_TILE, _SQ_TY) shmem=(_NE_TILE + 1) * _NE_TILE * sizeof(T) fast_sqtile_kernel!(
-        sq.xx, sq.xy, sq.yx, sq.yy, vis.xx, vis.xy, vis.yx, vis.yy, vis.flags, sm, table, N, ntile, true)
+        sq.xx, sq.xy, sq.yx, sq.yy, vis.xx, vis.xy, vis.yx, vis.yy, vis.flags, sm, table, N, ntile)
     sq
 end
 
@@ -312,11 +305,7 @@ function fast_ne_tile_kernel!(part, gxx, gxy, gyx, gyy, Vxx, Vxy, Vyx, Vyy, Mxx,
     T = eltype(Vxx)
     β = blockIdx().y
     active !== nothing && !active[β] && return nothing
-    I = 0; rem = blockIdx().x - 1                       # tile pair (I, J), I ≤ J, 0-based
-    while rem >= ntile - I
-        rem -= ntile - I; I += 1
-    end
-    J = I + rem
+    I, J = _tile_pair(blockIdx().x, ntile)
     tx = threadIdx().x; ty = threadIdx().y; TY = blockDim().y
     r = I * _NE_TILE + tx
     zt = zero(T)
@@ -723,6 +712,7 @@ function _apply_power!(part, vis, coherency, cal, meta, mode::Int)
     Nb, Nf = size(vis.xx)
     c = mode == 0 ? vis : coherency
     lowp = mode != 0
+    # mode 0 (power only) never reads the coherency or the gains: vis's own arrays fill those kernel arguments
     g, nfc, dg = mode == 0 ? ((vis.xx, vis.xy, vis.yx, vis.yy), 1, false) :
                  (_g32!((cal.xx, cal.xy, cal.yx, cal.yy), 2), Nfreq(cal), cal.is_diagonal)
     @cuda blocks=_gp_blocks(vis) threads=_GP_THREADS corrupt_apply_power_kernel!(
