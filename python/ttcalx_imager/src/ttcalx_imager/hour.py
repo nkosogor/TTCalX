@@ -96,7 +96,24 @@ def svd_quantum():
     multiple of this [lambda].  A finer quantum (0.25, the snapshot imager's) gives each w-snapshot block the
     rank its own w range needs instead of that of up to 2 lambda more (fewer terms per (de)gridding), at the
     price of more distinct factorisations (cheap with TTCALX_SVD_METHOD=gram)."""
-    return float(os.environ.get("TTCALX_SVD_QUANTUM", "2"))
+    q = float(os.environ.get("TTCALX_SVD_QUANTUM", "2"))
+    if not q > 0:
+        raise ValueError(f"TTCALX_SVD_QUANTUM must be > 0 (got {q})")
+    return q
+
+
+def hour_v5_in_effect():
+    """The HOUR_V5_ENV switches whose setting differs from the off default (production operations): the on/off
+    switches when "1" (their only on value), TTCALX_SVD_QUANTUM when it is not 2.  {} = production operations."""
+    out = {}
+    for k in HOUR_V5_ENV:
+        v = os.environ.get(k, "")
+        if not v.strip():
+            continue
+        on = svd_quantum() != 2.0 if k == "TTCALX_SVD_QUANTUM" else v == "1"
+        if on:
+            out[k] = v
+    return out
 
 
 def wmax_memo():
@@ -666,7 +683,7 @@ def _image_hour_snaps(snaps, band, out_prefix, ra, dec, products=(("1h", 1, band
     # WSClean's DATE-OBS is the first time step of the interval whether or not it is flagged
     tstart_all = [s["tstart"] for s in snaps]
     snaps = [s for i, s in enumerate(snaps) if i not in drop]
-    v5 = {k: os.environ[k] for k in HOUR_V5_ENV if os.environ.get(k, "") not in ("", "0")}
+    v5 = hour_v5_in_effect()
     if v5:
         summary["hour_v5"] = v5                 # the v5 speed switches in effect (none: production operations)
     if uvmax_gpu():

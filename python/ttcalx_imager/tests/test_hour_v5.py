@@ -73,6 +73,24 @@ def test_svd_quantum_env(monkeypatch):
     assert hour.svd_quantum() == 2.0
     monkeypatch.setenv("TTCALX_SVD_QUANTUM", "0.25")
     assert hour.svd_quantum() == 0.25
+    for bad in ("0", "-1", "nan"):
+        monkeypatch.setenv("TTCALX_SVD_QUANTUM", bad)
+        with pytest.raises(ValueError, match="TTCALX_SVD_QUANTUM"):
+            hour.svd_quantum()
+
+
+def test_hour_v5_summary_against_off_defaults(monkeypatch):
+    """summary["hour_v5"] lists the switches that differ from the off defaults: explicit off values (quantum 2,
+    "0", "2.0") are production operations."""
+    from hour_cpu import import_hour
+    hour = import_hour()
+    _clear_v5(monkeypatch)
+    assert hour.hour_v5_in_effect() == {}
+    monkeypatch.setenv("TTCALX_SVD_QUANTUM", "2.0"); monkeypatch.setenv("TTCALX_REPROJ_FAST", "0")
+    monkeypatch.setenv("TTCALX_FUSED_CAK", "")
+    assert hour.hour_v5_in_effect() == {}
+    monkeypatch.setenv("TTCALX_SVD_QUANTUM", "0.25"); monkeypatch.setenv("TTCALX_UVMAX_GPU", "1")
+    assert hour.hour_v5_in_effect() == {"TTCALX_SVD_QUANTUM": "0.25", "TTCALX_UVMAX_GPU": "1"}
 
 
 def test_uvmax_prefill_cpu(tmp_path):

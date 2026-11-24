@@ -56,14 +56,14 @@ run-to-run GPU floor (82 MHz MS hour job vs 748884a, 2026-11-02; 2026-10-27 regr
 | `TTCALX_REPROJ_FAST` | `0` | (`HOUR_V5_ENV`: `1`) | hour w-snapshot reprojection (order 3 / 5): B-spline prefilter as one zero-padded real-FFT division by the B-spline transfer function, interpolation in one float32 kernel, instead of cupyx `spline_filter` + `map_coordinates`. Equal to float32 rounding where the image is zero within ~10 px of its edge (the production geometries end 7-12 px beyond the horizon). |
 | `TTCALX_SVD_QUANTUM` | `2` | (`HOUR_V5_ENV`: `0.25`) | hour: w-term factorisations for wmax rounded up to this multiple [lambda] (0.25 = the snapshot imager's): each block gets the rank its own w range needs. Other factors within the 1e-4 tolerance. |
 | `TTCALX_MS_INCR` | `0` | (not in `HOUR_V5_ENV`) | **Leave off.** With the other v5 switches it moves 73 MHz I-Deep-NoTaper-Robust-0 reproducibly (residual 0.067 sigma, model flux +0.6 %; without it 0 fails) for ~7 s; alone it passes but is not faster (427 vs 420 s).  Multiscale CLEAN (with `TTCALX_SPARSE_UPDATE_MAX`): after a sparse residual update with <= n components the scale images are updated with the same components (S_s * S_k * PSF kernels) instead of recomputed by FFT. Kernels capped at `MultiScaleClean.INCR_CACHE_GB` (1) per interval and made only with `INCR_FREE_GB` (1) of the GPU free, else the FFT path. |
-| `TTCALX_FUSED_CAK` | `0` | (`HOUR_V5_ENV`: `1`) | `SampleSet.grid` / `degrid` (with `TTCALX_FAST_AK`; grid also `TTCALX_FUSED_WACC` + pruned plans): a_k(w) evaluated inside the product kernel (no a_k / conj / product temporaries); the same float operations (degrid bitwise). |
+| `TTCALX_FUSED_CAK` | `0` | (`HOUR_V5_ENV`: `1`) | `SampleSet.grid` / `degrid` (with `TTCALX_FAST_AK`; grid also `TTCALX_FUSED_WACC` + pruned plans): a_k(w) evaluated inside the product kernel (no a_k / conj / product temporaries); degrid bitwise, grid the same operations to float32 rounding, so the hour snapshot QA V rms (and any product) can change at float32 rounding level. |
 | `TTCALX_WMAX_MEMO` | `0` | (`HOUR_V5_ENV`: `1`) | hour: a w-snapshot block's max abs(w) re-used by every product / interval of the call (bit-identical). |
 | `TTCALX_UVMAX_GPU` | `0` | (`HOUR_V5_ENV`: `1`) | hour: the archive snapshots' max abs(u, v, w) computed on the GPU right after the QA drop instead of a host-side expansion per snapshot (bit-identical). |
 
 Hour-stage v5 switches (2026-11-24, op_hour on GSIV checkpoints vs production, compare.py/idtable.py: 0 fails at 55 and 73 MHz at the production rerun floor; 73 MHz 419.7 -> 351.1 s (x1.20), 55 MHz 325.4 -> 286.2 s (x1.14), 64 MHz 312.9 -> 252.9 s (measured with MS_INCR, which alone gave nothing); GPU peak +0.7 GB at 64 MHz from `TTCALX_REPROJ_FAST`, -0.2 GB at 73 MHz): `ttcalx_imager.use_hour_v5_settings()` sets `FAST_ENV` and `HOUR_V5_ENV` (an explicit
 value wins); they are not in `FAST_ENV`, so the gsi entry points leave them off unless the caller sets them
 (`TTCALX_V5=1`, below, includes them).
-`summary["hour_v5"]` lists the ones in effect.
+`summary["hour_v5"]` lists the ones in effect (a setting equal to the off default, e.g. `TTCALX_SVD_QUANTUM=2`, is not listed; a non-positive quantum is an error).
 
 ## v5 switches (default off)
 
