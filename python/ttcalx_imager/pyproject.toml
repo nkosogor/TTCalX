@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ttcalx-imager"
-version = "0.1.0"
+version = "0.5.0"
 description = "GPU CLEAN imager for OVRO-LWA snapshots and 1-h / 10-min images (WSClean-equivalent settings)"
 readme = "README.md"
 requires-python = ">=3.9"

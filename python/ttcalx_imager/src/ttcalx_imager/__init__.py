@@ -7,7 +7,7 @@ Products (see docs/src/gpu-clean-imager.md):
 The modules that do not need a GPU (bands, msio, weights, rotate, beam, fits) can be
 imported without CuPy installed.
 """
-__version__ = "0.1.0"
+__version__ = "0.5.0"
 
 import os as _os
 

@@ -9,9 +9,11 @@ TTCalX extends [TTCal](https://github.com/mweastwood/TTCal.jl) by Michael Eastwo
 Documentation: <https://nkosogor.github.io/TTCalX/>.
 
 **Versions used by the OVRO-LWA GPU pipeline (gsi):** `gsi-v1` (deployed until 2026-10-25),
-`gsi-v2` = 748884a, `v0.3.1` (gsi v3; same code as `v0.3.0`, updated docs), `v0.4.0` = `main` (gsi v4: the
-imager's v4 speed switches in `ttcalx_imager.FAST_ENV`, turned on by the v3 engine; same images as 0.3.1). With
-default settings the peeler is bitwise like 748884a; the faster paths are opt-in.
+`gsi-v2` = 748884a, `v0.3.1` (gsi v3; same code as `v0.3.0`, updated docs), `v0.4.0` (gsi v4: the
+imager's v4 speed switches in `ttcalx_imager.FAST_ENV`, turned on by the v3 engine; same images as 0.3.1),
+`v0.5.0` (gsi v5: the fast peel `peel_fast=true` and the imager's `TTCALX_V5=1` set, both off by default; see
+[CHANGELOG.md](CHANGELOG.md)). With default settings the peeler is bitwise like 748884a; the faster paths are
+opt-in.
 
 ## Install
 
