@@ -64,8 +64,15 @@ def _snapshot(nant=90, freqs=(46e6, 47e6, 48e6), tilt=6.0, seed=3):
     return small, {"DATA": data_h, "FLAG": flag}, R, src
 
 
-@pytest.fixture
-def zen_env(monkeypatch):
+@pytest.fixture(params=["default", "fast"])
+def zen_env(request, monkeypatch):
+    """TTCALX_SNAP_ZEN=force on the default operations and on FAST_ENV (the production gsi setting)."""
+    from ttcalx_imager import FAST_ENV
+    for k, v in FAST_ENV.items():
+        if request.param == "fast":
+            monkeypatch.setenv(k, v)
+        else:
+            monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("TTCALX_SNAP_ZEN", "force")
     for k in ("DK", "GZ", "PSFGZ", "RING_DEG", "RING_PX", "AK_LOSS"):
         monkeypatch.delenv("TTCALX_SNAP_ZEN_" + k, raising=False)
