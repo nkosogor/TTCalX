@@ -970,7 +970,8 @@ end
 # zest_sky_rfi!(...; peel_fast=true)                                           #
 #------------------------------------------------------------------------------#
 
-function _check_fast(vis, ws, kw)
+function _check_fast(vis, ws, kw, sky, rfi)
+    names = vcat(String[get_name(s) for s in sky], String[get_name(s) for s in rfi])
     why = !_is_gpu(vis.xx) ? "GPU visibilities" :
           ws === nothing ? "a workspace (PeelWorkspace)" :
           !fast_kernels() ? "fast_kernels!(true)" :
@@ -984,7 +985,8 @@ function _check_fast(vis, ws, kw)
           kw.initial_gains !== nothing ? "a cold start (initial_gains = nothing)" :
           !kw.cache_model_sq ? "cache_model_sq = true" :
           !(1 <= kw.maxiter <= FAST_MAXITER) ? "1 <= maxiter <= $FAST_MAXITER" :
-          !(eltype(vis.xx) in (ComplexF32, ComplexF64)) ? "ComplexF32 or ComplexF64 visibilities" : ""
+          !(eltype(vis.xx) in (ComplexF32, ComplexF64)) ? "ComplexF32 or ComplexF64 visibilities" :
+          !allunique(names) ? "unique sky and RFI source names (the fully flagged rows map them by name)" : ""
     isempty(why) || throw(ArgumentError("peel_fast needs $why"))
     nothing
 end
@@ -995,7 +997,7 @@ with `_fast_inner = true`) and the subtraction of the peeled directions on the f
 """
 function _zest_sky_rfi_fast!(vis, meta, mjd, sky, rfi, kw; flag_zeros::Bool, workspace)
     ws = workspace
-    _check_fast(vis, ws, kw)
+    _check_fast(vis, ws, kw, sky, rfi)
     Threads.atomic_cas!(_PEEL_FAST_BUSY, false, true) &&
         error("peel_fast: another fast peel is running in this process (one at a time)")
     try

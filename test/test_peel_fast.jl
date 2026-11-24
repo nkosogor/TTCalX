@@ -48,6 +48,10 @@ relrows(a, b, rows) = maximum(maximum(abs, ComplexF64.(getfield(a, f)[rows, :]) 
             end
             @test_throws ArgumentError ws_run(meta, measured, sky, rfi, [sky[1]]; FAST_CFG..., workspace=ws,
                                               peel_fast=true)
+            @test_throws "unique" ws_run(meta, measured, [sky; sky[1]], rfi, GPUSource[]; FAST_CFG...,
+                                         workspace=ws, peel_fast=true)            # duplicate names
+            @test_throws "unique" ws_run(meta, measured, sky, [rfi; rfi[1]], GPUSource[]; FAST_CFG...,
+                                         workspace=ws, peel_fast=true)
             @test_throws ArgumentError peelrun(to32(measured))          # ComplexF32 needs peel_fast
             fast_kernels!(false)
             @test_throws ArgumentError peelrun(measured; peel_fast=true)
