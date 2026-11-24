@@ -25,12 +25,12 @@ relrows(a, b, rows) = maximum(maximum(abs, ComplexF64.(getfield(a, f)[rows, :]) 
                       maximum(maximum(abs, getfield(b, f)[rows, :]) for f in (:xx, :xy, :yx, :yy))
 
 @testset "peel_fast" begin
-    @test !TTCalX.PEEL_FAST[]
+    @test !TTCalX._PEEL_FAST_BUSY[]
     @testset "argument checks (host)" begin
         meta, measured, sky, rfi = fast_problem(; gpu=false)
         @test_throws ArgumentError zest_sky_rfi!(deepcopy_gpu(measured), meta, TEST_MJD, sky, rfi;
                                                  FAST_CFG..., workspace=PeelWorkspace(), peel_fast=true)
-        @test !TTCalX.PEEL_FAST[] && !TTCalX._PEEL_FAST_BUSY[]
+        @test !TTCalX._PEEL_FAST_BUSY[]
     end
     is_gpu_available() || return
     try
@@ -52,11 +52,27 @@ relrows(a, b, rows) = maximum(maximum(abs, ComplexF64.(getfield(a, f)[rows, :]) 
             fast_kernels!(false)
             @test_throws ArgumentError peelrun(measured; peel_fast=true)
             fast_kernels!(true)
-            # one fast peel per process at a time
+            # one fast peel per process at a time: while one runs (busy), a second fast call and a default
+            # call throw; the internal _fast_inner is refused outside a fast peel
+            @test_throws "_fast_inner" peelrun(measured; peel_fast=true, _fast_inner=true)
             TTCalX._PEEL_FAST_BUSY[] = true
-            @test_throws ErrorException peelrun(measured; peel_fast=true)
-            TTCalX._PEEL_FAST_BUSY[] = false
-            @test !TTCalX.PEEL_FAST[]
+            try
+                @test_throws "another fast peel" peelrun(measured; peel_fast=true)
+                @test_throws "a fast peel is running" peelrun(measured)
+            finally
+                TTCalX._PEEL_FAST_BUSY[] = false
+            end
+            @test same(peelrun(measured), ref)
+        end
+        @testset "genvis_exact!: the default fringes are bitwise unchanged (lowp only when asked)" begin
+            gen(; kw...) = (m = GPUVisibilities(meta.Nbase, meta.Nfreq; gpu=true);
+                            genvis_exact!(m, meta, sky[1], TEST_MJD; kw...); host_copy(m))
+            d0 = gen()
+            TTCalX._PEEL_FAST_BUSY[] = true                 # a fast peel "running" in another task
+            d1 = try gen() finally TTCalX._PEEL_FAST_BUSY[] = false end
+            @test same(d0, d1) && same(d0, gen(; lowp=false))
+            lp = gen(; lowp=true)
+            @test !same(d0, lp) && relrows(lp, d0, 1:meta.Nbase) < 1e-6
         end
         alive = vec(any(.!Array(measured.flags); dims=2))
         live, dead = findall(alive), findall(.!alive)
@@ -67,7 +83,7 @@ relrows(a, b, rows) = maximum(maximum(abs, ComplexF64.(getfield(a, f)[rows, :]) 
                 log = []
                 r = zest_sky_rfi!(vis, meta, TEST_MJD, sky, rfi; FAST_CFG..., peeliter=2, maxiter=5, workspace=ws,
                                   peel_fast=true, report=(n, it; kw...) -> push!(log, (n, it, sort(collect(kw); by=first))))
-                @test !TTCalX.PEEL_FAST[] && !TTCalX._PEEL_FAST_BUSY[]
+                @test !TTCalX._PEEL_FAST_BUSY[]
                 @test eltype(vis.xx) == eltype(input.xx)
                 @test r.peeled == ref.peeled && r.skipped == ref.skipped && r.flagged_zeros == ref.flagged
                 @test Array(vis.flags) == ref.vis.flags
@@ -105,7 +121,7 @@ relrows(a, b, rows) = maximum(maximum(abs, ComplexF64.(getfield(a, f)[rows, :]) 
             n = Ref(0)
             boom = (name, it; kw...) -> (n[] += 1; n[] == 3 && error("boom"); nothing)
             @test_throws ErrorException fast(deepcopy_gpu(measured); report=boom)
-            @test !TTCalX.PEEL_FAST[] && !TTCalX._PEEL_FAST_BUSY[] && TTCalX._SQ_MASK[] === nothing
+            @test !TTCalX._PEEL_FAST_BUSY[] && TTCalX._SQ_MASK[] === nothing
             b = deepcopy_gpu(measured); fast(b)
             @test same(host_copy(a), host_copy(b))
             @test same(peelrun(measured), ref)                          # and the default still runs
@@ -151,14 +167,12 @@ relrows(a, b, rows) = maximum(maximum(abs, ComplexF64.(getfield(a, f)[rows, :]) 
                 w2 = PeelWorkspace()
                 msq = TTCalX._ws_square!(w2, :meas_sq, gmeta.Nant, gmeta.Nfreq, ComplexF32, true; zero=false)
                 r1 = try
-                    TTCalX.PEEL_FAST[] = true
                     TTCalX._fast_solve!(c1, gmeas, gmod, gmeta,
                                         TTCalX._fast_square!(TTCalX._ws_square!(w2, :mod_sq, gmeta.Nant, gmeta.Nfreq,
                                             ComplexF32, true; zero=false), gmod, gmeta, 5.0, nothing),
                                         msq, w2, nothing; maxiter=maxiter,
                                         tolerance=tol, minuvw=5.0)
                 finally
-                    TTCalX.PEEL_FAST[] = false
                     TTCalX._fast_reset_caches!()
                 end
                 @test r1[1] == r0[1] && r1[2] == r0[2] && r1[3] ≈ r0[3]
@@ -175,11 +189,9 @@ relrows(a, b, rows) = maximum(maximum(abs, ComplexF64.(getfield(a, f)[rows, :]) 
             w4 = PeelWorkspace()
             sq(t) = TTCalX._ws_square!(w4, t, gb.Nant, gb.Nfreq, ComplexF32, true; zero=false)
             r1 = try
-                TTCalX.PEEL_FAST[] = true
                 TTCalX._fast_solve!(c1, bv, bm, gb, TTCalX._fast_square!(sq(:m), bm, gb, 5.0, nothing), sq(:v), w4,
                                     nothing; maxiter=5, tolerance=1e-4, minuvw=5.0)
             finally
-                TTCalX.PEEL_FAST[] = false
                 TTCalX._fast_reset_caches!()
             end
             @test r1[1] == r0[1] && r1[2] == r0[2] && r1[3] ≈ r0[3]

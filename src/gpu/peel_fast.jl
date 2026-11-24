@@ -31,8 +31,9 @@
 #                         subtraction, one host wait per direction update
 #
 # Process-wide state (one fast peel per process at a time, one GPU per process):
-#   PEEL_FAST            true only while a fast zest_sky_rfi! runs; a second fast call meanwhile, or
-#                        a default zest_sky_rfi! call, throws
+#   _PEEL_FAST_BUSY      set (atomic CAS) while a fast zest_sky_rfi! runs; a second fast call meanwhile, or
+#                        a default zest_sky_rfi! call, throws.  The fast peel's own inner zest_sky_rfi!
+#                        calls pass the internal `_fast_inner = true`
 #   host-mapped memory   512 KiB of pinned host memory mapped into the device, allocated once on the
 #                        device current at the first fast peel (a fast peel on another device throws)
 #   CUDA events          a few reusable events of that context
@@ -40,7 +41,6 @@
 #   per-call caches      the baseline pair table and the short-baseline mask: built in the call and
 #                        dropped at its end (nothing is keyed on array identity across calls)
 
-const PEEL_FAST = Ref(false)
 const _PEEL_FAST_BUSY = Threads.Atomic{Bool}(false)
 
 """Largest `maxiter` of a fast peel (64 host-mapped slots per wait cycle, events 1:maxiter + 1)."""
@@ -1022,8 +1022,8 @@ function _check_fast(vis, ws, kw)
 end
 
 """
-The fast peel: checks, the process-wide state, the peel of the rows with data (`zest_sky_rfi!` with
-PEEL_FAST set) and the subtraction of the peeled directions on the fully flagged rows.
+The fast peel: checks, the process-wide state, the peel of the rows with data (the inner `zest_sky_rfi!`
+with `_fast_inner = true`) and the subtraction of the peeled directions on the fully flagged rows.
 """
 function _zest_sky_rfi_fast!(vis, meta, mjd, sky, rfi, kw; flag_zeros::Bool, workspace)
     ws = workspace
@@ -1032,11 +1032,9 @@ function _zest_sky_rfi_fast!(vis, meta, mjd, sky, rfi, kw; flag_zeros::Bool, wor
         error("peel_fast: another fast peel is running in this process (one at a time)")
     try
         _fast_reset_caches!()
-        PEEL_FAST[] = true
         isempty(rfi) || (_RFI_S0[] = uvw_geometry(meta)[1])
         return _zest_blc!(vis, meta, mjd, sky, rfi, kw, flag_zeros, ws)
     finally
-        PEEL_FAST[] = false
         _fast_reset_caches!()
         _PEEL_FAST_BUSY[] = false
     end
@@ -1051,7 +1049,8 @@ function _zest_blc!(vis, meta, mjd, sky, rfi, kw, flag_zeros, ws)
     idx = findall(alive)
     n = length(idx)
     if n == 0                           # nothing to solve for: the rows as they are
-        r = zest_sky_rfi!(vis, meta, mjd, sky, rfi; kw..., flag_zeros=false, workspace=ws, peel_fast=true)
+        r = zest_sky_rfi!(vis, meta, mjd, sky, rfi; kw..., flag_zeros=false, workspace=ws, peel_fast=true,
+                          _fast_inner=true)
         return merge(r, (flagged_zeros=nzero,))
     end
     meta_c, idx_d = _row_meta(meta, idx)
@@ -1068,7 +1067,8 @@ function _zest_blc!(vis, meta, mjd, sky, rfi, kw, flag_zeros, ws)
     end
     view(vc.flags, 1:n, :) .= view(vis.flags, idx_d, :)
     npad > n && (view(vc.flags, n+1:npad, :) .= true)
-    r = zest_sky_rfi!(vc, meta_c, mjd, sky, rfi; kw..., flag_zeros=false, workspace=ws, peel_fast=true)
+    r = zest_sky_rfi!(vc, meta_c, mjd, sky, rfi; kw..., flag_zeros=false, workspace=ws, peel_fast=true,
+                      _fast_inner=true)
     # a workspace reset inside would have freed vc
     (ws.key == wkey && ws.nreset == nr0) ||
         error("peel_fast: workspace key changed in the compacted peel ($(ws.key) vs $wkey, nreset $(ws.nreset) vs $nr0)")
@@ -1115,7 +1115,7 @@ function _dead_subtract!(vis, meta, mjd, sky, rfi, r, dead, ws)
             gpu_genvis!(md, meta_d, s, meta_d.phase_center_ra, meta_d.phase_center_dec, 0.0; overwrite=true,
                         s0=_RFI_S0[])
         else
-            genvis_exact!(md, meta_d, s, mjd; overwrite=true)
+            genvis_exact!(md, meta_d, s, mjd; overwrite=true, lowp=true)
         end
         _apply_power!(part, vd, md, cal, meta_d, 2)
     end

@@ -242,7 +242,8 @@ Keywords:
   vs off).  It needs GPU visibilities (ComplexF32, as read from the MS, is the validated setup;
   ComplexF64 works), a `workspace`, `fast_kernels!(true)`, `solver = :rk4`, `precision = :mixed`,
   full Jones, no `reg`, no smoothing, no `restore`, `rfi_mode = :after`, no `initial_gains`,
-  `cache_model_sq = true` and `maxiter ≤ 63`; one fast peel per process at a time.  Without it the
+  `cache_model_sq = true` and `maxiter ≤ 63`; one fast peel per process at a time (a second fast
+  peel, or a default peel, while one runs throws).  Without it the
   visibilities must be ComplexF64.
 
 Returns `(peeled, skipped, flagged_zeros, restored, gains)`: names of the subtracted sources,
@@ -263,14 +264,17 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
                        restore_below_mhz::Real=Inf, restore_offset_deg::Real=0.0,
                        precision::Symbol=:double, initial_gains=nothing, warm_max_age_s::Real=60.0,
                        cache_model_sq::Bool=(precision == :mixed),
-                       workspace::Union{Nothing,PeelWorkspace}=nothing, peel_fast::Bool=false)
-    if peel_fast && !PEEL_FAST[]            # the fast peel's entry; it calls back here with PEEL_FAST set
+                       workspace::Union{Nothing,PeelWorkspace}=nothing, peel_fast::Bool=false,
+                       _fast_inner::Bool=false)
+    if peel_fast && !_fast_inner            # the fast peel's entry: checks, the busy flag, then back here inner
         kw = (; rfi_mode, solver, maxiter, tolerance, minuvw, peeliter, max_gain, min_elevation, diagonal, reg,
               report, smooth_flux, rfi_smooth_flux, smooth_exempt_flux, smooth_exempt_names, restore,
               restore_below_mhz, restore_offset_deg, precision, initial_gains, warm_max_age_s, cache_model_sq)
         return _zest_sky_rfi_fast!(vis, meta, mjd, sky, rfi, kw; flag_zeros=flag_zeros, workspace=workspace)
     end
-    PEEL_FAST[] == peel_fast ||
+    _fast_inner && !(peel_fast && _PEEL_FAST_BUSY[]) &&
+        error("zest_sky_rfi!: _fast_inner is internal to the fast peel (_zest_sky_rfi_fast!)")
+    !peel_fast && _PEEL_FAST_BUSY[] &&
         error("zest_sky_rfi!: a fast peel is running in this process (one peel at a time with peel_fast)")
     fast = peel_fast
     fast || eltype(vis.xx) == ComplexF64 ||
@@ -323,7 +327,7 @@ function zest_sky_rfi!(vis::GPUVisibilities, meta::GPUMetadata, mjd::Float64,
                 gpu_genvis!(c, meta, s, meta.phase_center_ra, meta.phase_center_dec, 0.0; overwrite=fast,
                             s0=fast ? _RFI_S0[] : nothing)
             else
-                genvis_exact!(c, meta, s, mjd; overwrite=fast)
+                genvis_exact!(c, meta, s, mjd; overwrite=fast, lowp=fast)
             end
             c.flags .= vis.flags
             c

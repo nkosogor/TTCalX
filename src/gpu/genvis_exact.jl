@@ -102,7 +102,7 @@ with b = r₂ - r₁ and k = 2πν/c.  Shared by the GPU kernel and the host loo
 end
 
 """
-`_exact_vis` of a fast peel (`PEEL_FAST`): the phase in Float64 reduced mod 2π, its sincos and the Gaussian
+`_exact_vis` of a fast peel (`genvis_exact!(...; lowp=true)`): the phase in Float64 reduced mod 2π, its sincos and the Gaussian
 taper in Float32, the flux sums in Float64.
 """
 @inline function _exact_vis32(α, β, delay, flux, shape, positions, baselines, channels, Nc)
@@ -156,7 +156,7 @@ genvis_exact!(::GPUVisibilities, ::GPUMetadata, ::GPURFISource, ::Float64; kw...
     throw(ArgumentError("genvis_exact! is for sky sources; use gpu_genvis! for RFI sources"))
 
 """
-    genvis_exact!(vis, meta, source, mjd_utc; overwrite=false)
+    genvis_exact!(vis, meta, source, mjd_utc; overwrite=false, lowp=false)
 
 Add the model of a sky source computed as CPU TTCal does (see the file
 header).  `mjd_utc` is the observation time (`ms_mjd`).  The per-component
@@ -166,9 +166,12 @@ so the result does not depend on the MS's UVW convention.
 
 `overwrite = true`: `vis.xx .. yy` need not be zero; they get exactly the values that adding the
 model to zeros gives (the GPU kernel stores 0 + v without reading them; the host zero-fills first).
+
+`lowp = true` (the fast peel's fringes, GPU only; ignored for host arrays): the phase reduced mod 2π in
+Float64, its sincos and the Gaussian taper in Float32 (`_exact_vis32`).  The default is bitwise unchanged.
 """
 function genvis_exact!(vis::GPUVisibilities, meta::GPUMetadata, source::GPUSource, mjd_utc::Float64;
-                       overwrite::Bool=false)
+                       overwrite::Bool=false, lowp::Bool=false)
     delay, flux, shape = exact_model_tables(meta, source, mjd_utc)
     Nc = size(delay, 2)
     overwrite && (Nc == 0 || !_is_gpu(vis)) && _zero_model!(vis)
@@ -178,7 +181,7 @@ function genvis_exact!(vis::GPUVisibilities, meta::GPUMetadata, source::GPUSourc
         blocks, threads = kernel_config_1d(Nb * Nf)
         @cuda blocks=blocks threads=threads genvis_exact_kernel!(
             vis.xx, vis.xy, vis.yx, vis.yy, CuArray(delay), CuArray(flux), CuArray(shape),
-            meta.antenna_positions, meta.baselines, meta.channels, Nb, Nf, Nc, overwrite, PEEL_FAST[])
+            meta.antenna_positions, meta.baselines, meta.channels, Nb, Nf, Nc, overwrite, lowp)
         CUDA.synchronize()
     else
         pos, bl, ch = meta.antenna_positions, meta.baselines, meta.channels
